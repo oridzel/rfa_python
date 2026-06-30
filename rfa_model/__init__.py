@@ -36,4 +36,8 @@ from .accounting import (
     add_per_primary_to_current_counts,
 )
 
-from .collisions import *
+from .collisions import (
+    build_collision_mesh_dict,
+    build_stl_intersector,
+    build_stl_bounding_boxes
+)
