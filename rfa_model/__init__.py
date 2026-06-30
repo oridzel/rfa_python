@@ -19,6 +19,7 @@ from .geometry import (
     load_and_align_sample_assembly,
     load_and_align_grid_frames,
     sample_bounds,
+    build_collision_mesh_dict,
 )
 
 from .samplers import (
@@ -37,7 +38,6 @@ from .accounting import (
 )
 
 from .collisions import (
-    build_collision_mesh_dict,
     build_stl_intersector,
     build_stl_bounding_boxes
 )
