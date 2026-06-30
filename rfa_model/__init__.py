@@ -36,4 +36,4 @@ from .accounting import (
     add_per_primary_to_current_counts,
 )
 
-from rfa_model.collisions import *
+from .collisions import *
