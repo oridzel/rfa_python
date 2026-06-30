@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Data and results
+results/*
+!results/.gitkeep
+
+# Large local data
+data/*.csv
+data/*.npz
+data/*.stl
+data/*.mat
+data/*.h5
+data/*.hdf5
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,9 @@
+numpy
+scipy
+pandas
+matplotlib
+trimesh
+rtree
+joblib
+plotly
+jupyter
