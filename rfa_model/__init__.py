@@ -41,3 +41,11 @@ from .collisions import (
     build_stl_intersector,
     build_stl_bounding_boxes
 )
+
+from .plotting import (
+    plot_trajectories_3d,
+    plot_trajectory_projections,
+    plot_hit_points,
+    plot_current_balance,
+    plot_terminal_counts
+)
