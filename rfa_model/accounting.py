@@ -139,36 +139,28 @@ def electrode_from_owner(owner_name) -> str:
     return "unknown"
 
 
-def terminal_owner_from_result(res: dict, owner_name_map: dict | None = None) -> str:
-    """
-    Extract best terminal owner name from one trajectory result.
-
-    If hit_info contains owner_id and owner_name_map is supplied,
-    owner_id decoding is preferred over generic owner_9 names.
-    """
+def terminal_owner_from_result(res, owner_name_map=None):
     reason = res.get("reason", None)
+
+    if reason in ["left_grid", "left_update_region", "escaped"]:
+        return "escaped"
+
     hit_info = res.get("hit_info", None)
 
     if hit_info is None:
-        return canonical_owner_name(reason)
+        return "unknown"
 
-    if isinstance(hit_info, dict):
-        owner_id = hit_info.get("owner_id", None)
+    owner_name = hit_info.get("owner_name", None)
 
-        if owner_id is not None and owner_name_map is not None:
-            return canonical_owner_name(
-                owner_name_map.get(int(owner_id), f"owner_{owner_id}")
-            )
+    if owner_name is not None:
+        return canonical_owner_name(owner_name)
 
-        if "owner" in hit_info and hit_info["owner"] is not None:
-            return canonical_owner_name(hit_info["owner"])
+    owner_id = hit_info.get("owner_id", None)
 
-        if "kind" in hit_info and hit_info["kind"] is not None:
-            kind = canonical_owner_name(hit_info["kind"])
-            if kind != "fixed_voxel":
-                return kind
+    if owner_id is not None and owner_name_map is not None:
+        return canonical_owner_name(owner_name_map.get(int(owner_id), "unknown"))
 
-    return canonical_owner_name(reason)
+    return "unknown"
 
 
 def terminal_electrode_from_result(
