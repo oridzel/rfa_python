@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 
 def _to_mm(a):
@@ -534,5 +535,337 @@ def plot_current_balance(
 
     ax.set_title(title)
     fig.tight_layout()
+
+    return fig, ax
+
+
+def _set_axes_equal_3d(ax):
+    """
+    Make 3D axes approximately equal scale.
+    """
+    x_limits = ax.get_xlim3d()
+    y_limits = ax.get_ylim3d()
+    z_limits = ax.get_zlim3d()
+
+    x_range = abs(x_limits[1] - x_limits[0])
+    y_range = abs(y_limits[1] - y_limits[0])
+    z_range = abs(z_limits[1] - z_limits[0])
+
+    x_middle = np.mean(x_limits)
+    y_middle = np.mean(y_limits)
+    z_middle = np.mean(z_limits)
+
+    plot_radius = 0.5 * max([x_range, y_range, z_range])
+
+    ax.set_xlim3d([x_middle - plot_radius, x_middle + plot_radius])
+    ax.set_ylim3d([y_middle - plot_radius, y_middle + plot_radius])
+    ax.set_zlim3d([z_middle - plot_radius, z_middle + plot_radius])
+
+
+def plot_meshes_3d(
+    meshes: dict,
+    frame_meshes: dict | None = None,
+    max_faces_per_mesh: int = 3000,
+    alpha: float = 0.25,
+    title: str = "STL meshes",
+    ax=None,
+):
+    """
+    Plot STL meshes in 3D.
+
+    Coordinates are shown in mm.
+
+    Parameters
+    ----------
+    meshes:
+        Dict name -> trimesh object.
+    frame_meshes:
+        Optional dict name -> trimesh object for grid frames.
+    max_faces_per_mesh:
+        Randomly downsample faces for faster plotting.
+    alpha:
+        Mesh transparency.
+    """
+    if ax is None:
+        fig = plt.figure(figsize=(9, 8))
+        ax = fig.add_subplot(111, projection="3d")
+    else:
+        fig = ax.figure
+
+    all_meshes = {}
+
+    if meshes is not None:
+        all_meshes.update(meshes)
+
+    if frame_meshes is not None:
+        all_meshes.update(frame_meshes)
+
+    rng = np.random.default_rng(1)
+
+    for name, mesh in all_meshes.items():
+        verts = np.asarray(mesh.vertices)
+        faces = np.asarray(mesh.faces)
+
+        if len(faces) > max_faces_per_mesh:
+            idx = rng.choice(len(faces), size=max_faces_per_mesh, replace=False)
+            faces_plot = faces[idx]
+        else:
+            faces_plot = faces
+
+        tri = 1e3 * verts[faces_plot]
+
+        poly = Poly3DCollection(
+            tri,
+            alpha=alpha,
+            linewidths=0.05,
+        )
+
+        poly.set_label(name)
+        ax.add_collection3d(poly)
+
+    # Autoscale from all mesh bounds.
+    bounds_all = []
+
+    for mesh in all_meshes.values():
+        bounds_all.append(mesh.bounds)
+
+    if bounds_all:
+        bounds_all = np.asarray(bounds_all)
+        xyz_min = bounds_all[:, 0, :].min(axis=0)
+        xyz_max = bounds_all[:, 1, :].max(axis=0)
+
+        ax.set_xlim(1e3 * xyz_min[0], 1e3 * xyz_max[0])
+        ax.set_ylim(1e3 * xyz_min[1], 1e3 * xyz_max[1])
+        ax.set_zlim(1e3 * xyz_min[2], 1e3 * xyz_max[2])
+
+        _set_axes_equal_3d(ax)
+
+    ax.set_xlabel("x (mm)")
+    ax.set_ylabel("y (mm)")
+    ax.set_zlabel("z (mm)")
+    ax.set_title(title)
+
+    return fig, ax
+
+
+def plot_fixed_voxels_3d(
+    field: dict,
+    owner_names: list[str] | None = None,
+    max_points: int = 100_000,
+    s: float = 1.0,
+    alpha: float = 0.35,
+    title: str = "Fixed-potential voxels",
+    ax=None,
+):
+    """
+    Plot fixed voxels from field['fixed'] and field['owner'].
+
+    Coordinates are shown in mm.
+    """
+    if ax is None:
+        fig = plt.figure(figsize=(9, 8))
+        ax = fig.add_subplot(111, projection="3d")
+    else:
+        fig = ax.figure
+
+    fixed = np.asarray(field["fixed"], dtype=bool)
+    owner = np.asarray(field["owner"])
+
+    owner_name_map = field.get("owner_name_map", {})
+
+    if owner_names is None:
+        owner_ids = sorted(np.unique(owner[fixed]))
+        owner_ids = [int(o) for o in owner_ids if int(o) != 0]
+    else:
+        name_to_id = field.get("owner_id_map", None)
+
+        if name_to_id is None:
+            raise ValueError("field must contain owner_id_map when owner_names is used")
+
+        owner_ids = [int(name_to_id[name]) for name in owner_names]
+
+    rng = np.random.default_rng(1)
+
+    for owner_id in owner_ids:
+        mask = fixed & (owner == owner_id)
+
+        idx = np.argwhere(mask)
+
+        if len(idx) == 0:
+            continue
+
+        if len(idx) > max_points:
+            keep = rng.choice(len(idx), size=max_points, replace=False)
+            idx = idx[keep]
+
+        x = field["x"][idx[:, 0]]
+        y = field["y"][idx[:, 1]]
+        z = field["z"][idx[:, 2]]
+
+        owner_name = owner_name_map.get(owner_id, f"owner_{owner_id}")
+
+        ax.scatter(
+            1e3 * x,
+            1e3 * y,
+            1e3 * z,
+            s=s,
+            alpha=alpha,
+            label=owner_name,
+        )
+
+    ax.set_xlabel("x (mm)")
+    ax.set_ylabel("y (mm)")
+    ax.set_zlabel("z (mm)")
+    ax.set_title(title)
+    ax.legend(markerscale=5, fontsize=8)
+
+    _set_axes_equal_3d(ax)
+
+    return fig, ax
+
+
+def plot_owner_slice(
+    field: dict,
+    plane: str = "xz",
+    coord: float = 0.0,
+    title: str | None = None,
+    ax=None,
+):
+    """
+    Plot owner IDs on a 2D slice.
+
+    plane:
+        'xy' means constant z = coord.
+        'xz' means constant y = coord.
+        'yz' means constant x = coord.
+
+    coord is in meters.
+    """
+    if plane not in ["xy", "xz", "yz"]:
+        raise ValueError("plane must be 'xy', 'xz', or 'yz'")
+
+    owner = field["owner"]
+
+    x = field["x"]
+    y = field["y"]
+    z = field["z"]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 6))
+    else:
+        fig = ax.figure
+
+    if plane == "xy":
+        k = int(np.argmin(np.abs(z - coord)))
+        img = owner[:, :, k].T
+        extent = [1e3 * x[0], 1e3 * x[-1], 1e3 * y[0], 1e3 * y[-1]]
+        xlabel = "x (mm)"
+        ylabel = "y (mm)"
+        actual = z[k]
+
+    elif plane == "xz":
+        j = int(np.argmin(np.abs(y - coord)))
+        img = owner[:, j, :].T
+        extent = [1e3 * x[0], 1e3 * x[-1], 1e3 * z[0], 1e3 * z[-1]]
+        xlabel = "x (mm)"
+        ylabel = "z (mm)"
+        actual = y[j]
+
+    else:
+        i = int(np.argmin(np.abs(x - coord)))
+        img = owner[i, :, :].T
+        extent = [1e3 * y[0], 1e3 * y[-1], 1e3 * z[0], 1e3 * z[-1]]
+        xlabel = "y (mm)"
+        ylabel = "z (mm)"
+        actual = x[i]
+
+    im = ax.imshow(
+        img,
+        origin="lower",
+        extent=extent,
+        interpolation="nearest",
+        aspect="equal",
+    )
+
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("owner ID")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    if title is None:
+        title = f"Owner slice {plane}, coord = {1e3 * actual:.3f} mm"
+
+    ax.set_title(title)
+
+    return fig, ax
+
+
+def plot_potential_slice(
+    field: dict,
+    plane: str = "xz",
+    coord: float = 0.0,
+    title: str | None = None,
+    ax=None,
+):
+    """
+    Plot potential V on a 2D slice.
+    """
+    if plane not in ["xy", "xz", "yz"]:
+        raise ValueError("plane must be 'xy', 'xz', or 'yz'")
+
+    V = field["V"]
+
+    x = field["x"]
+    y = field["y"]
+    z = field["z"]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 6))
+    else:
+        fig = ax.figure
+
+    if plane == "xy":
+        k = int(np.argmin(np.abs(z - coord)))
+        img = V[:, :, k].T
+        extent = [1e3 * x[0], 1e3 * x[-1], 1e3 * y[0], 1e3 * y[-1]]
+        xlabel = "x (mm)"
+        ylabel = "y (mm)"
+        actual = z[k]
+
+    elif plane == "xz":
+        j = int(np.argmin(np.abs(y - coord)))
+        img = V[:, j, :].T
+        extent = [1e3 * x[0], 1e3 * x[-1], 1e3 * z[0], 1e3 * z[-1]]
+        xlabel = "x (mm)"
+        ylabel = "z (mm)"
+        actual = y[j]
+
+    else:
+        i = int(np.argmin(np.abs(x - coord)))
+        img = V[i, :, :].T
+        extent = [1e3 * y[0], 1e3 * y[-1], 1e3 * z[0], 1e3 * z[-1]]
+        xlabel = "y (mm)"
+        ylabel = "z (mm)"
+        actual = x[i]
+
+    im = ax.imshow(
+        img,
+        origin="lower",
+        extent=extent,
+        interpolation="nearest",
+        aspect="equal",
+    )
+
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Potential (V)")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    if title is None:
+        title = f"Potential slice {plane}, coord = {1e3 * actual:.3f} mm"
+
+    ax.set_title(title)
 
     return fig, ax

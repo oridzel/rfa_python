@@ -62,5 +62,9 @@ from .plotting import (
     plot_trajectory_projections,
     plot_hit_points,
     plot_current_balance,
-    plot_terminal_counts
+    plot_terminal_counts,
+    plot_meshes_3d,
+    plot_fixed_voxels_3d,
+    plot_owner_slice,
+    plot_potential_slice,
 )
