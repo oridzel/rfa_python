@@ -139,26 +139,71 @@ def electrode_from_owner(owner_name) -> str:
     return "unknown"
 
 
-def terminal_owner_from_result(res, owner_name_map=None):
+def terminal_owner_from_result(
+    res: dict,
+    owner_name_map: dict | None = None,
+    field: dict | None = None,
+) -> str:
+    """
+    Determine terminal owner name from a trajectory result.
+
+    Returns canonical owner names such as:
+        sample, holder, receiver, rod,
+        g1_shell, g2_shell, g3_shell,
+        collector_shell, drifttube, escaped, unknown.
+    """
     reason = res.get("reason", None)
 
+    # These are not electrode hits inside the modeled region.
     if reason in ["left_grid", "left_update_region", "escaped"]:
         return "escaped"
+
+    # Explicit sample return.
+    if reason == "hit_sample":
+        return "sample"
 
     hit_info = res.get("hit_info", None)
 
     if hit_info is None:
         return "unknown"
 
-    owner_name = hit_info.get("owner_name", None)
+    # Preferred explicit metadata.
+    for key in ["owner_name", "owner", "surface_name", "name"]:
+        owner_name = hit_info.get(key, None)
 
-    if owner_name is not None:
-        return canonical_owner_name(owner_name)
+        if owner_name is not None:
+            return canonical_owner_name(owner_name)
 
+    # Fallback through owner ID.
     owner_id = hit_info.get("owner_id", None)
 
     if owner_id is not None and owner_name_map is not None:
-        return canonical_owner_name(owner_name_map.get(int(owner_id), "unknown"))
+        try:
+            if np.isfinite(owner_id):
+                return canonical_owner_name(
+                    owner_name_map.get(int(owner_id), "unknown")
+                )
+        except TypeError:
+            pass
+
+    # Rare fallback for grid-wire hits missing owner metadata.
+    # Infer grid shell from the terminal location.
+    if reason == "hit_grid_wire":
+        location = hit_info.get("location", None)
+
+        if location is None:
+            traj = res.get("traj", None)
+
+            if traj is not None and len(traj) > 0:
+                location = np.asarray(traj)[-1]
+
+        inferred_owner = infer_grid_owner_from_location(
+            location,
+            field=field,
+        )
+
+        if inferred_owner is not None:
+            return inferred_owner
 
     return "unknown"
 
@@ -636,6 +681,7 @@ def grid_events_to_dataframe_many(
 def cascade_results_to_dataframe_for_accounting(
     cascade_results: list[dict],
     owner_name_map: dict | None = None,
+    field: dict | None = None,
 ) -> pd.DataFrame:
     """
     Convert cascade results into a compact dataframe for current accounting.
@@ -651,6 +697,7 @@ def cascade_results_to_dataframe_for_accounting(
         terminal_owner = terminal_owner_from_result(
             res,
             owner_name_map=owner_name_map,
+            field=field,
         )
         terminal_electrode = electrode_from_owner(terminal_owner)
 
@@ -767,6 +814,7 @@ def summarize_cascade_accounting(
     cascade_results: list[dict],
     N_primary: int,
     owner_name_map: dict | None = None,
+    field: dict | None = None,
 ) -> dict:
     """
     Summarize cascade electron balance per electrode.
@@ -774,6 +822,7 @@ def summarize_cascade_accounting(
     df_cascade = cascade_results_to_dataframe_for_accounting(
         cascade_results,
         owner_name_map=owner_name_map,
+        field=field,
     )
 
     counts = cascade_current_counts(df_cascade)
@@ -842,3 +891,45 @@ def add_per_primary_to_current_counts(
     accounting_result["current_counts"] = counts
 
     return accounting_result
+
+
+def infer_grid_owner_from_location(location, field=None):
+    """
+    Infer g1/g2/g3 shell from hit location by nearest spherical radius.
+
+    Used only as a fallback for rare grid-wire hits where hit_info
+    is missing owner metadata.
+    """
+    if location is None or field is None:
+        return None
+
+    p = np.asarray(location, dtype=float)
+
+    if p.shape[0] != 3 or not np.all(np.isfinite(p)):
+        return None
+
+    r = float(np.linalg.norm(p))
+
+    candidates = []
+
+    for owner_name, radius_key in [
+        ("g1_shell", "R_g1"),
+        ("g2_shell", "R_g2"),
+        ("g3_shell", "R_g3"),
+    ]:
+        if radius_key in field:
+            candidates.append(
+                (owner_name, abs(r - float(field[radius_key])))
+            )
+
+    if not candidates:
+        return None
+
+    owner_name, dr = min(candidates, key=lambda t: t[1])
+
+    h = float(field.get("h", 0.25e-3))
+
+    if dr <= 3.0 * h:
+        return owner_name
+
+    return None

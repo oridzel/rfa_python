@@ -9,9 +9,24 @@ __version__ = "0.1.0"
 from .io import load_field_npz, save_field_npz
 
 from .fields import (
+    OWNER_ID,
+    OWNER_NAME,
     attach_default_owner_name_map,
+    make_empty_field_grid,
+    build_rfa_field,
+    calculate_electric_field,
+    compute_electric_field,
     build_field_interpolators,
     build_potential_interpolator,
+    evaluate_field,
+    evaluate_potential,
+    E_at_point,
+    potential_at_point,
+    classify_grid_point,
+    mark_analytic_rfa_surfaces,
+    mark_named_meshes,
+    solve_laplace_red_black_sor,
+    solve_laplace_jacobi,
 )
 
 from .geometry import (

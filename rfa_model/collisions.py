@@ -11,6 +11,74 @@ import numpy as np
 import trimesh
 
 
+OWNER_ID_BY_NAME = {
+    "sample": 1,
+    "holder": 2,
+    "receiver": 3,
+    "rod": 4,
+
+    "g1frame": 5,
+    "g2frame": 6,
+    "g3frame": 7,
+
+    "g1_low_frame": 5,
+    "g1_upper_frame": 5,
+    "g2_low_frame": 6,
+    "g2_upper_frame": 6,
+    "g3_low_frame": 7,
+    "g3_upper_frame": 7,
+
+    "drifttube": 8,
+
+    "g1_shell": 9,
+    "g2_shell": 10,
+    "g3_shell": 11,
+    "collector_shell": 12,
+}
+
+
+def canonical_collision_owner_name(name):
+    """
+    Keep detailed grid-frame names for geometry, but normalize aliases if needed.
+    """
+    if name is None:
+        return None
+
+    name = str(name)
+
+    aliases = {
+        "grid1": "g1_shell",
+        "grid2": "g2_shell",
+        "grid3": "g3_shell",
+        "collector": "collector_shell",
+    }
+
+    return aliases.get(name, name)
+
+
+def add_owner_metadata(hit: dict, owner_name: str | None = None) -> dict:
+    """
+    Add explicit owner_name and owner_id fields to a hit dictionary.
+
+    Keeps the older 'owner' key for backward compatibility.
+    """
+    if hit is None:
+        return None
+
+    if owner_name is None:
+        owner_name = hit.get("owner_name", None)
+    if owner_name is None:
+        owner_name = hit.get("owner", None)
+
+    owner_name = canonical_collision_owner_name(owner_name)
+
+    hit["owner"] = owner_name
+    hit["owner_name"] = owner_name
+    hit["owner_id"] = OWNER_ID_BY_NAME.get(owner_name, None)
+
+    return hit
+
+
 # ============================================================
 # STL collision mesh and intersector
 # ============================================================
@@ -121,7 +189,7 @@ def first_segment_hit(
     owner = face_owner[tri_id]
     normal = collision_mesh.face_normals[tri_id]
 
-    return {
+    hit = {
         "kind": "stl",
         "location": location,
         "distance": distance,
@@ -129,6 +197,8 @@ def first_segment_hit(
         "owner": owner,
         "normal": normal,
     }
+
+    return add_owner_metadata(hit, owner_name=owner)
 
 
 # ============================================================
@@ -256,7 +326,7 @@ def first_sphere_segment_crossing(
     normal = location - center
     normal = normal / np.linalg.norm(normal)
 
-    return {
+    hit = {
         "kind": "sphere",
         "location": location,
         "distance": np.linalg.norm(t * d),
@@ -264,6 +334,8 @@ def first_sphere_segment_crossing(
         "owner": name,
         "normal": normal,
     }
+
+    return add_owner_metadata(hit, owner_name=name)
 
 
 # ============================================================
@@ -482,10 +554,12 @@ def segment_hits_sample_plane(
         if not (sample_z_bounds[0] <= location[2] <= sample_z_bounds[1]):
             return None
 
-    return {
+    hit = {
         "kind": "sample_plane",
         "location": location,
         "distance": np.linalg.norm(location - p0),
         "owner": "sample",
         "normal": np.array([1.0, 0.0, 0.0]),
     }
+
+    return add_owner_metadata(hit, owner_name="sample")
