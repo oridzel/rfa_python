@@ -3,6 +3,8 @@ fields.py
 
 Voxel field construction, Laplace solver, owner map handling,
 and field/potential interpolation utilities for the RFA model.
+mesh_method:
+    "voxelized", "contains", or "bounds".
 """
 
 from __future__ import annotations
@@ -257,6 +259,60 @@ def mark_box_region(
     return field
 
 
+def mark_mesh_voxels_by_voxelized(
+    field: dict,
+    mesh,
+    voltage: float,
+    owner_name: str,
+    pitch: float | None = None,
+) -> dict:
+    """
+    Mark fixed-potential voxels using trimesh mesh.voxelized(pitch=h).
+
+    This matches the tested field-building approach.
+
+    The mesh is voxelized in physical coordinates, then each voxel center is
+    mapped onto the nearest field-grid index.
+    """
+    if pitch is None:
+        pitch = float(field["h"])
+
+    vox = mesh.voxelized(pitch=pitch)
+
+    # Voxel centers in world coordinates.
+    points = np.asarray(vox.points, dtype=float)
+
+    if points.size == 0:
+        return field
+
+    x = field["x"]
+    y = field["y"]
+    z = field["z"]
+    h = float(field["h"])
+
+    i = np.round((points[:, 0] - x[0]) / h).astype(int)
+    j = np.round((points[:, 1] - y[0]) / h).astype(int)
+    k = np.round((points[:, 2] - z[0]) / h).astype(int)
+
+    valid = (
+        (i >= 0) & (i < len(x))
+        & (j >= 0) & (j < len(y))
+        & (k >= 0) & (k < len(z))
+    )
+
+    i = i[valid]
+    j = j[valid]
+    k = k[valid]
+
+    owner_id = owner_id_from_name(owner_name)
+
+    field["V"][i, j, k] = voltage
+    field["fixed"][i, j, k] = True
+    field["owner"][i, j, k] = owner_id
+
+    return field
+
+
 def mark_mesh_voxels_by_contains(
     field: dict,
     mesh,
@@ -375,13 +431,23 @@ def mark_named_meshes(
 
         voltage = float(voltages.get(voltage_key, 0.0))
 
-        if method == "contains":
+        if method == "voxelized":
+            mark_mesh_voxels_by_voxelized(
+                field=field,
+                mesh=mesh,
+                voltage=voltage,
+                owner_name=name,
+                pitch=float(field["h"]),
+            )
+        
+        elif method == "contains":
             mark_mesh_voxels_by_contains(
                 field=field,
                 mesh=mesh,
                 voltage=voltage,
                 owner_name=name,
             )
+        
         elif method == "bounds":
             mark_mesh_bounds_shell(
                 field=field,
@@ -389,8 +455,9 @@ def mark_named_meshes(
                 voltage=voltage,
                 owner_name=name,
             )
+        
         else:
-            raise ValueError("method must be 'contains' or 'bounds'")
+            raise ValueError("method must be 'voxelized', 'contains', or 'bounds'")
 
     return field
 
@@ -946,7 +1013,7 @@ def build_rfa_field(
     R_g2: float = 0.0579265,
     R_g3: float = 0.0710762,
     R_col: float = 0.08255,
-    mesh_method: str = "contains",
+    mesh_method: str = "voxelized",
     outer_boundary_voltage: float | None = None,
     solver: str = "sor",
     max_iter: int = 20_000,
