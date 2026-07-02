@@ -396,7 +396,7 @@ def integrate_one_electron(
                 traj=traj,
                 vel=vel,
                 step=step,
-                extra={"p1": p1},
+                extra={"p1": p_new},
             )
 
         E_new = E_at_point(p_new, Ex_interp, Ey_interp, Ez_interp)
