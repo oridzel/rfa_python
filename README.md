@@ -3,8 +3,8 @@
 Python model for electron trajectory tracking, secondary/backscattered electron emission, cascade emission, and electrode-current accounting in a spherical retarding-field analyzer.
 
 
-## Install directly from GitHub**
-The easiest way to install the library and all its dependencies (like `numpy`, `scipy`, `nlopt`, etc.):
+## Install directly from GitHub
+The easiest way to install the library and all its dependencies (like `numpy`, `scipy`, `trimesh`, etc.):
 ```bash
 pip install git+https://github.com/oridzel/rfa_python.git
 ```
