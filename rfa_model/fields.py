@@ -265,24 +265,29 @@ def mark_mesh_voxels_by_voxelized(
     voltage: float,
     owner_name: str,
     pitch: float | None = None,
+    verbose: bool = False,
 ) -> dict:
     """
     Mark fixed-potential voxels using trimesh mesh.voxelized(pitch=h).
-
-    This matches the tested field-building approach.
-
-    The mesh is voxelized in physical coordinates, then each voxel center is
-    mapped onto the nearest field-grid index.
     """
     if pitch is None:
         pitch = float(field["h"])
 
-    vox = mesh.voxelized(pitch=pitch)
+    _log(verbose, f"  Voxelizing {owner_name!r} with pitch = {pitch:.3e} m ...")
 
-    # Voxel centers in world coordinates.
+    t0 = time.perf_counter()
+
+    vox = mesh.voxelized(pitch=pitch)
     points = np.asarray(vox.points, dtype=float)
 
+    _log(
+        verbose,
+        f"    voxelized points: {len(points):,} "
+        f"elapsed = {time.perf_counter() - t0:.2f} s"
+    )
+
     if points.size == 0:
+        _log(verbose, f"    WARNING: no voxel points for {owner_name!r}")
         return field
 
     x = field["x"]
@@ -300,6 +305,9 @@ def mark_mesh_voxels_by_voxelized(
         & (k >= 0) & (k < len(z))
     )
 
+    n_valid = int(valid.sum())
+    n_outside = int(len(valid) - n_valid)
+
     i = i[valid]
     j = j[valid]
     k = k[valid]
@@ -309,6 +317,12 @@ def mark_mesh_voxels_by_voxelized(
     field["V"][i, j, k] = voltage
     field["fixed"][i, j, k] = True
     field["owner"][i, j, k] = owner_id
+
+    _log(
+        verbose,
+        f"    assigned fixed voxels: {n_valid:,}; outside grid: {n_outside:,}; "
+        f"V = {voltage:g} V; owner_id = {owner_id}"
+    )
 
     return field
 
@@ -386,7 +400,8 @@ def mark_named_meshes(
     meshes: dict,
     voltages: dict,
     name_to_voltage_key: dict | None = None,
-    method: str = "contains",
+    method: str = "voxelized",
+    verbose: bool = False,
 ) -> dict:
     """
     Mark multiple named STL meshes as fixed-potential voxels.
@@ -438,9 +453,12 @@ def mark_named_meshes(
                 voltage=voltage,
                 owner_name=name,
                 pitch=float(field["h"]),
+                verbose=verbose,
             )
-        
+                
         elif method == "contains":
+            _log(verbose, f"  Voxelizing {name!r} by mesh.contains ...")
+        
             mark_mesh_voxels_by_contains(
                 field=field,
                 mesh=mesh,
@@ -470,46 +488,48 @@ def mark_analytic_rfa_surfaces(
     R_g3: float,
     R_col: float,
     shell_thickness: float | None = None,
+    verbose: bool = False,
 ) -> dict:
     """
     Mark analytic g1/g2/g3 grid shells and collector shell.
     """
-    field["R_g1"] = float(R_g1)
-    field["R_g2"] = float(R_g2)
-    field["R_g3"] = float(R_g3)
-    field["R_col"] = float(R_col)
-
-    mark_spherical_shell(
-        field,
-        radius=R_g1,
-        voltage=float(voltages.get("Vg1", 0.0)),
-        owner_name="g1_shell",
-        thickness=shell_thickness,
+    attach_rfa_metadata(
+        field=field,
+        voltages=voltages,
+        R_g1=R_g1,
+        R_g2=R_g2,
+        R_g3=R_g3,
+        R_col=R_col,
     )
 
-    mark_spherical_shell(
-        field,
-        radius=R_g2,
-        voltage=float(voltages.get("Vg2", 0.0)),
-        owner_name="g2_shell",
-        thickness=shell_thickness,
-    )
+    _log(verbose, "Marking analytic spherical RFA surfaces:")
+    _log(verbose, f"  R_g1  = {1e3 * R_g1:.4f} mm, Vg1 = {voltages.get('Vg1', 0.0):g} V")
+    _log(verbose, f"  R_g2  = {1e3 * R_g2:.4f} mm, Vg2 = {voltages.get('Vg2', 0.0):g} V")
+    _log(verbose, f"  R_g3  = {1e3 * R_g3:.4f} mm, Vg3 = {voltages.get('Vg3', 0.0):g} V")
+    _log(verbose, f"  R_col = {1e3 * R_col:.4f} mm, Vc  = {voltages.get('Vc', 0.0):g} V")
 
-    mark_spherical_shell(
-        field,
-        radius=R_g3,
-        voltage=float(voltages.get("Vg3", 0.0)),
-        owner_name="g3_shell",
-        thickness=shell_thickness,
-    )
+    for owner_name, radius, voltage_key in [
+        ("g1_shell", R_g1, "Vg1"),
+        ("g2_shell", R_g2, "Vg2"),
+        ("g3_shell", R_g3, "Vg3"),
+        ("collector_shell", R_col, "Vc"),
+    ]:
+        n_before = int(field["fixed"].sum())
 
-    mark_spherical_shell(
-        field,
-        radius=R_col,
-        voltage=float(voltages.get("Vc", 0.0)),
-        owner_name="collector_shell",
-        thickness=shell_thickness,
-    )
+        mark_spherical_shell(
+            field,
+            radius=radius,
+            voltage=float(voltages.get(voltage_key, 0.0)),
+            owner_name=owner_name,
+            thickness=shell_thickness,
+        )
+
+        n_after = int(field["fixed"].sum())
+
+        _log(
+            verbose,
+            f"  {owner_name}: added approximately {n_after - n_before:,} fixed voxels"
+        )
 
     return field
 
@@ -1003,44 +1023,13 @@ def classify_grid_point(p, field: dict) -> dict:
 # ============================================================
 
 def build_rfa_field(
-    xyz_min=(-0.083, -0.083, -0.083),
-    xyz_max=(0.083, 0.083, 0.083),
-    h: float = 0.5e-3,
-    voltages: dict | None = None,
-    meshes: dict | None = None,
-    frame_meshes: dict | None = None,
-    R_g1: float = 0.0451904,
-    R_g2: float = 0.0579265,
-    R_g3: float = 0.0710762,
-    R_col: float = 0.08255,
-    mesh_method: str = "voxelized",
-    outer_boundary_voltage: float | None = None,
-    solver: str = "sor",
-    max_iter: int = 20_000,
-    tol: float = 1e-5,
-    omega: float | None = None,
+    ...
     verbose: bool = True,
 ) -> dict:
     """
     Build and solve a complete RFA electrostatic field.
-
-    This creates a voxel field, marks fixed electrodes, solves Laplace's
-    equation, and calculates Ex/Ey/Ez.
-
-    Parameters
-    ----------
-    meshes:
-        Sample/holder/receiver/rod/drifttube meshes, dict name -> mesh.
-    frame_meshes:
-        Grid-frame meshes, dict name -> mesh.
-    voltages:
-        Dict containing Vs, Vg1, Vg2, Vg3, Vc, Vdt.
-
-    Returns
-    -------
-    field:
-        Complete field dictionary.
     """
+
     if voltages is None:
         voltages = {
             "Vs": 0.0,
@@ -1051,16 +1040,38 @@ def build_rfa_field(
             "Vdt": 0.0,
         }
 
+    t_total = time.perf_counter()
+
+    _log(verbose, "Building RFA field")
+    _log(verbose, "==================")
+    _log(verbose, f"h = {h:.3e} m")
+    _log(verbose, f"domain min = {xyz_min}")
+    _log(verbose, f"domain max = {xyz_max}")
+    _log(verbose, f"voltages = {voltages}")
+    _log(verbose, "\n[1/7] Creating grid ...")
+
     field = make_empty_field_grid(
         xyz_min=xyz_min,
         xyz_max=xyz_max,
         h=h,
     )
 
-    field["voltages"] = dict(voltages)
+    _log(verbose, f"  grid shape = {field['V'].shape}")
+    _log(verbose, f"  total voxels = {field['V'].size:,}")
+
+    attach_rfa_metadata(
+        field=field,
+        voltages=voltages,
+        R_g1=R_g1,
+        R_g2=R_g2,
+        R_g3=R_g3,
+        R_col=R_col,
+    )
 
     if outer_boundary_voltage is None:
         outer_boundary_voltage = float(voltages.get("Vdt", 0.0))
+
+    _log(verbose, "\n[2/7] Marking outer boundary ...")
 
     set_outer_boundary_fixed(
         field,
@@ -1068,21 +1079,39 @@ def build_rfa_field(
         owner_name="drifttube",
     )
 
+    _log(verbose, f"  fixed voxels after boundary = {int(field['fixed'].sum()):,}")
+
     if meshes is not None:
+        _log(verbose, "\n[3/7] Voxelizing sample assembly meshes ...")
+
         mark_named_meshes(
             field,
             meshes=meshes,
             voltages=voltages,
             method=mesh_method,
+            verbose=verbose,
         )
 
+        _log(verbose, f"  fixed voxels after sample assembly = {int(field['fixed'].sum()):,}")
+    else:
+        _log(verbose, "\n[3/7] No sample assembly meshes provided.")
+
     if frame_meshes is not None:
+        _log(verbose, "\n[4/7] Voxelizing grid-frame meshes ...")
+
         mark_named_meshes(
             field,
             meshes=frame_meshes,
             voltages=voltages,
             method=mesh_method,
+            verbose=verbose,
         )
+
+        _log(verbose, f"  fixed voxels after grid frames = {int(field['fixed'].sum()):,}")
+    else:
+        _log(verbose, "\n[4/7] No grid-frame meshes provided.")
+
+    _log(verbose, "\n[5/7] Marking analytic grid/collector shells ...")
 
     mark_analytic_rfa_surfaces(
         field,
@@ -1091,13 +1120,20 @@ def build_rfa_field(
         R_g2=R_g2,
         R_g3=R_g3,
         R_col=R_col,
+        verbose=verbose,
     )
+
+    _log(verbose, f"  fixed voxels after analytic shells = {int(field['fixed'].sum()):,}")
+
+    _log(verbose, "\n[6/7] Initializing potential ...")
 
     initialize_potential_linear_x(
         field,
         V_left=outer_boundary_voltage,
         V_right=float(voltages.get("Vc", outer_boundary_voltage)),
     )
+
+    _log(verbose, "\n[7/7] Solving Laplace equation ...")
 
     if solver == "sor":
         if omega is None:
@@ -1110,6 +1146,7 @@ def build_rfa_field(
             omega=omega,
             verbose=verbose,
         )
+
     elif solver == "jacobi":
         if omega is None:
             omega = 1.0
@@ -1121,11 +1158,22 @@ def build_rfa_field(
             omega=omega,
             verbose=verbose,
         )
+
     else:
         raise ValueError("solver must be 'sor' or 'jacobi'")
 
+    _log(verbose, "\nCalculating electric field Ex, Ey, Ez ...")
     calculate_electric_field(field)
+
     attach_default_owner_name_map(field)
+
+    if "validate_field_metadata" in globals():
+        validate_field_metadata(field)
+
+    _log(verbose, "\nField build complete")
+    _log(verbose, f"total fixed voxels = {int(field['fixed'].sum()):,}")
+    _log(verbose, f"solver converged = {field.get('solver', {}).get('converged', None)}")
+    _log(verbose, f"total elapsed = {time.perf_counter() - t_total:.2f} s")
 
     return field
 
@@ -1179,3 +1227,11 @@ def potential_at_point(p, Phi_interp):
     Backwards-compatible alias for evaluate_potential().
     """
     return evaluate_potential(p, Phi_interp)
+
+
+def _log(verbose: bool, message: str):
+    """
+    Print a progress message when verbose=True.
+    """
+    if verbose:
+        print(message, flush=True)
