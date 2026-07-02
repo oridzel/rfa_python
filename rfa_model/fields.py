@@ -88,6 +88,59 @@ def owner_name_from_id(owner_id: int) -> str:
     return OWNER_NAME.get(int(owner_id), f"owner_{int(owner_id)}")
 
 
+def attach_rfa_metadata(
+    field: dict,
+    voltages: dict,
+    R_g1: float,
+    R_g2: float,
+    R_g3: float,
+    R_col: float,
+) -> dict:
+    """
+    Attach RFA geometry and voltage metadata required by trajectory,
+    collision, and cascade code.
+    """
+    field["R_g1"] = float(R_g1)
+    field["R_g2"] = float(R_g2)
+    field["R_g3"] = float(R_g3)
+    field["R_col"] = float(R_col)
+    field["voltages"] = dict(voltages)
+
+    attach_default_owner_name_map(field)
+
+    return field
+
+
+def validate_field_metadata(field: dict) -> None:
+    """
+    Raise an error if required RFA field metadata are missing.
+    """
+    required = [
+        "x", "y", "z", "h",
+        "V", "fixed", "owner", "update_region",
+        "R_g1", "R_g2", "R_g3", "R_col",
+        "voltages",
+        "owner_name_map", "owner_id_map",
+    ]
+
+    missing = [key for key in required if key not in field]
+
+    if missing:
+        raise KeyError(f"Field is missing required keys: {missing}")
+
+    # Ex/Ey/Ez are present only after calculate_electric_field().
+    if all(key in field for key in ["Ex", "Ey", "Ez"]):
+        return
+
+
+def _log(verbose: bool, message: str):
+    """
+    Print a progress message when verbose=True.
+    """
+    if verbose:
+        print(message, flush=True)
+
+
 # ============================================================
 # Grid construction
 # ============================================================
@@ -1191,62 +1244,3 @@ def build_rfa_field(
     _log(verbose, f"total elapsed = {time.perf_counter() - t_total:.2f} s")
 
     return field
-
-
-def E_at_point(p, Ex_interp, Ey_interp, Ez_interp):
-    """
-    Backwards-compatible alias for evaluate_field().
-    """
-    return evaluate_field(p, Ex_interp, Ey_interp, Ez_interp)
-
-
-def potential_at_point(p, Phi_interp):
-    """
-    Backwards-compatible alias for evaluate_potential().
-    """
-    return evaluate_potential(p, Phi_interp)
-
-
-def evaluate_field(p, Ex_interp, Ey_interp, Ez_interp):
-    """
-    Evaluate electric field vector at one point.
-    """
-    p = np.asarray(p, dtype=float).reshape(1, 3)
-
-    E = np.array([
-        float(Ex_interp(p)[0]),
-        float(Ey_interp(p)[0]),
-        float(Ez_interp(p)[0]),
-    ])
-
-    return E
-
-
-def evaluate_potential(p, Phi_interp):
-    """
-    Evaluate potential at one point.
-    """
-    p = np.asarray(p, dtype=float).reshape(1, 3)
-    return float(Phi_interp(p)[0])
-
-
-def E_at_point(p, Ex_interp, Ey_interp, Ez_interp):
-    """
-    Backwards-compatible alias for evaluate_field().
-    """
-    return evaluate_field(p, Ex_interp, Ey_interp, Ez_interp)
-
-
-def potential_at_point(p, Phi_interp):
-    """
-    Backwards-compatible alias for evaluate_potential().
-    """
-    return evaluate_potential(p, Phi_interp)
-
-
-def _log(verbose: bool, message: str):
-    """
-    Print a progress message when verbose=True.
-    """
-    if verbose:
-        print(message, flush=True)
