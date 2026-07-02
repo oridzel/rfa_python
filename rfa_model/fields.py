@@ -1244,3 +1244,40 @@ def build_rfa_field(
     _log(verbose, f"total elapsed = {time.perf_counter() - t_total:.2f} s")
 
     return field
+
+
+def E_at_point(p, Ex_interp, Ey_interp, Ez_interp):
+    """
+    Backwards-compatible alias for evaluate_field().
+    """
+    return evaluate_field(p, Ex_interp, Ey_interp, Ez_interp)
+
+
+def potential_at_point(p, Phi_interp):
+    """
+    Backwards-compatible alias for evaluate_potential().
+    """
+    return evaluate_potential(p, Phi_interp)
+
+
+def evaluate_field(p, Ex_interp, Ey_interp, Ez_interp):
+    """
+    Evaluate electric field vector at one point.
+    """
+    p = np.asarray(p, dtype=float).reshape(1, 3)
+
+    E = np.array([
+        float(Ex_interp(p)[0]),
+        float(Ey_interp(p)[0]),
+        float(Ez_interp(p)[0]),
+    ])
+
+    return E
+
+
+def evaluate_potential(p, Phi_interp):
+    """
+    Evaluate potential at one point.
+    """
+    p = np.asarray(p, dtype=float).reshape(1, 3)
+    return float(Phi_interp(p)[0])
