@@ -1023,7 +1023,22 @@ def classify_grid_point(p, field: dict) -> dict:
 # ============================================================
 
 def build_rfa_field(
-    ...
+    xyz_min=(-0.083, -0.083, -0.083),
+    xyz_max=(0.083, 0.083, 0.083),
+    h: float = 0.5e-3,
+    voltages: dict | None = None,
+    meshes: dict | None = None,
+    frame_meshes: dict | None = None,
+    R_g1: float = 0.0451904,
+    R_g2: float = 0.0579265,
+    R_g3: float = 0.0710762,
+    R_col: float = 0.08255,
+    mesh_method: str = "voxelized",
+    outer_boundary_voltage: float | None = None,
+    solver: str = "sor",
+    max_iter: int = 20_000,
+    tol: float = 1e-5,
+    omega: float | None = None,
     verbose: bool = True,
 ) -> dict:
     """
