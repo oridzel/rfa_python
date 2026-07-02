@@ -23,6 +23,26 @@ from .collisions import (
 )
 
 
+def _trajectory_failure(reason, p, v, traj, vel, step, extra=None):
+    hit_info = {
+        "kind": reason,
+        "location": np.asarray(p, dtype=float),
+        "v_in": np.asarray(v, dtype=float),
+        "KE_hit_eV": np.nan,
+    }
+
+    if extra is not None:
+        hit_info.update(extra)
+
+    return {
+        "reason": reason,
+        "hit_info": hit_info,
+        "traj": np.asarray(traj),
+        "vel": np.asarray(vel),
+        "steps": step,
+    }
+
+
 def unit(v: np.ndarray) -> np.ndarray:
     """
     Normalize a vector.
@@ -233,6 +253,16 @@ def integrate_one_electron(
     p = np.asarray(p0, dtype=float).copy()
     v = np.asarray(v0, dtype=float).copy()
 
+    if not np.all(np.isfinite(p)) or not np.all(np.isfinite(v)):
+        return _trajectory_failure(
+            reason="nan_state",
+            p=p,
+            v=v,
+            traj=traj,
+            vel=vel,
+            step=step,
+        )
+
     traj = [p.copy()]
     vel = [v.copy()]
     grid_events = []
@@ -343,12 +373,43 @@ def integrate_one_electron(
             dt_step = dt
 
         E = E_at_point(p, Ex_interp, Ey_interp, Ez_interp)
+        if not np.all(np.isfinite(E)):
+            return _trajectory_failure(
+                reason="field_nan",
+                p=p,
+                v=v,
+                traj=traj,
+                vel=vel,
+                step=step,
+                extra={"E": E},
+            )
         a = q_over_m * E
 
         # Velocity-Verlet / constant acceleration over one small step.
         p_new = p + v * dt_step + 0.5 * a * dt_step**2
 
+        if not np.all(np.isfinite(p_new)):
+            return _trajectory_failure(
+                reason="nan_step",
+                p=p,
+                v=v,
+                traj=traj,
+                vel=vel,
+                step=step,
+                extra={"p1": p1},
+            )
+
         E_new = E_at_point(p_new, Ex_interp, Ey_interp, Ez_interp)
+        if not np.all(np.isfinite(E_new)):
+            return _trajectory_failure(
+                reason="field_nan",
+                p=p,
+                v=v,
+                traj=traj,
+                vel=vel,
+                step=step,
+                extra={"E": E},
+            )
         a_new = q_over_m * E_new
         v_new = v + 0.5 * (a + a_new) * dt_step
 

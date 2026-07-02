@@ -155,7 +155,15 @@ def terminal_owner_from_result(
     reason = res.get("reason", None)
 
     # These are not electrode hits inside the modeled region.
-    if reason in ["left_grid", "left_update_region", "escaped"]:
+    if reason in [
+        "left_grid",
+        "left_update_region",
+        "escaped",
+        "field_nan",
+        "nan_state",
+        "nan_step",
+        "rk_nan",
+    ]:
         return "escaped"
 
     # Explicit sample return.

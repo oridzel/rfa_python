@@ -37,6 +37,18 @@ OWNER_ID_BY_NAME = {
 }
 
 
+def _is_finite_vec(v, n=3) -> bool:
+    """
+    Return True if v is a finite vector of length n.
+    """
+    v = np.asarray(v, dtype=float)
+
+    return (
+        v.shape == (n,)
+        and np.all(np.isfinite(v))
+    )
+
+
 def canonical_collision_owner_name(name):
     """
     Keep detailed grid-frame names for geometry, but normalize aliases if needed.
@@ -158,29 +170,44 @@ def first_segment_hit(
     p0 = np.asarray(p0, dtype=float)
     p1 = np.asarray(p1, dtype=float)
 
+    if not _is_finite_vec(p0) or not _is_finite_vec(p1):
+        return None
+
     seg = p1 - p0
     seg_len = np.linalg.norm(seg)
 
-    if seg_len <= eps:
+    if (not np.isfinite(seg_len)) or seg_len <= eps:
         return None
 
     direction = seg / seg_len
 
-    locations, ray_ids, tri_ids = intersector.intersects_location(
-        ray_origins=p0.reshape(1, 3),
-        ray_directions=direction.reshape(1, 3),
-        multiple_hits=False,
-    )
+    if not _is_finite_vec(direction):
+        return None
+
+    try:
+        locations, ray_ids, tri_ids = intersector.intersects_location(
+            ray_origins=p0.reshape(1, 3),
+            ray_directions=direction.reshape(1, 3),
+            multiple_hits=False,
+        )
+    except Exception:
+        # Avoid letting rare rtree/trimesh failures kill a whole batch.
+        # Usually caused by invalid numerical ray state.
+        return None
 
     if len(locations) == 0:
         return None
 
     location = locations[0]
+
+    if not _is_finite_vec(location):
+        return None
+
     tri_id = int(tri_ids[0])
 
     distance = np.linalg.norm(location - p0)
 
-    if distance <= min_distance:
+    if (not np.isfinite(distance)) or distance <= min_distance:
         return None
 
     if distance > seg_len + eps:
@@ -198,7 +225,11 @@ def first_segment_hit(
         "normal": normal,
     }
 
-    return add_owner_metadata(hit, owner_name=owner)
+    # If you added add_owner_metadata earlier, use it:
+    if "add_owner_metadata" in globals():
+        hit = add_owner_metadata(hit, owner_name=owner)
+
+    return hit
 
 
 # ============================================================
@@ -239,8 +270,20 @@ def segment_intersects_aabb(
     """
     p0 = np.asarray(p0, dtype=float)
     p1 = np.asarray(p1, dtype=float)
+    bounds = np.asarray(bounds, dtype=float)
+
+    if (
+        not _is_finite_vec(p0)
+        or not _is_finite_vec(p1)
+        or bounds.shape != (2, 3)
+        or not np.all(np.isfinite(bounds))
+    ):
+        return False
 
     d = p1 - p0
+
+    if not _is_finite_vec(d):
+        return False
 
     tmin = 0.0
     tmax = 1.0
@@ -254,6 +297,9 @@ def segment_intersects_aabb(
 
             t1 = (bounds[0, ax] - p0[ax]) * inv_d
             t2 = (bounds[1, ax] - p0[ax]) * inv_d
+
+            if not np.isfinite(t1) or not np.isfinite(t2):
+                return False
 
             if t1 > t2:
                 t1, t2 = t2, t1
@@ -292,11 +338,21 @@ def first_sphere_segment_crossing(
 ):
     """
     First crossing of a sphere by finite segment p0 -> p1.
-
-    Returns None if there is no crossing inside the segment.
     """
-    p0_shift = np.asarray(p0, dtype=float) - center
-    p1_shift = np.asarray(p1, dtype=float) - center
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    center = np.asarray(center, dtype=float)
+
+    if (
+        not _is_finite_vec(p0)
+        or not _is_finite_vec(p1)
+        or not _is_finite_vec(center)
+        or not np.isfinite(radius)
+    ):
+        return None
+
+    p0_shift = p0 - center
+    p1_shift = p1 - center
 
     d = p1_shift - p0_shift
 
@@ -304,9 +360,12 @@ def first_sphere_segment_crossing(
     b = 2.0 * np.dot(p0_shift, d)
     c = np.dot(p0_shift, p0_shift) - radius**2
 
+    if not np.isfinite(a) or not np.isfinite(b) or not np.isfinite(c):
+        return None
+
     disc = b * b - 4.0 * a * c
 
-    if disc < 0 or a <= eps:
+    if (not np.isfinite(disc)) or disc < 0 or a <= eps:
         return None
 
     sqrt_disc = np.sqrt(disc)
@@ -314,7 +373,10 @@ def first_sphere_segment_crossing(
     t1 = (-b - sqrt_disc) / (2.0 * a)
     t2 = (-b + sqrt_disc) / (2.0 * a)
 
-    candidates = [t for t in (t1, t2) if eps < t <= 1.0 + eps]
+    candidates = [
+        t for t in (t1, t2)
+        if np.isfinite(t) and eps < t <= 1.0 + eps
+    ]
 
     if not candidates:
         return None
@@ -323,8 +385,16 @@ def first_sphere_segment_crossing(
 
     location = (p0_shift + t * d) + center
 
+    if not _is_finite_vec(location):
+        return None
+
     normal = location - center
-    normal = normal / np.linalg.norm(normal)
+    normal_norm = np.linalg.norm(normal)
+
+    if (not np.isfinite(normal_norm)) or normal_norm <= eps:
+        return None
+
+    normal = normal / normal_norm
 
     hit = {
         "kind": "sphere",
@@ -335,7 +405,10 @@ def first_sphere_segment_crossing(
         "normal": normal,
     }
 
-    return add_owner_metadata(hit, owner_name=name)
+    if "add_owner_metadata" in globals():
+        hit = add_owner_metadata(hit, owner_name=name)
+
+    return hit
 
 
 # ============================================================
