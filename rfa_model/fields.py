@@ -545,7 +545,10 @@ def mark_analytic_rfa_surfaces(
     verbose: bool = False,
 ) -> dict:
     """
-    Mark analytic g1/g2/g3 grid shells and collector shell.
+    Mark analytic g1/g2/g3 grid shells, collector shell,
+    and drift-tube boundary.
+
+    This version stores the masks in the field dictionary.
     """
     attach_rfa_metadata(
         field=field,
@@ -556,34 +559,59 @@ def mark_analytic_rfa_surfaces(
         R_col=R_col,
     )
 
-    _log(verbose, "Marking analytic spherical RFA surfaces:")
-    _log(verbose, f"  R_g1  = {1e3 * R_g1:.4f} mm, Vg1 = {voltages.get('Vg1', 0.0):g} V")
-    _log(verbose, f"  R_g2  = {1e3 * R_g2:.4f} mm, Vg2 = {voltages.get('Vg2', 0.0):g} V")
-    _log(verbose, f"  R_g3  = {1e3 * R_g3:.4f} mm, Vg3 = {voltages.get('Vg3', 0.0):g} V")
-    _log(verbose, f"  R_col = {1e3 * R_col:.4f} mm, Vc  = {voltages.get('Vc', 0.0):g} V")
+    _log(verbose, "Creating analytic RFA boundary masks ...")
 
-    for owner_name, radius, voltage_key in [
-        ("g1_shell", R_g1, "Vg1"),
-        ("g2_shell", R_g2, "Vg2"),
-        ("g3_shell", R_g3, "Vg3"),
-        ("collector_shell", R_col, "Vc"),
-    ]:
-        n_before = int(field["fixed"].sum())
+    make_analytic_rfa_boundary_masks(
+        field=field,
+        R_g1=R_g1,
+        R_g2=R_g2,
+        R_g3=R_g3,
+        R_col=R_col,
+    )
 
-        mark_spherical_shell(
-            field,
-            radius=radius,
-            voltage=float(voltages.get(voltage_key, 0.0)),
-            owner_name=owner_name,
-            thickness=shell_thickness,
-        )
+    _log(verbose, "Assigning analytic fixed-potential boundaries ...")
 
-        n_after = int(field["fixed"].sum())
+    n_before = int(np.count_nonzero(field["fixed"]))
 
-        _log(
-            verbose,
-            f"  {owner_name}: added approximately {n_after - n_before:,} fixed voxels"
-        )
+    _set_fixed_mask(
+        field,
+        field["drift_bc"],
+        voltage=float(voltages.get("Vdt", 0.0)),
+        owner_name="drifttube",
+    )
+
+    _set_fixed_mask(
+        field,
+        field["g1_bdry"],
+        voltage=float(voltages.get("Vg1", 0.0)),
+        owner_name="g1_shell",
+    )
+
+    _set_fixed_mask(
+        field,
+        field["g2_bdry"],
+        voltage=float(voltages.get("Vg2", 0.0)),
+        owner_name="g2_shell",
+    )
+
+    _set_fixed_mask(
+        field,
+        field["g3_bdry"],
+        voltage=float(voltages.get("Vg3", 0.0)),
+        owner_name="g3_shell",
+    )
+
+    _set_fixed_mask(
+        field,
+        field["col_bdry"],
+        voltage=float(voltages.get("Vc", 0.0)),
+        owner_name="collector_shell",
+    )
+
+    n_after = int(np.count_nonzero(field["fixed"]))
+
+    _log(verbose, f"  analytic fixed voxels added: {n_after - n_before:,}")
+    _log(verbose, f"  update voxels: {int(np.count_nonzero(field['update_region'] & ~field['fixed'])):,}")
 
     return field
 
@@ -591,6 +619,175 @@ def mark_analytic_rfa_surfaces(
 # ============================================================
 # Update-region handling
 # ============================================================
+
+def _set_fixed_mask(
+    field: dict,
+    mask: np.ndarray,
+    voltage: float,
+    owner_name: str,
+) -> dict:
+    """
+    Assign a fixed-potential mask to the field.
+    """
+    owner_id = owner_id_from_name(owner_name)
+
+    field["fixed"][mask] = True
+    field["V"][mask] = float(voltage)
+    field["owner"][mask] = owner_id
+
+    return field
+
+
+def make_analytic_rfa_boundary_masks(
+    field: dict,
+    R_g1: float,
+    R_g2: float,
+    R_g3: float,
+    R_col: float,
+    r_hole: float = 0.0056,
+    r_rod: float = 0.011,
+    r_dt_i: float = 4.3e-3,
+    t_dt: float = 0.25e-3,
+) -> dict:
+    """
+    Create and store analytic RFA boundary masks.
+
+    Stores:
+        field["g1_bdry"]
+        field["g2_bdry"]
+        field["g3_bdry"]
+        field["col_bdry"]
+        field["drift_bc"]
+        field["inside"]
+        field["update_region"]
+
+    This follows the old notebook convention.
+    """
+    x = field["x"]
+    y = field["y"]
+    z = field["z"]
+    h = float(field["h"])
+
+    Nx, Ny, Nz = field["V"].shape
+    full_shape = (Nx, Ny, Nz)
+
+    X = x[:, None, None]
+    Y = y[None, :, None]
+    Z = z[None, None, :]
+
+    rho_yz = np.sqrt(Y**2 + Z**2)
+    rho_xy = np.sqrt(X**2 + Y**2)
+    R = np.sqrt(X**2 + Y**2 + Z**2)
+
+    eps_hit = 0.5 * h
+    band_grid = 2.0 * eps_hit      # = h
+    band_col = 2.0 * h
+    pad = 2.0 * h
+
+    x_dt_near = 0.048
+    x_dt_far = R_col + pad
+
+    # --------------------------------------------------------
+    # Analytic spherical shells
+    # --------------------------------------------------------
+    g1_bdry = np.abs(R - R_g1) <= band_grid
+    g2_bdry = np.abs(R - R_g2) <= band_grid
+    g3_bdry = np.abs(R - R_g3) <= band_grid
+    col_bdry = np.abs(R - R_col) <= band_col
+
+    # --------------------------------------------------------
+    # Drift-tube aperture through shells
+    # --------------------------------------------------------
+    x_ap_near = R_g1 - 2.0 * h
+
+    aperture_range = (X >= x_ap_near) & (X <= x_dt_far)
+    drift_axis_open = aperture_range & (rho_yz <= r_hole)
+
+    g1_bdry = g1_bdry & ~drift_axis_open
+    g2_bdry = g2_bdry & ~drift_axis_open
+    g3_bdry = g3_bdry & ~drift_axis_open
+    col_bdry = col_bdry & ~drift_axis_open
+
+    # --------------------------------------------------------
+    # Rod holes through shells
+    # --------------------------------------------------------
+    rod_axis = (rho_xy <= r_rod) & (Z <= 0.0)
+
+    g1_bdry = g1_bdry & ~rod_axis
+    g2_bdry = g2_bdry & ~rod_axis
+    g3_bdry = g3_bdry & ~rod_axis
+    col_bdry = col_bdry & ~rod_axis
+
+    # --------------------------------------------------------
+    # Side spherical cap openings
+    # --------------------------------------------------------
+    def spherical_cap_hole(R, X, Y, Z, Rshell, band_shell, u_axis, alpha_deg):
+        u = np.asarray(u_axis, dtype=float)
+        u = u / np.linalg.norm(u)
+
+        shell = np.abs(R - Rshell) <= band_shell
+
+        dot = X * u[0] + Y * u[1] + Z * u[2]
+        cosang = dot / np.maximum(R, 1e-30)
+
+        return shell & (cosang >= np.cos(np.deg2rad(alpha_deg)))
+
+    u_open = np.array([
+        np.cos(np.deg2rad(225.0)),
+        np.sin(np.deg2rad(225.0)),
+        0.0,
+    ])
+
+    open_g1 = spherical_cap_hole(R, X, Y, Z, R_g1, band_grid, u_open, 20.0)
+    open_g2 = spherical_cap_hole(R, X, Y, Z, R_g2, band_grid, u_open, 18.0)
+    open_g3 = spherical_cap_hole(R, X, Y, Z, R_g3, band_grid, u_open, 14.0)
+
+    g1_bdry = g1_bdry & ~open_g1
+    g2_bdry = g2_bdry & ~open_g2
+    g3_bdry = g3_bdry & ~open_g3
+
+    # --------------------------------------------------------
+    # Drift tube cylindrical boundary
+    # --------------------------------------------------------
+    in_range = (X >= x_dt_near - 5.0 * h) & (X <= x_dt_far)
+    dt_band_bc = max(t_dt, 2.0 * h)
+
+    drift_bc = (
+        in_range
+        & (rho_yz >= r_dt_i)
+        & (rho_yz <= r_dt_i + dt_band_bc)
+    )
+
+    # Broadcast/copy to real full-size boolean arrays.
+    g1_bdry = np.broadcast_to(g1_bdry, full_shape).copy()
+    g2_bdry = np.broadcast_to(g2_bdry, full_shape).copy()
+    g3_bdry = np.broadcast_to(g3_bdry, full_shape).copy()
+    col_bdry = np.broadcast_to(col_bdry, full_shape).copy()
+    drift_bc = np.broadcast_to(drift_bc, full_shape).copy()
+
+    inside = np.broadcast_to(
+        R <= (R_col + band_col),
+        full_shape,
+    ).copy()
+
+    update_region = (
+        inside
+        & ~g1_bdry
+        & ~g2_bdry
+        & ~g3_bdry
+        & ~col_bdry
+    )
+
+    field["g1_bdry"] = g1_bdry
+    field["g2_bdry"] = g2_bdry
+    field["g3_bdry"] = g3_bdry
+    field["col_bdry"] = col_bdry
+    field["drift_bc"] = drift_bc
+    field["inside"] = inside
+    field["update_region"] = update_region
+
+    return field
+    
 
 def set_rfa_update_region(field: dict) -> dict:
     """
@@ -1335,12 +1532,11 @@ def build_rfa_field(
         R_col=R_col,
         verbose=verbose,
     )
-
+    
     _log(verbose, f"  fixed voxels after analytic shells = {int(field['fixed'].sum()):,}")
-
-    set_rfa_update_region(field)
-
     _log(verbose, f"  update voxels = {int(np.count_nonzero(field['update_region'] & ~field['fixed'])):,}")
+
+    field["Vfix"] = field["V"].copy()
 
     _log(verbose, "\n[6/7] Initializing potential ...")
 
