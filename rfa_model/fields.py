@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 import numpy as np
+from numba import njit
 from scipy.interpolate import RegularGridInterpolator
 
 from .constants import e_charge, m_e
@@ -591,6 +592,46 @@ def mark_analytic_rfa_surfaces(
 # Update-region handling
 # ============================================================
 
+def set_rfa_update_region(field: dict) -> dict:
+    """
+    Match the old notebook update region:
+
+        inside collector domain,
+        excluding analytic grid and collector boundary shells.
+
+    Requires field to contain:
+        g1_bdry, g2_bdry, g3_bdry, col_bdry, R_col.
+    """
+    h = float(field["h"])
+    R_col = float(field["R_col"])
+
+    X = field["x"][:, None, None]
+    Y = field["y"][None, :, None]
+    Z = field["z"][None, None, :]
+
+    R = np.sqrt(X**2 + Y**2 + Z**2)
+
+    band = 2.0 * h
+
+    inside = np.broadcast_to(
+        R <= (R_col + band),
+        field["V"].shape,
+    ).copy()
+
+    update_region = (
+        inside
+        & ~field["g1_bdry"]
+        & ~field["g2_bdry"]
+        & ~field["g3_bdry"]
+        & ~field["col_bdry"]
+    )
+
+    field["inside"] = inside
+    field["update_region"] = update_region
+
+    return field
+    
+
 def set_update_region_spherical(
     field: dict,
     r_max: float | None = None,
@@ -653,6 +694,110 @@ def set_outer_boundary_fixed(
 # ============================================================
 # Laplace solver
 # ============================================================
+
+@njit
+def _solve_laplace_sor_numba(
+    V,
+    Vfix,
+    fixed,
+    update_region,
+    omega,
+    tol,
+    maxit,
+):
+    Nx, Ny, Nz = V.shape
+
+    for it in range(1, maxit + 1):
+        dmax = 0.0
+
+        for k in range(1, Nz - 1):
+            for j in range(1, Ny - 1):
+                for i in range(1, Nx - 1):
+                    if (not update_region[i, j, k]) or fixed[i, j, k]:
+                        continue
+
+                    rhs = (
+                        V[i - 1, j, k] + V[i + 1, j, k]
+                        + V[i, j - 1, k] + V[i, j + 1, k]
+                        + V[i, j, k - 1] + V[i, j, k + 1]
+                    ) / 6.0
+
+                    vij = V[i, j, k]
+                    vnew = vij + omega * (rhs - vij)
+
+                    V[i, j, k] = vnew
+
+                    d = abs(vnew - vij)
+                    if d > dmax:
+                        dmax = d
+
+        # Re-enforce fixed values.
+        for k in range(Nz):
+            for j in range(Ny):
+                for i in range(Nx):
+                    if fixed[i, j, k]:
+                        V[i, j, k] = Vfix[i, j, k]
+
+        if dmax < tol:
+            return V, it, dmax
+
+    return V, maxit, dmax
+
+
+def solve_laplace_sor_numba(
+    field: dict,
+    max_iter: int = 20_000,
+    tol: float = 2e-5,
+    omega: float = 1.90,
+    verbose: bool = True,
+) -> dict:
+    """
+    Solve Laplace equation using the same Numba in-place SOR method
+    used in the old test notebook.
+    """
+    Vfix = field.get("Vfix", field["V"].copy())
+    fixed = field["fixed"]
+    update_region = field["update_region"]
+
+    V = field["V"].copy()
+
+    if verbose:
+        print("Solving Laplace with Numba SOR ...", flush=True)
+        print(f"  grid shape: {V.shape}", flush=True)
+        print(f"  fixed voxels: {int(np.count_nonzero(fixed)):,}", flush=True)
+        print(f"  update voxels: {int(np.count_nonzero(update_region & ~fixed)):,}", flush=True)
+        print(f"  omega = {omega}", flush=True)
+        print(f"  tol   = {tol}", flush=True)
+
+    t0 = time.perf_counter()
+
+    V, it, dmax = _solve_laplace_sor_numba(
+        V,
+        Vfix,
+        fixed,
+        update_region,
+        float(omega),
+        float(tol),
+        int(max_iter),
+    )
+
+    field["V"] = V
+    field["solver"] = {
+        "method": "numba_sor",
+        "iterations": int(it),
+        "tol": float(tol),
+        "last_delta": float(dmax),
+        "omega": float(omega),
+        "runtime_s": time.perf_counter() - t0,
+        "converged": bool(dmax < tol),
+    }
+
+    if verbose:
+        print(f"Finished: it = {it}, max dV = {dmax:.3e} V", flush=True)
+        print(f"runtime = {field['solver']['runtime_s']:.2f} s", flush=True)
+
+    return field
+    
 
 def initialize_potential_linear_x(
     field: dict,
@@ -1088,7 +1233,7 @@ def build_rfa_field(
     R_col: float = 0.08255,
     mesh_method: str = "voxelized",
     outer_boundary_voltage: float | None = None,
-    solver: str = "sor",
+    solver: str = "numba_sor",
     max_iter: int = 20_000,
     tol: float = 1e-5,
     omega: float | None = None,
@@ -1193,6 +1338,10 @@ def build_rfa_field(
 
     _log(verbose, f"  fixed voxels after analytic shells = {int(field['fixed'].sum()):,}")
 
+    set_rfa_update_region(field)
+
+    _log(verbose, f"  update voxels = {int(np.count_nonzero(field['update_region'] & ~field['fixed'])):,}")
+
     _log(verbose, "\n[6/7] Initializing potential ...")
 
     initialize_potential_linear_x(
@@ -1203,7 +1352,16 @@ def build_rfa_field(
 
     _log(verbose, "\n[7/7] Solving Laplace equation ...")
 
-    if solver == "sor":
+    if solver == "numba_sor":
+        solve_laplace_sor_numba(
+            field,
+            max_iter=max_iter,
+            tol=tol,
+            omega=omega if omega is not None else 1.90,
+            verbose=verbose,
+        )
+
+    elif solver == "sor":
         if omega is None:
             omega = 1.85
 
