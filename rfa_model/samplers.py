@@ -521,7 +521,7 @@ def sample_surface_event(
             collector_SEY_mult=collector_SEY_mult,
         )
         
-        sey = sey * surface_mult
+        sey_val = sey_val * surface_mult
 
     sey_val = max(0.0, sey_val)
 
