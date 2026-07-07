@@ -482,11 +482,11 @@ def sample_surface_event(
     yield_models: dict,
     surface_name: str,
     Einc: float,
+    cos_theta: float,
+    rng,
     SEY_mult: float = 1.0,
     grid_SEY_mult: float | None = None,
     collector_SEY_mult: float | None = None,
-    cos_theta: float,
-    rng,
 ) -> tuple[bool, int]:
     """
     Sample whether a BSE occurs and how many SE electrons are emitted.
@@ -761,9 +761,11 @@ def generate_surface_emissions(
     energy_models: dict,
     theta_models: dict,
     voltages: dict,
-    SEY_mult: float,
     rng,
     origin: str,
+    SEY_mult: float = 1.0,
+    grid_SEY_mult: float | None = None,
+    collector_SEY_mult: float | None = None,
     sample_launch_eps: float = 1.0e-6,
     U0: float = 15.0,
 ) -> list[dict]:
