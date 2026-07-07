@@ -18,13 +18,32 @@ from .trajectories import unit
 
 
 GRID_SURFACES = {
-    "grid1", "grid2", "grid3",
-    "g1_shell", "g2_shell", "g3_shell",
-    "g1frame", "g2frame", "g3frame",
-    "g1_frame", "g2_frame", "g3_frame",
-    "g1_low_frame", "g1_upper_frame",
-    "g2_low_frame", "g2_upper_frame",
-    "g3_low_frame", "g3_upper_frame",
+    # analytic wire/shell surfaces
+    "g1_shell",
+    "g2_shell",
+    "g3_shell",
+
+    # canonical frame names
+    "g1frame",
+    "g2frame",
+    "g3frame",
+
+    # possible aliases from STL names
+    "g1_frame",
+    "g2_frame",
+    "g3_frame",
+
+    "g1_low_frame",
+    "g1_upper_frame",
+    "g2_low_frame",
+    "g2_upper_frame",
+    "g3_low_frame",
+    "g3_upper_frame",
+
+    # possible electrode labels
+    "grid1",
+    "grid2",
+    "grid3",
 }
 
 COLLECTOR_SURFACES = {
@@ -43,6 +62,18 @@ def canonical_surface_name_for_sey(surface_name):
         "grid1": "g1_shell",
         "grid2": "g2_shell",
         "grid3": "g3_shell",
+
+        "g1_frame": "g1frame",
+        "g2_frame": "g2frame",
+        "g3_frame": "g3frame",
+
+        "g1_low_frame": "g1frame",
+        "g1_upper_frame": "g1frame",
+        "g2_low_frame": "g2frame",
+        "g2_upper_frame": "g2frame",
+        "g3_low_frame": "g3frame",
+        "g3_upper_frame": "g3frame",
+
         "collector": "collector_shell",
     }
 
@@ -58,8 +89,9 @@ def sey_multiplier_for_surface(
     """
     Surface-specific SEY multiplier.
 
-    The legacy SEY_mult is used only as a fallback when the new
-    surface-specific multipliers are not provided.
+    grid_SEY_mult applies to both analytic grid shells and grid frames.
+    collector_SEY_mult applies to the collector shell.
+    Other surfaces keep their physical yield unchanged.
     """
     s = canonical_surface_name_for_sey(surface_name)
 
@@ -75,7 +107,6 @@ def sey_multiplier_for_surface(
     if s in COLLECTOR_SURFACES:
         return float(collector_SEY_mult)
 
-    # Keep sample/holder/receiver/rod/drifttube physics fixed.
     return 1.0
 
 
