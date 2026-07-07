@@ -17,6 +17,68 @@ from .constants import speed_from_energy_eV
 from .trajectories import unit
 
 
+GRID_SURFACES = {
+    "grid1", "grid2", "grid3",
+    "g1_shell", "g2_shell", "g3_shell",
+    "g1frame", "g2frame", "g3frame",
+    "g1_frame", "g2_frame", "g3_frame",
+    "g1_low_frame", "g1_upper_frame",
+    "g2_low_frame", "g2_upper_frame",
+    "g3_low_frame", "g3_upper_frame",
+}
+
+COLLECTOR_SURFACES = {
+    "collector",
+    "collector_shell",
+}
+
+
+def canonical_surface_name_for_sey(surface_name):
+    if surface_name is None:
+        return "unknown"
+
+    s = str(surface_name)
+
+    aliases = {
+        "grid1": "g1_shell",
+        "grid2": "g2_shell",
+        "grid3": "g3_shell",
+        "collector": "collector_shell",
+    }
+
+    return aliases.get(s, s)
+
+
+def sey_multiplier_for_surface(
+    surface_name,
+    SEY_mult: float = 1.0,
+    grid_SEY_mult: float | None = None,
+    collector_SEY_mult: float | None = None,
+) -> float:
+    """
+    Surface-specific SEY multiplier.
+
+    The legacy SEY_mult is used only as a fallback when the new
+    surface-specific multipliers are not provided.
+    """
+    s = canonical_surface_name_for_sey(surface_name)
+
+    if grid_SEY_mult is None:
+        grid_SEY_mult = SEY_mult
+
+    if collector_SEY_mult is None:
+        collector_SEY_mult = SEY_mult
+
+    if s in GRID_SURFACES:
+        return float(grid_SEY_mult)
+
+    if s in COLLECTOR_SURFACES:
+        return float(collector_SEY_mult)
+
+    # Keep sample/holder/receiver/rod/drifttube physics fixed.
+    return 1.0
+
+
 # ============================================================
 # CSV loaders
 # ============================================================
@@ -420,7 +482,9 @@ def sample_surface_event(
     yield_models: dict,
     surface_name: str,
     Einc: float,
-    SEY_mult: float,
+    SEY_mult: float = 1.0,
+    grid_SEY_mult: float | None = None,
+    collector_SEY_mult: float | None = None,
     cos_theta: float,
     rng,
 ) -> tuple[bool, int]:
@@ -450,7 +514,14 @@ def sample_surface_event(
     bsey_val = max(0.0, min(0.99, bsey_val))
 
     if fam in ["grid", "collector"]:
-        sey_val *= SEY_mult
+        surface_mult = sey_multiplier_for_surface(
+            surface_name=surface_name,
+            SEY_mult=SEY_mult,
+            grid_SEY_mult=grid_SEY_mult,
+            collector_SEY_mult=collector_SEY_mult,
+        )
+        
+        sey = sey * surface_mult
 
     sey_val = max(0.0, sey_val)
 
