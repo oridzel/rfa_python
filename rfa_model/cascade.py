@@ -80,6 +80,10 @@ def is_emitting_surface(owner_name: str) -> bool:
         "g1_shell",
         "g2_shell",
         "g3_shell",
+        "g1mesh",
+        "g2mesh",
+        "g3mesh",
+
         "g1frame",
         "g2frame",
         "g3frame",
@@ -99,9 +103,15 @@ def cascade_surface_name(owner_name: str) -> str:
 
     mapping = {
         "collector_shell": "collector",
-        "g1_shell": "g1_shell",
-        "g2_shell": "g2_shell",
-        "g3_shell": "g3_shell",
+
+        "g1_shell": "g1mesh",
+        "g2_shell": "g2mesh",
+        "g3_shell": "g3mesh",
+
+        "g1mesh": "g1mesh",
+        "g2mesh": "g2mesh",
+        "g3mesh": "g3mesh",
+
         "g1frame": "g1frame",
         "g2frame": "g2frame",
         "g3frame": "g3frame",
@@ -154,7 +164,7 @@ def estimate_surface_normal(
     if owner == "sample":
         return np.array([1.0, 0.0, 0.0])
 
-    if owner in ["g1_shell", "g2_shell", "g3_shell"]:
+    if owner in ["g1_shell", "g2_shell", "g3_shell", "g1mesh", "g2mesh", "g3mesh"]:
         return unit(r_hit)
 
     if owner in ["collector", "collector_shell"]:

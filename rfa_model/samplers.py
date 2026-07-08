@@ -18,7 +18,12 @@ from .trajectories import unit
 
 
 GRID_SURFACES = {
-    # analytic wire/shell surfaces
+    # canonical analytic grid mesh names
+    "g1mesh",
+    "g2mesh",
+    "g3mesh",
+
+    # shell aliases
     "g1_shell",
     "g2_shell",
     "g3_shell",
@@ -44,6 +49,7 @@ GRID_SURFACES = {
     "grid1",
     "grid2",
     "grid3",
+    "grid",
 }
 
 COLLECTOR_SURFACES = {
@@ -59,9 +65,13 @@ def canonical_surface_name_for_sey(surface_name):
     s = str(surface_name)
 
     aliases = {
-        "grid1": "g1_shell",
-        "grid2": "g2_shell",
-        "grid3": "g3_shell",
+        "grid1": "g1mesh",
+        "grid2": "g2mesh",
+        "grid3": "g3mesh",
+
+        "g1_shell": "g1mesh",
+        "g2_shell": "g2mesh",
+        "g3_shell": "g3mesh",
 
         "g1_frame": "g1frame",
         "g2_frame": "g2frame",
@@ -74,7 +84,7 @@ def canonical_surface_name_for_sey(surface_name):
         "g3_low_frame": "g3frame",
         "g3_upper_frame": "g3frame",
 
-        "collector": "collector_shell",
+        "collector_shell": "collector",
     }
 
     return aliases.get(s, s)
@@ -855,9 +865,11 @@ def generate_surface_emissions(
         yield_models=yield_models,
         surface_name=surface_name,
         Einc=Einc,
-        SEY_mult=SEY_mult,
         cos_theta=cos_theta,
         rng=rng,
+        SEY_mult=SEY_mult,
+        grid_SEY_mult=grid_SEY_mult,
+        collector_SEY_mult=collector_SEY_mult,
     )
 
     if did_bse:
