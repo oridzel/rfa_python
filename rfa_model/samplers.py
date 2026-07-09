@@ -90,33 +90,56 @@ def canonical_surface_name_for_sey(surface_name):
     return aliases.get(s, s)
 
 
+def bse_multiplier_for_surface(
+    surface_name,
+    BSE_mult: float = 1.0,
+    grid_BSE_mult: float | None = None,
+    collector_BSE_mult: float | None = None,
+) -> float:
+    """
+    Surface-specific BSEY multiplier.
+
+    For now we mainly need collector_BSE_mult because collector BSEs
+    redistribute current away from the collector.
+    """
+    s = canonical_surface_name_for_sey(surface_name)
+
+    if grid_BSE_mult is None:
+        grid_BSE_mult = BSE_mult
+
+    if collector_BSE_mult is None:
+        collector_BSE_mult = BSE_mult
+
+    if s in GRID_SURFACES:
+        return float(grid_BSE_mult)
+
+    if s in COLLECTOR_SURFACES:
+        return float(collector_BSE_mult)
+
+    return 1.0
+
+
 def sey_multiplier_for_surface(
     surface_name,
-    SEY_mult: float = 1.0,
     grid_SEY_mult: float | None = None,
-    collector_SEY_mult: float | None = None,
 ) -> float:
     """
     Surface-specific SEY multiplier.
 
-    grid_SEY_mult applies to both analytic grid shells and grid frames.
-    collector_SEY_mult applies to the collector shell.
-    Other surfaces keep their physical yield unchanged.
+    grid_SEY_mult applies to grid shells and grid frames.
+    Collector SEY is not separately scaled because collector SEs mostly
+    return to the collector in this geometry.
     """
     s = canonical_surface_name_for_sey(surface_name)
 
     if grid_SEY_mult is None:
-        grid_SEY_mult = SEY_mult
-
-    if collector_SEY_mult is None:
-        collector_SEY_mult = SEY_mult
+        grid_SEY_mult = 1.0
 
     if s in GRID_SURFACES:
         return float(grid_SEY_mult)
 
-    if s in COLLECTOR_SURFACES:
-        return float(collector_SEY_mult)
-
+    # Do not tune collector SEY separately.
+    # Leave sample, holder, receiver, rod, drifttube, collector unchanged.
     return 1.0
 
 
@@ -525,9 +548,10 @@ def sample_surface_event(
     Einc: float,
     cos_theta: float,
     rng,
-    SEY_mult: float = 1.0,
     grid_SEY_mult: float | None = None,
-    collector_SEY_mult: float | None = None,
+    BSE_mult: float = 1.0,
+    grid_BSE_mult: float | None = None,
+    collector_BSE_mult: float | None = None,
 ) -> tuple[bool, int]:
     """
     Sample whether a BSE occurs and how many SE electrons are emitted.
@@ -552,19 +576,25 @@ def sample_surface_event(
     sey_val = sey_base / cos_theta
     bsey_val = bsey_base / cos_theta
 
-    bsey_val = max(0.0, min(0.99, bsey_val))
-
-    if fam in ["grid", "collector"]:
-        surface_mult = sey_multiplier_for_surface(
+    if fam in ["grid"]:
+        surface_sey_mult = sey_multiplier_for_surface(
             surface_name=surface_name,
-            SEY_mult=SEY_mult,
             grid_SEY_mult=grid_SEY_mult,
-            collector_SEY_mult=collector_SEY_mult,
         )
         
-        sey_val = sey_val * surface_mult
-
+        sey = sey * surface_sey_mult
     sey_val = max(0.0, sey_val)
+
+    if fam in ["grid","collector"]:
+        surface_bse_mult = bse_multiplier_for_surface(
+            surface_name=surface_name,
+            BSE_mult=BSE_mult,
+            grid_BSE_mult=grid_BSE_mult,
+            collector_BSE_mult=collector_BSE_mult,
+        )
+        
+        bsey_val = bsey_val * surface_bse_mult       
+    bsey_val = max(0.0, min(float(bsey_val), 0.99))
 
     did_bse = False if Einc <= 50.0 else (rng.random() < bsey_val)
     Nse = rng.poisson(sey_val)
@@ -804,9 +834,10 @@ def generate_surface_emissions(
     voltages: dict,
     rng,
     origin: str,
-    SEY_mult: float = 1.0,
     grid_SEY_mult: float | None = None,
-    collector_SEY_mult: float | None = None,
+    BSE_mult: float = 1.0,
+    grid_BSE_mult: float | None = None,
+    collector_BSE_mult: float | None = None,
     sample_launch_eps: float = 1.0e-6,
     U0: float = 15.0,
 ) -> list[dict]:
@@ -867,9 +898,10 @@ def generate_surface_emissions(
         Einc=Einc,
         cos_theta=cos_theta,
         rng=rng,
-        SEY_mult=SEY_mult,
         grid_SEY_mult=grid_SEY_mult,
-        collector_SEY_mult=collector_SEY_mult,
+        BSE_mult=BSE_mult,
+        grid_BSE_mult=grid_BSE_mult,
+        collector_BSE_mult=collector_BSE_mult,
     )
 
     if did_bse:
