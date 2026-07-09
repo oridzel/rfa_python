@@ -39,6 +39,8 @@ from .geometry import (
 
 from .samplers import (
     load_default_surface_models,
+    surface_family,
+    sample_surface_event,
 )
 
 from .cascade import (
