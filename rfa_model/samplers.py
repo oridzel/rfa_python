@@ -582,7 +582,7 @@ def sample_surface_event(
             grid_SEY_mult=grid_SEY_mult,
         )
         
-        sey = sey * surface_sey_mult
+        sey_val = sey_val * surface_sey_mult
     sey_val = max(0.0, sey_val)
 
     if fam in ["grid","collector"]:
