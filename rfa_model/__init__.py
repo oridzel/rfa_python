@@ -42,6 +42,7 @@ from .samplers import (
     surface_family,
     surface_voltage,
     sample_surface_event,
+    generate_surface_emissions,
 )
 
 from .cascade import (
