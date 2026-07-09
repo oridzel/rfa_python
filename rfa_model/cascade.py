@@ -237,13 +237,12 @@ def generate_cascade_emissions_from_hit(
     energy_models: dict,
     theta_models: dict,
     voltages: dict,
-    SEY_mult: float,
     rng,
     origin: str,
     hit_info: dict | None = None,
     launch_step_fraction_of_h: float = 0.25,
     grid_SEY_mult: float | None = None,
-    collector_SEY_mult: float | None = None,
+    collector_BSE_mult: float | None = None,
 ) -> list[dict]:
     """
     Generate and safely place cascade emissions from one surface hit.
@@ -269,9 +268,8 @@ def generate_cascade_emissions_from_hit(
         energy_models=energy_models,
         theta_models=theta_models,
         voltages=voltages,
-        SEY_mult=SEY_mult,
         grid_SEY_mult=grid_SEY_mult,
-        collector_SEY_mult=collector_SEY_mult,
+        collector_BSE_mult=collector_BSE_mult,
         rng=rng,
         origin=origin,
         sample_launch_eps=1.0e-6,
@@ -317,14 +315,13 @@ def run_one_primary_with_cascade(
     energy_models,
     theta_models,
     voltages,
-    SEY_mult,
     rng,
     
     sample_y_bounds,
     sample_z_bounds,
     
     grid_SEY_mult: float | None = None,
-    collector_SEY_mult: float | None = None,
+    collector_BSE_mult: float | None = None,
 
     max_generation: int = 5,
     max_total_electrons: int = 500,
@@ -397,9 +394,8 @@ def run_one_primary_with_cascade(
         energy_models=energy_models,
         theta_models=theta_models,
         voltages=voltages,
-        SEY_mult=SEY_mult,
         grid_SEY_mult=grid_SEY_mult,
-        collector_SEY_mult=collector_SEY_mult,
+        collector_BSE_mult=collector_BSE_mult,
         rng=rng,
         origin="gun",
         hit_info=hit,
@@ -537,9 +533,8 @@ def run_one_primary_with_cascade(
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
-            SEY_mult=SEY_mult,
             grid_SEY_mult=grid_SEY_mult,
-            collector_SEY_mult=collector_SEY_mult,
+            collector_BSE_mult=collector_BSE_mult,
             rng=rng,
             origin=res.get("emission_kind", "cascade"),
             hit_info=hit_info,
@@ -686,7 +681,6 @@ def _run_cascade_chunk(
     energy_models,
     theta_models,
     voltages,
-    SEY_mult,
     
     sample_y_bounds,
     sample_z_bounds,
@@ -702,7 +696,7 @@ def _run_cascade_chunk(
     launch_step_fraction_of_h,
     
     grid_SEY_mult: float | None = None,
-    collector_SEY_mult: float | None = None,
+    collector_BSE_mult: float | None = None,
 ):
     """
     Worker function for one cascade chunk.
@@ -741,9 +735,8 @@ def _run_cascade_chunk(
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
-            SEY_mult=SEY_mult,
             grid_SEY_mult=grid_SEY_mult,
-            collector_SEY_mult=collector_SEY_mult,
+            collector_BSE_mult=collector_BSE_mult,
             rng=rng,
 
             sample_y_bounds=sample_y_bounds,
@@ -854,9 +847,8 @@ def run_cascade_batch_parallel(
     sample_y_bounds,
     sample_z_bounds,
     
-    SEY_mult: float = 1.0,
     grid_SEY_mult: float | None = None,
-    collector_SEY_mult: float | None = None,
+    collector_BSE_mult: float | None = None,
 
     x_start: float | None = None,
     beam_sigma: float = 150e-6,
@@ -895,10 +887,10 @@ def run_cascade_batch_parallel(
         raise ValueError("chunk_size must be positive")
 
     if grid_SEY_mult is None:
-        grid_SEY_mult = SEY_mult
+        grid_SEY_mult = 1.0
 
-    if collector_SEY_mult is None:
-        collector_SEY_mult = SEY_mult
+    if collector_BSE_mult is None:
+        collector_BSE_mult = 1.0
 
     t0 = time.perf_counter()
 
@@ -969,9 +961,8 @@ def run_cascade_batch_parallel(
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
-            SEY_mult=SEY_mult,
             grid_SEY_mult=grid_SEY_mult,
-            collector_SEY_mult=collector_SEY_mult,
+            collector_BSE_mult=collector_BSE_mult,
 
             sample_y_bounds=sample_y_bounds,
             sample_z_bounds=sample_z_bounds,
@@ -1064,11 +1055,10 @@ def run_cascade_batch_parallel(
 
         "N_primary": N_primary,
         "E0_eV": E0_eV,
-        "SEY_mult": SEY_mult,
 
         "grid_transparency": grid_transparency,
         "grid_SEY_mult": grid_SEY_mult,
-        "collector_SEY_mult": collector_SEY_mult,
+        "collector_BSE_mult": collector_BSE_mult,
 
         "max_generation": max_generation,
         "max_total_electrons_per_primary": max_total_electrons_per_primary,
