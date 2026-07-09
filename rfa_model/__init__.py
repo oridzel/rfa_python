@@ -43,6 +43,7 @@ from .samplers import (
     surface_voltage,
     sample_surface_event,
     generate_surface_emissions,
+    interp_yield_model,
 )
 
 from .cascade import (
