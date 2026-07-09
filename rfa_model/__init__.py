@@ -40,6 +40,7 @@ from .geometry import (
 from .samplers import (
     load_default_surface_models,
     surface_family,
+    surface_voltage,
     sample_surface_event,
 )
 
