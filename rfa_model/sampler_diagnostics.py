@@ -177,7 +177,6 @@ def validate_yield_sampling_at_energy(
     surface_name,
     E0,
     N=100_000,
-    SEY_mult=1.0,
     cos_theta=1.0,
     seed=1,
 ):
@@ -194,7 +193,10 @@ def validate_yield_sampling_at_energy(
             yield_models=yield_models,
             surface_name=surface_name,
             Einc=E0,
-            SEY_mult=SEY_mult,
+            grid_SEY_mult=1.0,
+            BSE_mult=1.0,
+            grid_BSE_mult=1.0,
+            collector_BSE_mult=1.0,
             cos_theta=cos_theta,
             rng=rng,
         )
@@ -250,7 +252,6 @@ def sweep_yield_sampling(
     surface_name,
     Etest,
     N=50_000,
-    SEY_mult=1.0,
     cos_theta=1.0,
     seed=1,
 ):
@@ -271,7 +272,10 @@ def sweep_yield_sampling(
                 yield_models=yield_models,
                 surface_name=surface_name,
                 Einc=E0,
-                SEY_mult=SEY_mult,
+                grid_SEY_mult=1.0,
+                BSE_mult=1.0,
+                grid_BSE_mult=1.0,
+                collector_BSE_mult=1.0,
                 cos_theta=cos_theta,
                 rng=rng,
             )
@@ -289,9 +293,6 @@ def sweep_yield_sampling(
             bse_expected = 0.0
 
         se_expected = se_raw / max(cos_theta, 0.05)
-
-        if fam in ["grid", "collector"]:
-            se_expected *= SEY_mult
 
         rows.append({
             "E_eV": E0,

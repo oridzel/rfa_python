@@ -512,6 +512,34 @@ def run_one_primary_with_cascade(
         if not np.isfinite(E_term) or E_term < min_incident_energy_eV:
             continue
 
+                n_term = estimate_surface_normal(
+            terminal_owner,
+            r_hit=r_term,
+            v_in=v_term,
+            hit_info=hit_info,
+        )
+
+        vhat_term = unit(v_term)
+
+        terminal_cos_theta_raw = -float(np.dot(vhat_term, n_term))
+        terminal_cos_theta_used = max(terminal_cos_theta_raw, 0.05)
+
+        terminal_theta_raw_deg = float(
+            np.degrees(
+                np.arccos(
+                    np.clip(terminal_cos_theta_raw, -1.0, 1.0)
+                )
+            )
+        )
+
+        terminal_theta_used_deg = float(
+            np.degrees(
+                np.arccos(
+                    np.clip(terminal_cos_theta_used, 0.0, 1.0)
+                )
+            )
+        )
+
         cascade_log.append({
             "electron_id": item["electron_id"],
             "parent_id": item["parent_id"],
@@ -521,6 +549,11 @@ def run_one_primary_with_cascade(
             "terminal_electrode": terminal_electrode,
             "terminal_Einc_eV": E_term,
             "is_emitting_surface": is_emitting_surface(terminal_owner),
+
+            "terminal_cos_theta_raw": terminal_cos_theta_raw,
+            "terminal_cos_theta_used": terminal_cos_theta_used,
+            "terminal_theta_raw_deg": terminal_theta_raw_deg,
+            "terminal_theta_used_deg": terminal_theta_used_deg,
         })
 
         child_emissions = generate_cascade_emissions_from_hit(
@@ -550,6 +583,11 @@ def run_one_primary_with_cascade(
             "terminal_electrode": terminal_electrode,
             "terminal_Einc_eV": E_term,
             "N_child_emissions": len(child_emissions),
+
+            "terminal_cos_theta_raw": terminal_cos_theta_raw,
+            "terminal_cos_theta_used": terminal_cos_theta_used,
+            "terminal_theta_raw_deg": terminal_theta_raw_deg,
+            "terminal_theta_used_deg": terminal_theta_used_deg,
         })
 
         for child in child_emissions:

@@ -62,6 +62,8 @@ from .collisions import (
     build_stl_bounding_boxes
 )
 
+from .trajectories import unit
+
 from .plotting import (
     plot_trajectories_3d,
     plot_trajectory_projections,
