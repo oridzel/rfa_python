@@ -918,6 +918,7 @@ def run_cascade_batch_parallel(
     """
     from joblib import Parallel, delayed
     from pathlib import Path
+    import os
 
     if N_primary <= 0:
         raise ValueError("N_primary must be positive")
@@ -966,8 +967,14 @@ def run_cascade_batch_parallel(
 
     chunk_seeds = seed + 5000 + np.arange(len(chunks))
 
-    tmp_dir = Path("joblib_tmp")
-    tmp_dir.mkdir(exist_ok=True)
+    tmp_base = (
+        os.environ.get("SLURM_TMPDIR")
+        or os.environ.get("TMPDIR")
+        or "/tmp"
+    )
+    
+    tmp_dir = Path(tmp_base) / "joblib_rfa_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     
     chunk_results = Parallel(
         n_jobs=n_jobs,
