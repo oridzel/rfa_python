@@ -91,6 +91,9 @@ def canonical_surface_name_for_sey(surface_name):
 
 
 def orient_normal_against_incoming(n_out, v_in):
+    """
+    Orient ordinary surface normal so it faces the incoming electron.
+    """
     n_out = unit(n_out)
     vhat = unit(v_in)
 
@@ -834,6 +837,34 @@ def emit_local(
     return speed * unit(direction)
 
 
+def launch_electron_about_axis(
+    theta_rad: float,
+    phi_rad: float,
+    Eout_eV: float,
+    axis,
+) -> np.ndarray:
+    """
+    Launch electron with polar angle theta_rad relative to a chosen axis.
+
+    For grid-wire JMONSEL angular samplers:
+        axis = -v_in_hat
+
+    Then:
+        theta = 0 deg   -> backward, opposite incoming direction
+        theta = 90 deg  -> sideways
+        theta = 180 deg -> forward, along incoming direction
+    """
+    speed = speed_from_energy_eV(Eout_eV)
+    axis = unit(axis)
+
+    return emit_local(
+        n=axis,
+        theta_rad=theta_rad,
+        phi_rad=phi_rad,
+        speed=speed,
+    )
+
+
 def launch_surface_electron(
     theta_rad: float,
     phi_rad: float,
@@ -930,18 +961,19 @@ def generate_surface_emissions(
 
     r_hit = np.asarray(r_hit, dtype=float)
     v_in = np.asarray(v_in, dtype=float)
-    # n_out = unit(n_out)
-    if surface_name in ["g1_shell", "g2_shell", "g3_shell", "g1mesh", "g2mesh", "g3mesh"]:
-        n_out = sample_effective_wire_normal_for_grid_hit(
-            n_grid=unit(r_hit),
-            v_in=v_in,
-            rng=rng,
-        )
-    else:
-        n_out = orient_normal_against_incoming(n_out, v_in)
 
+    fam = surface_family(surface_name)
+
+    if fam != "grid":
+        n_out = orient_normal_against_incoming(n_out, v_in)
+    
     vhat = unit(v_in)
-    cos_theta = max(0.05, -float(np.dot(vhat, n_out)))
+    
+    if fam in ["grid", "collector"]:
+        # We do not want incidence-angle yield amplification for these shells.
+        cos_theta = 1.0
+    else:
+        cos_theta = max(0.05, -float(np.dot(vhat, n_out)))
 
     Einc = float(Einc)
     Phi_emit = surface_voltage(surface_name, voltages)
@@ -958,14 +990,14 @@ def generate_surface_emissions(
     else:
         R_quantum = 0.0
 
-    p0 = r_hit + sample_launch_eps * n_out
+    p0_surface = r_hit + sample_launch_eps * n_out
 
     if surface_name == "sample" and origin == "gun":
         if rng.random() < R_quantum:
             v_reflect = v_in - 2.0 * np.dot(v_in, n_out) * n_out
 
             emitted.append({
-                "p0": p0,
+                "p0": p0_surface,
                 "v0": v_reflect,
                 "E_emit_eV": Einc,
                 "kind": "quantum_reflection",
@@ -1010,18 +1042,39 @@ def generate_surface_emissions(
 
                 phi_bs = 2.0 * np.pi * rng.random()
 
-                use_full = is_fullsphere_surface(surface_name)
-
-                v_bse = launch_surface_electron(
-                    theta_rad=theta_bs,
-                    phi_rad=phi_bs,
-                    Eout_eV=E_bse,
-                    n_out=n_out,
-                    use_full_sphere=use_full,
-                )
-
+                if fam == "grid":
+                    # Effective wire scattering model.
+                    # John/JMONSEL grid-wire theta convention:
+                    # theta = 0 deg   -> backward, opposite incoming electron
+                    # theta = 180 deg -> forward, along incoming electron
+                    axis_backscatter = -unit(v_in)
+                
+                    v_bse = launch_electron_about_axis(
+                        theta_rad=theta_bs,
+                        phi_rad=phi_bs,
+                        Eout_eV=E_bse,
+                        axis=axis_backscatter,
+                    )
+                
+                    # Launch along actual emitted direction because it may go to either side
+                    # of the grid shell.
+                    p0_bse = r_hit + sample_launch_eps * unit(v_bse)
+                
+                else:
+                    use_full = is_fullsphere_surface(surface_name)
+                
+                    v_bse = launch_surface_electron(
+                        theta_rad=theta_bs,
+                        phi_rad=phi_bs,
+                        Eout_eV=E_bse,
+                        n_out=n_out,
+                        use_full_sphere=use_full,
+                    )
+                
+                    p0_bse = p0_surface
+                
                 emitted.append({
-                    "p0": p0,
+                    "p0": p0_bse,
                     "v0": v_bse,
                     "E_emit_eV": E_bse,
                     "kind": "BSE",
@@ -1056,18 +1109,33 @@ def generate_surface_emissions(
 
         phi_se = 2.0 * np.pi * rng.random()
 
-        use_full = is_fullsphere_surface(surface_name)
-
-        v_se = launch_surface_electron(
-            theta_rad=theta_se,
-            phi_rad=phi_se,
-            Eout_eV=E_se,
-            n_out=n_out,
-            use_full_sphere=use_full,
-        )
-
+        if fam == "grid":
+            axis_backscatter = -unit(v_in)
+        
+            v_se = launch_electron_about_axis(
+                theta_rad=theta_se,
+                phi_rad=phi_se,
+                Eout_eV=E_se,
+                axis=axis_backscatter,
+            )
+        
+            p0_se = r_hit + sample_launch_eps * unit(v_se)
+        
+        else:
+            use_full = is_fullsphere_surface(surface_name)
+        
+            v_se = launch_surface_electron(
+                theta_rad=theta_se,
+                phi_rad=phi_se,
+                Eout_eV=E_se,
+                n_out=n_out,
+                use_full_sphere=use_full,
+            )
+        
+            p0_se = p0_surface
+        
         emitted.append({
-            "p0": p0,
+            "p0": p0_se,
             "v0": v_se,
             "E_emit_eV": E_se,
             "kind": "SE",
