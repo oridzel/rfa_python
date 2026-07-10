@@ -917,6 +917,7 @@ def run_cascade_batch_parallel(
         dict containing primary/cascade dataframes, logs, accounting, and runtime.
     """
     from joblib import Parallel, delayed
+    from pathlib import Path
 
     if N_primary <= 0:
         raise ValueError("N_primary must be positive")
@@ -965,9 +966,15 @@ def run_cascade_batch_parallel(
 
     chunk_seeds = seed + 5000 + np.arange(len(chunks))
 
+    tmp_dir = Path("joblib_tmp")
+    tmp_dir.mkdir(exist_ok=True)
+    
     chunk_results = Parallel(
         n_jobs=n_jobs,
         backend="loky",
+        max_nbytes="10M",
+        mmap_mode="r",
+        temp_folder=str(tmp_dir),
         verbose=verbose,
     )(
         delayed(_run_cascade_chunk)(
@@ -976,43 +983,44 @@ def run_cascade_batch_parallel(
             v0s_chunk=v0s[start:stop],
             primary_index_offset=start,
             seed=int(chunk_seeds[ic]),
-
+    
             field=field,
             Phi_interp=Phi_interp,
             Ex_interp=Ex_interp,
             Ey_interp=Ey_interp,
             Ez_interp=Ez_interp,
-
+    
             intersector_primary=intersector_primary,
             face_owner_primary=face_owner_primary,
             collision_mesh_primary=collision_mesh_primary,
             stl_boxes_primary=stl_boxes_primary,
-
+    
             intersector_emit=intersector_emit,
             face_owner_emit=face_owner_emit,
             collision_mesh_emit=collision_mesh_emit,
             stl_boxes_emit=stl_boxes_emit,
-
+    
             grid_transparency=grid_transparency,
-
+    
             yield_models=yield_models,
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
+    
             grid_SEY_mult=grid_SEY_mult,
             collector_BSE_mult=collector_BSE_mult,
-
+    
             sample_y_bounds=sample_y_bounds,
             sample_z_bounds=sample_z_bounds,
-
+    
             max_generation=max_generation,
             max_total_electrons_per_primary=max_total_electrons_per_primary,
             min_incident_energy_eV=min_incident_energy_eV,
-
+    
             emitted_max_steps=emitted_max_steps,
             emitted_dt_max=emitted_dt_max,
             emitted_max_step_fraction_of_h=emitted_max_step_fraction_of_h,
-
+    
             launch_step_fraction_of_h=launch_step_fraction_of_h,
         )
         for ic, (start, stop) in enumerate(chunks)
