@@ -189,6 +189,122 @@ def choose_adaptive_dt_with_surfaces(
 
 
 # ============================================================
+# RK4
+# ============================================================
+
+def acceleration_at_point(
+    p,
+    Ex_interp,
+    Ey_interp,
+    Ez_interp,
+):
+    """
+    Electron acceleration at position p in the electrostatic field.
+
+    Equation:
+        a = q E / m
+
+    For an electron, q = -e.
+    """
+    E = E_at_point(
+        p,
+        Ex_interp,
+        Ey_interp,
+        Ez_interp,
+    )
+
+    return (e_charge / m_e) * E
+
+
+def velocity_verlet_step(
+    p,
+    v,
+    dt,
+    Ex_interp,
+    Ey_interp,
+    Ez_interp,
+):
+    """
+    One velocity-Verlet step for an electron in a static electric field.
+
+    System:
+        dr/dt = v
+        dv/dt = a(r)
+
+    Update:
+        r_new = r + v dt + 0.5 a_old dt^2
+        v_new = v + 0.5 (a_old + a_new) dt
+    """
+    p = np.asarray(p, dtype=float)
+    v = np.asarray(v, dtype=float)
+    dt = float(dt)
+
+    a_old = acceleration_at_point(
+        p,
+        Ex_interp,
+        Ey_interp,
+        Ez_interp,
+    )
+
+    p_new = p + v * dt + 0.5 * a_old * dt * dt
+
+    a_new = acceleration_at_point(
+        p_new,
+        Ex_interp,
+        Ey_interp,
+        Ez_interp,
+    )
+
+    v_new = v + 0.5 * (a_old + a_new) * dt
+
+    return p_new, v_new
+    
+
+def rk4_step(p, v, dt, Ex_interp, Ey_interp, Ez_interp):
+    """
+    One RK4 step for:
+        dp/dt = v
+        dv/dt = a(p)
+    """
+
+    def f(p_i, v_i):
+        a_i = acceleration_at_point(
+            p_i,
+            Ex_interp,
+            Ey_interp,
+            Ez_interp,
+        )
+        return v_i, a_i
+
+    k1_p, k1_v = f(p, v)
+
+    k2_p, k2_v = f(
+        p + 0.5 * dt * k1_p,
+        v + 0.5 * dt * k1_v,
+    )
+
+    k3_p, k3_v = f(
+        p + 0.5 * dt * k2_p,
+        v + 0.5 * dt * k2_v,
+    )
+
+    k4_p, k4_v = f(
+        p + dt * k3_p,
+        v + dt * k3_v,
+    )
+
+    p_new = p + dt / 6.0 * (
+        k1_p + 2.0 * k2_p + 2.0 * k3_p + k4_p
+    )
+
+    v_new = v + dt / 6.0 * (
+        k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v
+    )
+
+    return p_new, v_new
+
+
+# ============================================================
 # Main emitted-electron integrator
 # ============================================================
 
@@ -202,6 +318,7 @@ def integrate_one_electron(
     intersector,
     face_owner,
     collision_mesh,
+    integrator: str = "verlet",
     dt: float = 1e-12,
     max_steps: int = 20000,
     surface_eps: float = 1e-7,
@@ -372,46 +489,20 @@ def integrate_one_electron(
         else:
             dt_step = dt
 
-        E = E_at_point(p, Ex_interp, Ey_interp, Ez_interp)
-        if not np.all(np.isfinite(E)):
-            return _trajectory_failure(
-                reason="field_nan",
-                p=p,
-                v=v,
-                traj=traj,
-                vel=vel,
-                step=step,
-                extra={"E": E},
+        if integrator == "verlet":
+            p_new, v_new = velocity_verlet_step(
+                p, v, dt,
+                Ex_interp, Ey_interp, Ez_interp,
             )
-        a = q_over_m * E
-
-        # Velocity-Verlet / constant acceleration over one small step.
-        p_new = p + v * dt_step + 0.5 * a * dt_step**2
-
-        if not np.all(np.isfinite(p_new)):
-            return _trajectory_failure(
-                reason="nan_step",
-                p=p,
-                v=v,
-                traj=traj,
-                vel=vel,
-                step=step,
-                extra={"p1": p_new},
+        
+        elif integrator == "rk4":
+            p_new, v_new = rk4_step(
+                p, v, dt,
+                Ex_interp, Ey_interp, Ez_interp,
             )
-
-        E_new = E_at_point(p_new, Ex_interp, Ey_interp, Ez_interp)
-        if not np.all(np.isfinite(E_new)):
-            return _trajectory_failure(
-                reason="field_nan",
-                p=p,
-                v=v,
-                traj=traj,
-                vel=vel,
-                step=step,
-                extra={"E": E},
-            )
-        a_new = q_over_m * E_new
-        v_new = v + 0.5 * (a + a_new) * dt_step
+        
+        else:
+            raise ValueError(f"Unknown integrator: {integrator}")
 
         # Analytic sample-plane return.
         hit_sample = None
