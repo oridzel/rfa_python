@@ -512,7 +512,7 @@ def run_one_primary_with_cascade(
         if not np.isfinite(E_term) or E_term < min_incident_energy_eV:
             continue
 
-                n_term = estimate_surface_normal(
+        n_term = estimate_surface_normal(
             terminal_owner,
             r_hit=r_term,
             v_in=v_term,
