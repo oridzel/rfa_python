@@ -90,6 +90,16 @@ def canonical_surface_name_for_sey(surface_name):
     return aliases.get(s, s)
 
 
+def orient_normal_against_incoming(n_out, v_in):
+    n_out = unit(n_out)
+    vhat = unit(v_in)
+
+    if np.dot(vhat, n_out) > 0:
+        n_out = -n_out
+
+    return n_out
+
+
 def bse_multiplier_for_surface(
     surface_name,
     BSE_mult: float = 1.0,
@@ -571,29 +581,31 @@ def sample_surface_event(
     sey_base = interp_yield_model(sey_mdl, Einc)
     bsey_base = interp_yield_model(bsey_mdl, Einc)
 
-    cos_theta = max(float(cos_theta), 0.05)
+    cos_theta_eff = max(float(cos_theta), 0.05)    
+    
+    if fam in ["grid", "collector"]:
+        # For analytic grid shells and collector shell, do not apply
+        # incidence-angle yield amplification.
+        sey_val = sey_base
+        bsey_val = bsey_base
+    else:
+        # Real material surfaces.
+        sey_val = sey_base / cos_theta_eff
+        bsey_val = bsey_base / cos_theta_eff
 
-    sey_val = sey_base / cos_theta
-    bsey_val = bsey_base / cos_theta
-
-    if fam in ["grid"]:
-        surface_sey_mult = sey_multiplier_for_surface(
+    if fam == "grid":
+        sey_val *= sey_multiplier_for_surface(
             surface_name=surface_name,
             grid_SEY_mult=grid_SEY_mult,
         )
-        
-        sey_val = sey_val * surface_sey_mult
-    sey_val = max(0.0, sey_val)
-
-    if fam in ["grid","collector"]:
-        surface_bse_mult = bse_multiplier_for_surface(
+    
+    if fam == "collector":
+        bsey_val *= bse_multiplier_for_surface(
             surface_name=surface_name,
-            BSE_mult=BSE_mult,
-            grid_BSE_mult=grid_BSE_mult,
             collector_BSE_mult=collector_BSE_mult,
         )
-        
-        bsey_val = bsey_val * surface_bse_mult       
+    
+    sey_val = max(0.0, float(sey_val))
     bsey_val = max(0.0, min(float(bsey_val), 0.99))
 
     did_bse = False if Einc <= 50.0 else (rng.random() < bsey_val)
@@ -605,6 +617,34 @@ def sample_surface_event(
 # ============================================================
 # Energy and theta sampling
 # ============================================================
+
+def sample_direction_about_axis(axis, theta_rad, rng):
+    """
+    Sample a direction making polar angle theta_rad with respect to axis.
+    theta = 0   -> along axis
+    theta = pi  -> opposite axis
+    """
+    axis = unit(axis)
+
+    tmp = np.array([0.0, 0.0, 1.0])
+    if abs(np.dot(tmp, axis)) > 0.9:
+        tmp = np.array([0.0, 1.0, 0.0])
+
+    e1 = unit(np.cross(axis, tmp))
+    e2 = unit(np.cross(axis, e1))
+
+    phi = 2.0 * np.pi * rng.random()
+
+    vhat = (
+        np.cos(theta_rad) * axis
+        + np.sin(theta_rad) * (
+            np.cos(phi) * e1
+            + np.sin(phi) * e2
+        )
+    )
+
+    return unit(vhat)
+    
 
 def _choose_sampler_table(model: dict, Einc: float, rng):
     """
@@ -818,6 +858,41 @@ def launch_surface_electron(
     return v
 
 
+def sample_effective_wire_normal_for_grid_hit(n_grid, v_in, rng):
+    vhat = unit(v_in)
+    n_grid = unit(n_grid)
+
+    # Make n_grid oppose incoming direction.
+    if np.dot(vhat, n_grid) > 0:
+        n_grid = -n_grid
+
+    # Choose a random tangent direction in the grid plane.
+    tmp = np.array([0.0, 0.0, 1.0])
+    if abs(np.dot(tmp, n_grid)) > 0.9:
+        tmp = np.array([0.0, 1.0, 0.0])
+
+    t1 = unit(np.cross(n_grid, tmp))
+    t2 = unit(np.cross(n_grid, t1))
+
+    # Random wire-edge direction in tangent plane.
+    t_edge = unit(rng.normal() * t1 + rng.normal() * t2)
+
+    # Impact parameter across wire shadow.
+    b = rng.uniform(-1.0, 1.0)
+
+    # Local cylinder normal on front half of wire.
+    # b=0 gives normal against incoming/grid-normal direction.
+    # |b| near 1 gives side/edge normal.
+    n_wire = np.sqrt(max(0.0, 1.0 - b*b)) * n_grid + b * t_edge
+    n_wire = unit(n_wire)
+
+    # Ensure it faces the incoming electron.
+    if np.dot(vhat, n_wire) > 0:
+        n_wire = -n_wire
+
+    return n_wire
+
+
 # ============================================================
 # Surface-emission generation
 # ============================================================
@@ -855,11 +930,18 @@ def generate_surface_emissions(
 
     r_hit = np.asarray(r_hit, dtype=float)
     v_in = np.asarray(v_in, dtype=float)
-    n_out = unit(n_out)
+    # n_out = unit(n_out)
+    if surface_name in ["g1_shell", "g2_shell", "g3_shell", "g1mesh", "g2mesh", "g3mesh"]:
+        n_out = sample_effective_wire_normal_for_grid_hit(
+            n_grid=unit(r_hit),
+            v_in=v_in,
+            rng=rng,
+        )
+    else:
+        n_out = orient_normal_against_incoming(n_out, v_in)
 
     vhat = unit(v_in)
-
-    cos_theta = max(0.05, -np.dot(vhat, n_out))
+    cos_theta = max(0.05, -float(np.dot(vhat, n_out)))
 
     Einc = float(Einc)
     Phi_emit = surface_voltage(surface_name, voltages)
