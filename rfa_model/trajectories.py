@@ -213,7 +213,7 @@ def acceleration_at_point(
         Ez_interp,
     )
 
-    return (e_charge / m_e) * E
+    return (-e_charge / m_e) * E
 
 
 def velocity_verlet_step(
@@ -369,7 +369,14 @@ def integrate_one_electron(
 
     p = np.asarray(p0, dtype=float).copy()
     v = np.asarray(v0, dtype=float).copy()
-
+    
+    traj = [p.copy()]
+    vel = [v.copy()]
+    grid_events = []
+    events = []
+    
+    ignore_sphere_owners = set()
+    
     if not np.all(np.isfinite(p)) or not np.all(np.isfinite(v)):
         return _trajectory_failure(
             reason="nan_state",
@@ -377,17 +384,8 @@ def integrate_one_electron(
             v=v,
             traj=traj,
             vel=vel,
-            step=step,
+            step=0,
         )
-
-    traj = [p.copy()]
-    vel = [v.copy()]
-    grid_events = []
-    events = []
-
-    ignore_sphere_owners = set()
-
-    q_over_m = -e_charge / m_e
 
     for step in range(max_steps):
         cls = classify_grid_point(p, field)
@@ -416,7 +414,7 @@ def integrate_one_electron(
                     if grid_transparency is None:
                         T = 1.0
                     else:
-                        T = grid_transparency.get(owner, 1.0)
+                        T = transparency_for_owner(grid_transparency, owner, default=1.0)
 
                     if rng is None:
                         rng_local = np.random.default_rng()
@@ -491,13 +489,13 @@ def integrate_one_electron(
 
         if integrator == "verlet":
             p_new, v_new = velocity_verlet_step(
-                p, v, dt,
+                p, v, dt_step,
                 Ex_interp, Ey_interp, Ez_interp,
             )
         
         elif integrator == "rk4":
             p_new, v_new = rk4_step(
-                p, v, dt,
+                p, v, dt_step,
                 Ex_interp, Ey_interp, Ez_interp,
             )
         
@@ -586,7 +584,7 @@ def integrate_one_electron(
                     }
 
                 if event_type == "transmit_grid":
-                    T = grid_transparency.get(owner, 1.0)
+                    T = transparency_for_owner(grid_transparency, owner, default=1.0)
 
                     u = rng.random()
 
@@ -709,3 +707,13 @@ def advance_until_free(
             return p, cls
 
     return p, cls
+
+
+def transparency_for_owner(grid_transparency, owner, default=1.0):
+    if grid_transparency is None:
+        return float(default)
+
+    if isinstance(grid_transparency, dict):
+        return float(grid_transparency.get(owner, default))
+
+    return float(grid_transparency)
