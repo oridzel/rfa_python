@@ -318,7 +318,7 @@ def integrate_one_electron(
     intersector,
     face_owner,
     collision_mesh,
-    integrator: str = "verlet",
+    integrator: str = "rk4",
     dt: float = 1e-12,
     max_steps: int = 20000,
     surface_eps: float = 1e-7,
@@ -501,6 +501,26 @@ def integrate_one_electron(
         
         else:
             raise ValueError(f"Unknown integrator: {integrator}")
+
+        if not np.all(np.isfinite(p_new)) or not np.all(np.isfinite(v_new)):
+            return _trajectory_failure(
+                reason="nan_state_after_step",
+                p=p_new,
+                v=v_new,
+                traj=traj,
+                vel=vel,
+                step=step + 1,
+                hit_info={
+                    "owner_name": "escaped",
+                    "owner": "escaped",
+                    "numerical_failure": True,
+                },
+                extra={
+                    "p_before": p.copy(),
+                    "v_before": v.copy(),
+                    "dt_step": dt_step,
+                },
+            )
 
         # Analytic sample-plane return.
         hit_sample = None
