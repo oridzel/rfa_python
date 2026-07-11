@@ -329,7 +329,7 @@ def integrate_one_electron(
     intersector,
     face_owner,
     collision_mesh,
-    integrator: str = "rk4",
+    integrator: str = "verlet",
     dt: float = 1e-12,
     max_steps: int = 20000,
     surface_eps: float = 1e-7,
