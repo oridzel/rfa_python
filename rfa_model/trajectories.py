@@ -23,24 +23,35 @@ from .collisions import (
 )
 
 
-def _trajectory_failure(reason, p, v, traj, vel, step, extra=None):
-    hit_info = {
-        "kind": reason,
-        "location": np.asarray(p, dtype=float),
-        "v_in": np.asarray(v, dtype=float),
-        "KE_hit_eV": np.nan,
-    }
+def _trajectory_failure(
+    reason,
+    p,
+    v,
+    traj,
+    vel,
+    step,
+    hit_info=None,
+    extra=None,
+):
+    if hit_info is None:
+        hit_info = {}
 
-    if extra is not None:
-        hit_info.update(extra)
+    if extra is None:
+        extra = {}
 
-    return {
+    out = {
         "reason": reason,
+        "p_final": np.asarray(p, dtype=float),
+        "v_final": np.asarray(v, dtype=float),
+        "traj": np.asarray(traj, dtype=float),
+        "vel": np.asarray(vel, dtype=float),
+        "step": step,
         "hit_info": hit_info,
-        "traj": np.asarray(traj),
-        "vel": np.asarray(vel),
-        "steps": step,
     }
+
+    out.update(extra)
+
+    return out
 
 
 def unit(v: np.ndarray) -> np.ndarray:
@@ -501,6 +512,26 @@ def integrate_one_electron(
         
         else:
             raise ValueError(f"Unknown integrator: {integrator}")
+
+        if not np.all(np.isfinite(p_new)) or not np.all(np.isfinite(v_new)):
+            return _trajectory_failure(
+                reason="nan_state_after_step",
+                p=p_new,
+                v=v_new,
+                traj=traj,
+                vel=vel,
+                step=step + 1,
+                hit_info={
+                    "owner_name": "escaped",
+                    "owner": "escaped",
+                    "numerical_failure": True,
+                },
+                extra={
+                    "p_before": p.copy(),
+                    "v_before": v.copy(),
+                    "dt_step": dt_step,
+                },
+            )
 
         # Analytic sample-plane return.
         hit_sample = None
