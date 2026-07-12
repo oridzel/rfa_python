@@ -476,7 +476,7 @@ def mark_named_meshes(
             "sample": "Vs",
             "holder": "Vs",
             "receiver": "Vs",
-            "rod": "Vs",
+            "rod": "Vrod",
 
             "drifttube": "Vdt",
 
@@ -1443,6 +1443,7 @@ def build_rfa_field(
     if voltages is None:
         voltages = {
             "Vs": 0.0,
+            "Vrod": 0.0,
             "Vg1": 0.0,
             "Vg2": 0.0,
             "Vg3": 0.0,
