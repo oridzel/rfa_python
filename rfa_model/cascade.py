@@ -936,6 +936,9 @@ def run_cascade_batch_parallel(
 
     rng = np.random.default_rng(seed)
 
+    optimal_chunks = n_jobs * 4
+    chunk_size = max(1, N_primary // optimal_chunks)
+
     if x_start is None:
         x_start = 0.75 * float(field["h"])
 
