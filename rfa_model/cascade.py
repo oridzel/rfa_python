@@ -978,9 +978,9 @@ def run_cascade_batch_parallel(
     
     chunk_results = Parallel(
         n_jobs=n_jobs,
-        backend="loky",
-        max_nbytes="10M",
-        mmap_mode="r",
+        backend="multiprocessing",
+        # max_nbytes="10M",
+        # mmap_mode="r",
         temp_folder=str(tmp_dir),
         verbose=verbose,
     )(
