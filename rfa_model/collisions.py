@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import trimesh
+from .constants import COLLECTOR_OPENING_ALPHA_DEG
 
 
 OWNER_ID_BY_NAME = {
@@ -505,7 +506,11 @@ def sphere_crossing_is_opening(
         return is_in_spherical_cap_opening(p, u_open, alpha_deg=14.0)
 
     if owner == "collector_shell":
-        return is_in_spherical_cap_opening(p, u_open, alpha_deg=11.8)
+        return is_in_spherical_cap_opening(
+            p,
+            u_open,
+            alpha_deg=COLLECTOR_OPENING_ALPHA_DEG,
+        )
 
     return False
 

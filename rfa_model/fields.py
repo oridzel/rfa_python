@@ -14,8 +14,8 @@ import numpy as np
 from numba import njit
 from scipy.interpolate import RegularGridInterpolator
 
-from .constants import e_charge, m_e
 
+from .constants import e_charge, m_e, COLLECTOR_OPENING_ALPHA_DEG
 
 # ============================================================
 # Owner IDs and names
@@ -741,10 +741,21 @@ def make_analytic_rfa_boundary_masks(
     open_g1 = spherical_cap_hole(R, X, Y, Z, R_g1, band_grid, u_open, 20.0)
     open_g2 = spherical_cap_hole(R, X, Y, Z, R_g2, band_grid, u_open, 18.0)
     open_g3 = spherical_cap_hole(R, X, Y, Z, R_g3, band_grid, u_open, 14.0)
+    open_col = spherical_cap_hole(
+        R,
+        X,
+        Y,
+        Z,
+        R_col,
+        band_col,
+        u_open,
+        COLLECTOR_OPENING_ALPHA_DEG,
+    )
 
     g1_bdry = g1_bdry & ~open_g1
     g2_bdry = g2_bdry & ~open_g2
     g3_bdry = g3_bdry & ~open_g3
+    col_bdry = col_bdry & ~open_col
 
     # --------------------------------------------------------
     # Drift tube cylindrical boundary

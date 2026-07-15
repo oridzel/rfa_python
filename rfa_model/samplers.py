@@ -993,30 +993,10 @@ def generate_surface_emissions(
 
     p0_surface = r_hit + sample_launch_eps * n_out
 
-    # Potential correction for the launch-point offset.
-    #
-    # The tabulated surface energy E_surf is defined at the physical electrode
-    # surface (Phi = Phi_emit).  The electron is numerically launched from
-    # p0_surface, which is one small step (sample_launch_eps) away from the
-    # surface into the field.  At that point the local potential Phi0 differs
-    # slightly from Phi_emit because the field is not perfectly flat.
-    #
-    # Energy conservation requires:
-    #   E_launch = E_surf - (Phi0 - Phi_emit)
-    #            = E_surf + Phi_emit - Phi0
-    #
-    # The correction is typically < 0.1 eV near the sample (where the field
-    # gradient is small) but reaches ~1.5 eV near the retarding grids biased
-    # at -50 V, where it can shift electrons across the 50 eV BSE/SE boundary.
-    #
-    # The correction is only applied when Phi_interp is provided.
-    # Cutoff checks (E_bse < Phi_emit, E_se < Phi_emit) intentionally use the
-    # raw surface energy, not the corrected launch energy, because they test
-    # whether the electron can escape the surface potential well.
     if Phi_interp is not None:
         from .fields import evaluate_potential
         Phi0 = evaluate_potential(p0_surface, Phi_interp)
-        phi_correction = Phi_emit - Phi0   # eV; added to surface energy
+        phi_correction = Phi0 - Phi_emit
     else:
         phi_correction = 0.0
 
@@ -1028,6 +1008,7 @@ def generate_surface_emissions(
                 "p0": p0_surface,
                 "v0": v_reflect,
                 "E_emit_eV": Einc,
+                "Phi_emit": Phi_emit,
                 "kind": "quantum_reflection",
                 "cos_theta": cos_theta,
             })
@@ -1104,6 +1085,7 @@ def generate_surface_emissions(
                     "v0": v_bse,
                     "E_emit_eV": E_bse,        # record physical surface energy
                     "E_launch_eV": E_bse_launch,
+                    "Phi_emit": Phi_emit,
                     "kind": "BSE",
                     "cos_theta": cos_theta,
                 })

@@ -75,6 +75,11 @@ def point_to_grid_index(p, x, y, z):
     """
     Convert a Cartesian point to nearest grid index.
     """
+    p = np.asarray(p, dtype=float)
+
+    if p.shape[0] != 3 or not np.all(np.isfinite(p)):
+        return -1, -1, -1, False
+
     hx = x[1] - x[0]
     hy = y[1] - y[0]
     hz = z[1] - z[0]

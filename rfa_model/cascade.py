@@ -185,17 +185,19 @@ def make_emissions_safe_to_launch(
     field: dict,
     launch_step_fraction_of_h: float = 0.25,
     max_advance_tries: int = 30,
+    Phi_interp=None,
 ) -> list[dict]:
     """
-    Move emitted electrons to the nearest free voxel along their launch velocity.
-
-    This avoids immediate self-hits when emission starts inside a fixed voxel
-    layer, especially for grid shells and the collector shell.
+    Move emitted electrons to the nearest free voxel along their launch velocity,
+    then correct kinetic energy for the potential difference between the
+    physical emitting surface and the actual numerical launch point.
     """
+    from .fields import evaluate_potential
+    from .constants import speed_from_energy_eV
+
     safe = []
 
     r_hit = np.asarray(r_hit, dtype=float)
-
     h = float(field["h"])
 
     for e in emissions:
@@ -204,7 +206,6 @@ def make_emissions_safe_to_launch(
         v0 = np.asarray(e["v0"], dtype=float)
         direction = unit(v0)
 
-        # Start a tiny distance along the actual emitted direction.
         p_start = r_hit + 1.0e-6 * direction
 
         p_safe, cls = advance_until_free(
@@ -217,10 +218,27 @@ def make_emissions_safe_to_launch(
 
         e["p0"] = p_safe
         e["launch_grid_classification"] = cls
-
-        # Useful for debugging.
         e["raw_hit_location"] = r_hit.copy()
         e["launch_offset_m"] = float(np.linalg.norm(p_safe - r_hit))
+
+        if Phi_interp is not None:
+            Phi_emit = e.get("Phi_emit", np.nan)
+            E_surface = e.get("E_emit_eV", np.nan)
+
+            if np.isfinite(Phi_emit) and np.isfinite(E_surface):
+                Phi_launch = float(evaluate_potential(p_safe, Phi_interp))
+
+                if np.isfinite(Phi_launch):
+                    # Electron energy conservation:
+                    # K_launch - Phi_launch = K_surface - Phi_emit
+                    dE = Phi_launch - Phi_emit
+                    E_launch = max(float(E_surface) + dE, 1.0e-3)
+
+                    e["Phi_launch"] = Phi_launch
+                    e["phi_launch_correction_eV"] = dE
+                    e["E_launch_eV"] = E_launch
+
+                    e["v0"] = direction * speed_from_energy_eV(E_launch)
 
         safe.append(e)
 
@@ -283,6 +301,7 @@ def generate_cascade_emissions_from_hit(
         r_hit=r_hit,
         field=field,
         launch_step_fraction_of_h=launch_step_fraction_of_h,
+        Phi_interp=Phi_interp,
     )
 
     return emissions
@@ -335,6 +354,7 @@ def run_one_primary_with_cascade(
 
     launch_step_fraction_of_h: float = 0.25,
     surface_skip_eps: float = 1.0e-6,
+    integrator: str = "verlet",
 ):
     """
     Run one primary electron with full cascade emission.
@@ -438,6 +458,7 @@ def run_one_primary_with_cascade(
             intersector=intersector_emit,
             face_owner=face_owner_emit,
             collision_mesh=collision_mesh_emit,
+            integrator=integrator,
             dt=1.0e-12,
             max_steps=emitted_max_steps,
             surface_eps=surface_skip_eps,
@@ -739,6 +760,7 @@ def _run_cascade_chunk(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    integrator: str = "verlet",
 ):
     """
     Worker function for one cascade chunk.
@@ -793,6 +815,7 @@ def _run_cascade_chunk(
             emitted_max_step_fraction_of_h=emitted_max_step_fraction_of_h,
 
             launch_step_fraction_of_h=launch_step_fraction_of_h,
+            integrator=integrator,
         )
 
         primary_res_i["primary_index"] = primary_index
@@ -907,6 +930,7 @@ def run_cascade_batch_parallel(
     emitted_max_steps: int = 20000,
 
     launch_step_fraction_of_h: float = 0.75,
+    integrator: str = "verlet",
 
     n_jobs: int = 4,
     chunk_size: int = 5,
@@ -1033,6 +1057,7 @@ def run_cascade_batch_parallel(
             emitted_max_step_fraction_of_h=emitted_max_step_fraction_of_h,
     
             launch_step_fraction_of_h=launch_step_fraction_of_h,
+            integrator=integrator,
         )
         for ic, (start, stop) in enumerate(chunks)
     )
@@ -1112,6 +1137,7 @@ def run_cascade_batch_parallel(
 
         "N_primary": N_primary,
         "E0_eV": E0_eV,
+        "integrator": integrator,
 
         "grid_transparency": grid_transparency,
         "grid_SEY_mult": grid_SEY_mult,

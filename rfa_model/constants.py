@@ -11,6 +11,7 @@ import numpy as np
 
 e_charge = 1.602176634e-19
 m_e = 9.1093837015e-31
+COLLECTOR_OPENING_ALPHA_DEG = 11.8
 
 
 def speed_from_energy_eV(E_eV: float | np.ndarray) -> float | np.ndarray:
