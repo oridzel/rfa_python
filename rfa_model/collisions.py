@@ -505,7 +505,7 @@ def sphere_crossing_is_opening(
         return is_in_spherical_cap_opening(p, u_open, alpha_deg=14.0)
 
     if owner == "collector_shell":
-        return is_in_spherical_cap_opening(p, u_open, alpha_deg=14.0)
+        return is_in_spherical_cap_opening(p, u_open, alpha_deg=11.8)
 
     return False
 

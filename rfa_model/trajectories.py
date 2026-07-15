@@ -45,7 +45,7 @@ def _trajectory_failure(
         "v_final": np.asarray(v, dtype=float),
         "traj": np.asarray(traj, dtype=float),
         "vel": np.asarray(vel, dtype=float),
-        "step": step,
+        "steps": step,
         "hit_info": hit_info,
     }
 
@@ -373,9 +373,9 @@ def integrate_one_electron(
 
     if grid_transparency is None:
         grid_transparency = {
-            "g1_shell": 1.0,
-            "g2_shell": 1.0,
-            "g3_shell": 1.0,
+            "g1_shell": 0.93,
+            "g2_shell": 0.93,
+            "g3_shell": 0.93,
         }
 
     p = np.asarray(p0, dtype=float).copy()
@@ -449,7 +449,7 @@ def integrate_one_electron(
                     grid_events.append({
                         "owner": owner,
                         "location": p.copy(),
-                        "step": step,
+                        "steps": step,
                         "type": "transmit_fixed_voxel",
                     })
 
@@ -636,7 +636,7 @@ def integrate_one_electron(
                         "type": "transmit_grid",
                         "owner": owner,
                         "location": hit["location"],
-                        "step": step,
+                        "steps": step,
                         "u": u,
                         "T": T,
                     })

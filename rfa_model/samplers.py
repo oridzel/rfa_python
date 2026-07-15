@@ -946,6 +946,7 @@ def generate_surface_emissions(
     collector_BSE_mult: float | None = None,
     sample_launch_eps: float = 1.0e-6,
     U0: float = 15.0,
+    Phi_interp=None,
 ) -> list[dict]:
     """
     Generate emitted electrons from one surface impact.
@@ -992,6 +993,33 @@ def generate_surface_emissions(
 
     p0_surface = r_hit + sample_launch_eps * n_out
 
+    # Potential correction for the launch-point offset.
+    #
+    # The tabulated surface energy E_surf is defined at the physical electrode
+    # surface (Phi = Phi_emit).  The electron is numerically launched from
+    # p0_surface, which is one small step (sample_launch_eps) away from the
+    # surface into the field.  At that point the local potential Phi0 differs
+    # slightly from Phi_emit because the field is not perfectly flat.
+    #
+    # Energy conservation requires:
+    #   E_launch = E_surf - (Phi0 - Phi_emit)
+    #            = E_surf + Phi_emit - Phi0
+    #
+    # The correction is typically < 0.1 eV near the sample (where the field
+    # gradient is small) but reaches ~1.5 eV near the retarding grids biased
+    # at -50 V, where it can shift electrons across the 50 eV BSE/SE boundary.
+    #
+    # The correction is only applied when Phi_interp is provided.
+    # Cutoff checks (E_bse < Phi_emit, E_se < Phi_emit) intentionally use the
+    # raw surface energy, not the corrected launch energy, because they test
+    # whether the electron can escape the surface potential well.
+    if Phi_interp is not None:
+        from .fields import evaluate_potential
+        Phi0 = evaluate_potential(p0_surface, Phi_interp)
+        phi_correction = Phi_emit - Phi0   # eV; added to surface energy
+    else:
+        phi_correction = 0.0
+
     if surface_name == "sample" and origin == "gun":
         if rng.random() < R_quantum:
             v_reflect = v_in - 2.0 * np.dot(v_in, n_out) * n_out
@@ -1027,7 +1055,7 @@ def generate_surface_emissions(
             rng=rng,
         )
 
-        # Copied from MATLAB-style logic. At Vs=0 this does nothing.
+        # Cutoff check uses raw surface energy (escape condition).
         if not (surface_name == "sample" and E_bse < Phi_emit):
             if E_bse > 0:
                 theta_bs = np.deg2rad(
@@ -1042,41 +1070,40 @@ def generate_surface_emissions(
 
                 phi_bs = 2.0 * np.pi * rng.random()
 
+                # Apply launch-point potential correction to kinetic energy.
+                # Clamp to a small positive value so speed stays real.
+                E_bse_launch = max(E_bse + phi_correction, 1.0e-3)
+
                 if fam == "grid":
-                    # Effective wire scattering model.
-                    # John/JMONSEL grid-wire theta convention:
-                    # theta = 0 deg   -> backward, opposite incoming electron
-                    # theta = 180 deg -> forward, along incoming electron
                     axis_backscatter = -unit(v_in)
-                
+
                     v_bse = launch_electron_about_axis(
                         theta_rad=theta_bs,
                         phi_rad=phi_bs,
-                        Eout_eV=E_bse,
+                        Eout_eV=E_bse_launch,
                         axis=axis_backscatter,
                     )
-                
-                    # Launch along actual emitted direction because it may go to either side
-                    # of the grid shell.
+
                     p0_bse = r_hit + sample_launch_eps * unit(v_bse)
-                
+
                 else:
                     use_full = is_fullsphere_surface(surface_name)
-                
+
                     v_bse = launch_surface_electron(
                         theta_rad=theta_bs,
                         phi_rad=phi_bs,
-                        Eout_eV=E_bse,
+                        Eout_eV=E_bse_launch,
                         n_out=n_out,
                         use_full_sphere=use_full,
                     )
-                
+
                     p0_bse = p0_surface
-                
+
                 emitted.append({
                     "p0": p0_bse,
                     "v0": v_bse,
-                    "E_emit_eV": E_bse,
+                    "E_emit_eV": E_bse,        # record physical surface energy
+                    "E_launch_eV": E_bse_launch,
                     "kind": "BSE",
                     "cos_theta": cos_theta,
                 })
@@ -1090,7 +1117,7 @@ def generate_surface_emissions(
             rng=rng,
         )
 
-        # Copied from MATLAB-style logic. At Vs=0 this does nothing.
+        # Cutoff check uses raw surface energy (escape condition).
         if surface_name == "sample" and E_se < Phi_emit:
             continue
 
@@ -1109,35 +1136,40 @@ def generate_surface_emissions(
 
         phi_se = 2.0 * np.pi * rng.random()
 
+        # Apply launch-point potential correction to kinetic energy.
+        # Clamp to a small positive value so speed stays real.
+        E_se_launch = max(E_se + phi_correction, 1.0e-3)
+
         if fam == "grid":
             axis_backscatter = -unit(v_in)
-        
+
             v_se = launch_electron_about_axis(
                 theta_rad=theta_se,
                 phi_rad=phi_se,
-                Eout_eV=E_se,
+                Eout_eV=E_se_launch,
                 axis=axis_backscatter,
             )
-        
+
             p0_se = r_hit + sample_launch_eps * unit(v_se)
-        
+
         else:
             use_full = is_fullsphere_surface(surface_name)
-        
+
             v_se = launch_surface_electron(
                 theta_rad=theta_se,
                 phi_rad=phi_se,
-                Eout_eV=E_se,
+                Eout_eV=E_se_launch,
                 n_out=n_out,
                 use_full_sphere=use_full,
             )
-        
+
             p0_se = p0_surface
-        
+
         emitted.append({
             "p0": p0_se,
             "v0": v_se,
-            "E_emit_eV": E_se,
+            "E_emit_eV": E_se,          # record physical surface energy
+            "E_launch_eV": E_se_launch,
             "kind": "SE",
             "cos_theta": cos_theta,
         })

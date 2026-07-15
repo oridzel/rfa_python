@@ -243,6 +243,7 @@ def generate_cascade_emissions_from_hit(
     launch_step_fraction_of_h: float = 0.25,
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    Phi_interp=None,
 ) -> list[dict]:
     """
     Generate and safely place cascade emissions from one surface hit.
@@ -274,6 +275,7 @@ def generate_cascade_emissions_from_hit(
         origin=origin,
         sample_launch_eps=1.0e-6,
         U0=15.0,
+        Phi_interp=Phi_interp,
     )
 
     emissions = make_emissions_safe_to_launch(
@@ -400,6 +402,7 @@ def run_one_primary_with_cascade(
         origin="gun",
         hit_info=hit,
         launch_step_fraction_of_h=launch_step_fraction_of_h,
+        Phi_interp=Phi_interp,
     )
 
     for e in first_emissions:
@@ -572,6 +575,7 @@ def run_one_primary_with_cascade(
             origin=res.get("emission_kind", "cascade"),
             hit_info=hit_info,
             launch_step_fraction_of_h=launch_step_fraction_of_h,
+            Phi_interp=Phi_interp,
         )
 
         cascade_log.append({
@@ -978,9 +982,9 @@ def run_cascade_batch_parallel(
     
     chunk_results = Parallel(
         n_jobs=n_jobs,
-        backend="multiprocessing",
-        # max_nbytes="10M",
-        # mmap_mode="r",
+        backend="loky",
+        max_nbytes="10M",
+        mmap_mode="r",
         temp_folder=str(tmp_dir),
         verbose=verbose,
     )(

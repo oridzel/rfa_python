@@ -193,12 +193,12 @@ def validate_yield_sampling_at_energy(
             yield_models=yield_models,
             surface_name=surface_name,
             Einc=E0,
+            cos_theta=cos_theta,
+            rng=rng,
             grid_SEY_mult=1.0,
             BSE_mult=1.0,
             grid_BSE_mult=1.0,
             collector_BSE_mult=1.0,
-            cos_theta=cos_theta,
-            rng=rng,
         )
 
         bse_count += int(did_bse)
@@ -219,9 +219,6 @@ def validate_yield_sampling_at_energy(
         bse_expected = 0.0
 
     se_expected = se_raw / max(cos_theta, 0.05)
-
-    if fam in ["grid", "collector"]:
-        se_expected *= SEY_mult
 
     print(f"Surface: {surface_name}")
     print(f"Family: {fam}")
