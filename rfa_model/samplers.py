@@ -349,8 +349,8 @@ def load_default_surface_models(
 
     theta_models = {
         "sample": {
-            "BSE": load_theta_sampler_csv(model_dir / "BSEThetaFromPlaneSampler_uncoatedAu.csv"),
-            "SE": load_theta_sampler_csv(model_dir / "SEThetaFromPlaneSampler_uncoatedAu.csv"),
+            "BSE": load_theta_sampler_csv(model_dir / "BSEThetaFromPlaneSampler_uncoatedCuFPA.csv"),
+            "SE": load_theta_sampler_csv(model_dir / "SEThetaFromPlaneSampler_uncoatedCuFPA.csv"),
         },
         "grid": {
             "BSE": load_theta_sampler_csv(model_dir / "BSEThetaFromWireSampler_glassyCarbon_t70nmWFPA.csv"),
@@ -372,8 +372,8 @@ def load_default_surface_models(
 
     energy_models = {
         "sample": {
-            "BSE": load_energy_sampler_csv(model_dir / "BSEeEFromPlaneSampler_SEVaccum_t0nmAu.csv"),
-            "SE": load_energy_sampler_csv(model_dir / "SEeEFromPlaneSampler_SEVaccum_t0nmAu.csv"),
+            "BSE": load_energy_sampler_csv(model_dir / "BSEeEFromPlaneSampler_SEVaccum_t0nmCuFPA.csv"),
+            "SE": load_energy_sampler_csv(model_dir / "SEeEFromPlaneSampler_SEVaccum_t0nmCuFPA.csv"),
         },
         "grid": {
             "BSE": load_energy_sampler_csv(model_dir / "BSEeEFromWireSampler_glassyCarbon_t70nmWFPA.csv"),
@@ -398,8 +398,8 @@ def load_default_surface_models(
 
     yield_models = {
         "sample": {
-            "BSEY": load_yield_curve_csv(model_dir / "BSEYFromPlane_SEVaccum_t0nmAu.csv"),
-            "SEY": load_yield_curve_csv(model_dir / "SEYFromPlane_SEVaccum_t0nmAu.csv"),
+            "BSEY": load_yield_curve_csv(model_dir / "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
+            "SEY": load_yield_curve_csv(model_dir / "SEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
         },
         "holder": {
             "BSEY": load_yield_curve_csv(bronstein_dir / "BSEY_Mo_Bronstein.csv"),
