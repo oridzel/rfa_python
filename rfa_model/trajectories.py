@@ -20,7 +20,6 @@ from .collisions import (
     segment_hits_sample_plane,
     classify_sphere_event,
     nearest_hit,
-    sphere_crossing_is_opening,
 )
 
 
@@ -470,28 +469,24 @@ def integrate_one_electron(
                     traj.append(p.copy())
                     vel.append(v.copy())
 
+                    if cls_after["status"] != "free":
+                        return _trajectory_failure(
+                            reason="grid_transmission_placement_failed",
+                            p=p,
+                            v=v,
+                            traj=traj,
+                            vel=vel,
+                            step=step,
+                            hit_info={
+                                **cls_after,
+                                "owner": owner,
+                                "kind": "grid_transmission_placement_failed",
+                            },
+                            extra={"grid_events": grid_events},
+                        )
+
                     # Continue integration after stepping through shell.
                     continue
-
-                # -----------------------------------------------
-                # For the collector shell, the voxel layer can
-                # overlap the sample-exchange or drift-tube opening.
-                # first_analytic_grid_hit guards the ANALYTIC sphere
-                # path, but voxels inside an opening region would
-                # otherwise be absorbed incorrectly here.
-                # Re-apply the same opening check to the voxel
-                # position and step through if inside an opening.
-                # -----------------------------------------------
-                if owner == "collector_shell":
-                    if sphere_crossing_is_opening(p, "collector_shell", field):
-                        p, _ = advance_until_free(
-                            p, v, field,
-                            max_tries=30,
-                            step_fraction_of_h=0.25,
-                        )
-                        traj.append(p.copy())
-                        vel.append(v.copy())
-                        continue
 
                 # Ordinary fixed voxel: absorbing electrode.
                 return {
@@ -744,11 +739,15 @@ def advance_until_free(
     step_fraction_of_h: float = 0.25,
 ):
     """
-    Advance a transmitted electron along its velocity until it is outside
+    Advance a TRANSMITTED electron along its velocity until it leaves
     the current fixed voxel layer.
 
-    This is needed for fixed grid-shell voxels, because surface_eps alone
-    can be much smaller than the field-grid voxel thickness.
+    This is the original function, intended for grid-shell transmissions
+    where advancing along the velocity direction is geometrically correct.
+
+    Returns (p, cls) — same signature as before for backward compatibility.
+    The caller should check cls["status"] == "free" if it needs to know
+    whether the search succeeded.
     """
     p = np.asarray(p, dtype=float).copy()
     direction = unit(v)
@@ -763,7 +762,81 @@ def advance_until_free(
         if cls["status"] == "free":
             return p, cls
 
+        # Early exit if already outside valid region — no point continuing.
+        if cls["status"] in {"left_grid", "left_update_region"}:
+            return p, cls
+
     return p, cls
+
+
+def place_emitted_particle_in_vacuum(
+    r_hit,
+    n_vacuum,
+    field,
+    max_tries: int = 12,
+    step_fraction_of_h: float = 0.10,
+):
+    """
+    Find a free-vacuum launch point for a NEWLY EMITTED particle.
+
+    Unlike advance_until_free(), this steps along the vacuum-side surface
+    NORMAL rather than the sampled emission velocity. This is the
+    geometrically correct approach for emission from curved or thick
+    fixed-voxel surfaces (especially the collector shell), where a
+    tangential emission direction can stay inside the shell for many steps.
+
+    The sampled emission velocity is unchanged; only the starting position
+    is displaced along the normal.
+
+    Parameters
+    ----------
+    r_hit : array (3,)
+        Exact surface hit location.
+    n_vacuum : array (3,)
+        Unit outward normal pointing toward vacuum from the surface.
+        For collector_shell this is -r_hat (inward radial direction).
+        For g*_shell this is +r_hat.
+        For sample this is +X.
+    field : dict
+        Field dictionary containing at least "h" (voxel size).
+    max_tries : int
+        Maximum number of normal-directed steps.  12 steps × 0.10h ≈ 1.2h
+        which is safely larger than the voxel layer thickness without
+        overshooting into the next electrode.
+    step_fraction_of_h : float
+        Step size as a fraction of h.
+
+    Returns
+    -------
+    p_safe : ndarray (3,)
+        Launch point (free voxel if success, else last attempted point).
+    cls : dict
+        Grid classification at p_safe.
+    success : bool
+        True only if a free voxel was found within max_tries steps.
+        If False the caller MUST NOT use p_safe as a physical launch point.
+    """
+    p = np.asarray(r_hit, dtype=float).copy()
+    n_vac = unit(np.asarray(n_vacuum, dtype=float))
+
+    h = float(field["h"])
+    ds = step_fraction_of_h * h
+
+    cls = classify_grid_point(p, field)
+
+    for _ in range(max_tries):
+        p = p + ds * n_vac
+        cls = classify_grid_point(p, field)
+
+        if cls["status"] == "free":
+            return p, cls, True
+
+        # Stepped outside the field entirely — give up immediately.
+        if cls["status"] in {"left_grid", "left_update_region"}:
+            return p, cls, False
+
+    # Exhausted all tries without finding free vacuum.
+    return p, cls, False
 
 
 def transparency_for_owner(grid_transparency, owner, default=1.0):

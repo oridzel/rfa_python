@@ -35,6 +35,7 @@ from .trajectories import (
     unit,
     integrate_one_electron,
     advance_until_free,
+    place_emitted_particle_in_vacuum,
 )
 from .primary import (
     fly_primary_to_sample,
@@ -183,43 +184,74 @@ def make_emissions_safe_to_launch(
     emissions: list[dict],
     r_hit,
     field: dict,
-    launch_step_fraction_of_h: float = 0.25,
-    max_advance_tries: int = 30,
+    launch_step_fraction_of_h: float = 0.10,
+    max_advance_tries: int = 20,
     Phi_interp=None,
-) -> list[dict]:
+    surface_name: str | None = None,
+    n_vacuum=None,
+) -> tuple[list[dict], list[dict]]:
     """
-    Move emitted electrons to the nearest free voxel along their launch velocity,
-    then correct kinetic energy for the potential difference between the
-    physical emitting surface and the actual numerical launch point.
+    Place newly emitted electrons in a free-vacuum voxel.
+
+    Every particle passed to this function is a NEW surface emission, so its
+    launch position is displaced along the vacuum-side surface normal.  The
+    sampled emission velocity is preserved.  Velocity-directed stepping is
+    reserved for already-travelling electrons transmitted through grid shells
+    inside integrate_one_electron().
+
+    Returns
+    -------
+    safe, failed : tuple[list[dict], list[dict]]
+        Successfully placed emissions and explicit failed-launch records.
+        Failed launches are never passed to the trajectory integrator and are
+        therefore not misclassified as physical escapes.
     """
     from .fields import evaluate_potential
     from .constants import speed_from_energy_eV
 
-    safe = []
+    safe: list[dict] = []
+    failed: list[dict] = []
 
     r_hit = np.asarray(r_hit, dtype=float)
-    h = float(field["h"])
 
-    for e in emissions:
-        e = dict(e)
+    if n_vacuum is None:
+        raise ValueError(
+            f"n_vacuum is required for emitted-particle placement "
+            f"(surface={surface_name!r})"
+        )
+
+    # Keep the normal search local even if an older notebook passes the former
+    # transmission-style value (for example 0.75 h).
+    normal_step_fraction = min(float(launch_step_fraction_of_h), 0.10)
+    if normal_step_fraction <= 0.0:
+        raise ValueError("launch_step_fraction_of_h must be positive")
+
+    for emission in emissions:
+        e = dict(emission)
 
         v0 = np.asarray(e["v0"], dtype=float)
         direction = unit(v0)
 
-        p_start = r_hit + 1.0e-6 * direction
-
-        p_safe, cls = advance_until_free(
-            p_start,
-            v0,
-            field,
+        p_safe, cls, success = place_emitted_particle_in_vacuum(
+            r_hit=r_hit,
+            n_vacuum=n_vacuum,
+            field=field,
             max_tries=max_advance_tries,
-            step_fraction_of_h=launch_step_fraction_of_h,
+            step_fraction_of_h=normal_step_fraction,
         )
 
-        e["p0"] = p_safe
-        e["launch_grid_classification"] = cls
         e["raw_hit_location"] = r_hit.copy()
         e["launch_offset_m"] = float(np.linalg.norm(p_safe - r_hit))
+        e["launch_grid_classification"] = cls
+
+        if not success:
+            e["launch_failed"] = True
+            e["launch_failure_reason"] = cls.get("status", "no_free_voxel")
+            failed.append(e)
+            continue
+
+        e["p0"] = p_safe
+        e["launch_failed"] = False
 
         if Phi_interp is not None:
             Phi_emit = e.get("Phi_emit", np.nan)
@@ -229,21 +261,30 @@ def make_emissions_safe_to_launch(
                 Phi_launch = float(evaluate_potential(p_safe, Phi_interp))
 
                 if np.isfinite(Phi_launch):
-                    # Electron energy conservation:
+                    # Electron energy conservation in eV:
                     # K_launch - Phi_launch = K_surface - Phi_emit
+                    # K_launch = K_surface + Phi_launch - Phi_emit
                     dE = Phi_launch - Phi_emit
-                    E_launch = max(float(E_surface) + dE, 1.0e-3)
+                    E_launch = float(E_surface) + dE
 
                     e["Phi_launch"] = Phi_launch
                     e["phi_launch_correction_eV"] = dE
-                    e["E_launch_eV"] = E_launch
+                    e["E_launch_eV_unclipped"] = E_launch
 
+                    if E_launch <= 0.0:
+                        e["launch_failed"] = True
+                        e["launch_failure_reason"] = (
+                            "insufficient_energy_to_launch_point"
+                        )
+                        failed.append(e)
+                        continue
+
+                    e["E_launch_eV"] = E_launch
                     e["v0"] = direction * speed_from_energy_eV(E_launch)
 
         safe.append(e)
 
-    return safe
-
+    return safe, failed
 
 def generate_cascade_emissions_from_hit(
     surface_name: str,
@@ -258,13 +299,15 @@ def generate_cascade_emissions_from_hit(
     rng,
     origin: str,
     hit_info: dict | None = None,
-    launch_step_fraction_of_h: float = 0.25,
+    launch_step_fraction_of_h: float = 0.10,
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
     Phi_interp=None,
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
     """
-    Generate and safely place cascade emissions from one surface hit.
+    Generate cascade emissions and place them safely in free vacuum.
+
+    Returns successful emissions and explicit failed-launch records.
     """
     surface_name = cascade_surface_name(surface_name)
 
@@ -275,8 +318,9 @@ def generate_cascade_emissions_from_hit(
         hit_info=hit_info,
     )
 
-    # Use very small normal offset here because we will override p0 using
-    # make_emissions_safe_to_launch(), which moves along the actual v0 direction.
+    # Use very small normal offset in generate_surface_emissions; the safe
+    # launch point is found by make_emissions_safe_to_launch() using the
+    # surface normal (for absorbing surfaces) or velocity (for grid shells).
     emissions = generate_surface_emissions(
         surface_name=surface_name,
         r_hit=r_hit,
@@ -296,15 +340,17 @@ def generate_cascade_emissions_from_hit(
         Phi_interp=Phi_interp,
     )
 
-    emissions = make_emissions_safe_to_launch(
+    safe_emissions, failed_emissions = make_emissions_safe_to_launch(
         emissions,
         r_hit=r_hit,
         field=field,
         launch_step_fraction_of_h=launch_step_fraction_of_h,
         Phi_interp=Phi_interp,
+        surface_name=surface_name,
+        n_vacuum=n_out,   # n_out points from the surface into vacuum
     )
 
-    return emissions
+    return safe_emissions, failed_emissions
 
 
 # ============================================================
@@ -352,7 +398,7 @@ def run_one_primary_with_cascade(
     emitted_dt_max: float = 5.0e-11,
     emitted_max_step_fraction_of_h: float = 0.75,
 
-    launch_step_fraction_of_h: float = 0.25,
+    launch_step_fraction_of_h: float = 0.10,
     surface_skip_eps: float = 1.0e-6,
     integrator: str = "verlet",
 ):
@@ -406,7 +452,7 @@ def run_one_primary_with_cascade(
     next_electron_id = 0
 
     # First-generation sample emission.
-    first_emissions = generate_cascade_emissions_from_hit(
+    first_emissions, first_launch_failures = generate_cascade_emissions_from_hit(
         surface_name="sample",
         r_hit=p_hit,
         v_in=v_in,
@@ -424,6 +470,24 @@ def run_one_primary_with_cascade(
         launch_step_fraction_of_h=launch_step_fraction_of_h,
         Phi_interp=Phi_interp,
     )
+
+    for failed in first_launch_failures:
+        cascade_log.append({
+            "event": "launch_failed",
+            "electron_id": None,
+            "parent_id": -1,
+            "generation": 1,
+            "source_owner": "sample",
+            "source_electrode": "sample",
+            "source_Einc_eV": E_inc_eV,
+            "emission_kind": failed.get("kind", None),
+            "E_emit_eV": failed.get("E_emit_eV", np.nan),
+            "launch_offset_m": failed.get("launch_offset_m", np.nan),
+            "launch_failure_reason": failed.get("launch_failure_reason", None),
+            "launch_grid_status": failed.get(
+                "launch_grid_classification", {}
+            ).get("status", None),
+        })
 
     for e in first_emissions:
         record = {
@@ -485,6 +549,13 @@ def run_one_primary_with_cascade(
 
         res["E_emit_eV"] = e.get("E_emit_eV", np.nan)
         res["emission_kind"] = e.get("kind", None)
+        res["launch_offset_m"] = e.get("launch_offset_m", np.nan)
+        res["Phi_emit"] = e.get("Phi_emit", np.nan)
+        res["Phi_launch"] = e.get("Phi_launch", np.nan)
+        res["phi_launch_correction_eV"] = e.get(
+            "phi_launch_correction_eV", np.nan
+        )
+        res["E_launch_eV"] = e.get("E_launch_eV", e.get("E_emit_eV", np.nan))
         res["primary_E_inc_eV"] = E_inc_eV
         res["primary_cos_theta"] = e.get("cos_theta", np.nan)
 
@@ -580,7 +651,7 @@ def run_one_primary_with_cascade(
             "terminal_theta_used_deg": terminal_theta_used_deg,
         })
 
-        child_emissions = generate_cascade_emissions_from_hit(
+        child_emissions, child_launch_failures = generate_cascade_emissions_from_hit(
             surface_name=terminal_owner,
             r_hit=r_term,
             v_in=v_term,
@@ -614,6 +685,26 @@ def run_one_primary_with_cascade(
             "terminal_theta_raw_deg": terminal_theta_raw_deg,
             "terminal_theta_used_deg": terminal_theta_used_deg,
         })
+
+        for failed in child_launch_failures:
+            cascade_log.append({
+                "event": "launch_failed",
+                "electron_id": None,
+                "parent_id": item["electron_id"],
+                "generation": item["generation"] + 1,
+                "source_owner": terminal_owner,
+                "source_electrode": terminal_electrode,
+                "source_Einc_eV": E_term,
+                "emission_kind": failed.get("kind", None),
+                "E_emit_eV": failed.get("E_emit_eV", np.nan),
+                "launch_offset_m": failed.get("launch_offset_m", np.nan),
+                "launch_failure_reason": failed.get(
+                    "launch_failure_reason", None
+                ),
+                "launch_grid_status": failed.get(
+                    "launch_grid_classification", {}
+                ).get("status", None),
+            })
 
         for child in child_emissions:
             if next_electron_id >= max_total_electrons:
@@ -685,6 +776,13 @@ def cascade_results_to_dataframe(
 
             "emission_kind": res.get("emission_kind", None),
             "E_emit_eV": res.get("E_emit_eV", np.nan),
+            "launch_offset_m": res.get("launch_offset_m", np.nan),
+            "Phi_emit": res.get("Phi_emit", np.nan),
+            "Phi_launch": res.get("Phi_launch", np.nan),
+            "phi_launch_correction_eV": res.get(
+                "phi_launch_correction_eV", np.nan
+            ),
+            "E_launch_eV": res.get("E_launch_eV", np.nan),
 
             "reason": res.get("reason", None),
             "terminal_owner": terminal_owner,
@@ -929,7 +1027,7 @@ def run_cascade_batch_parallel(
     emitted_dt_max: float = 5.0e-11,
     emitted_max_steps: int = 20000,
 
-    launch_step_fraction_of_h: float = 0.75,
+    launch_step_fraction_of_h: float = 0.10,
     integrator: str = "verlet",
 
     n_jobs: int = 4,
@@ -1085,6 +1183,18 @@ def run_cascade_batch_parallel(
 
     df_log = cascade_log_to_dataframe(cascade_logs_all)
 
+    if not df_log.empty and "event" in df_log.columns:
+        launch_failure_mask = df_log["event"].eq("launch_failed")
+        N_launch_failed = int(launch_failure_mask.sum())
+        launch_failures_by_surface = (
+            df_log.loc[launch_failure_mask, "source_electrode"]
+            .value_counts(dropna=False)
+            .to_dict()
+        )
+    else:
+        N_launch_failed = 0
+        launch_failures_by_surface = {}
+
     acct = summarize_cascade_accounting(
         cascade_results=cascade_results_all,
         N_primary=N_primary,
@@ -1129,6 +1239,8 @@ def run_cascade_batch_parallel(
 
         "runtime_s": runtime_s,
         "runtime_per_primary_s": runtime_s / N_primary,
+        "N_launch_failed": N_launch_failed,
+        "launch_failures_by_surface": launch_failures_by_surface,
 
         "p0s": p0s,
         "v0s": v0s,
@@ -1176,6 +1288,9 @@ def print_cascade_batch_summary(result: dict):
 
     print(f"\nRuntime:                 {result['runtime_s']:.2f} s")
     print(f"Runtime per primary:     {result['runtime_per_primary_s']:.4f} s")
+    print(f"Launch failures:         {result.get('N_launch_failed', 0)}")
+    if result.get("launch_failures_by_surface"):
+        print(f"Failures by surface:     {result['launch_failures_by_surface']}")
 
     print("\nElectron-count balance:")
     print(result["current_counts"])
@@ -1232,5 +1347,3 @@ def save_cascade_batch_tables(result: dict, out_dir, prefix: str = "cascade"):
     pd.DataFrame([result["summary"]]).to_csv(paths["summary"], index=False)
 
     return paths
-
-
