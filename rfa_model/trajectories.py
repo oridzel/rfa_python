@@ -20,6 +20,7 @@ from .collisions import (
     segment_hits_sample_plane,
     classify_sphere_event,
     nearest_hit,
+    sphere_crossing_is_opening,
 )
 
 
@@ -471,6 +472,26 @@ def integrate_one_electron(
 
                     # Continue integration after stepping through shell.
                     continue
+
+                # -----------------------------------------------
+                # For the collector shell, the voxel layer can
+                # overlap the sample-exchange or drift-tube opening.
+                # first_analytic_grid_hit guards the ANALYTIC sphere
+                # path, but voxels inside an opening region would
+                # otherwise be absorbed incorrectly here.
+                # Re-apply the same opening check to the voxel
+                # position and step through if inside an opening.
+                # -----------------------------------------------
+                if owner == "collector_shell":
+                    if sphere_crossing_is_opening(p, "collector_shell", field):
+                        p, _ = advance_until_free(
+                            p, v, field,
+                            max_tries=30,
+                            step_fraction_of_h=0.25,
+                        )
+                        traj.append(p.copy())
+                        vel.append(v.copy())
+                        continue
 
                 # Ordinary fixed voxel: absorbing electrode.
                 return {
