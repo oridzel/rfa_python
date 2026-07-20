@@ -23,6 +23,120 @@ from .collisions import (
 )
 
 
+# ============================================================
+# Grid-wire geometry (angle-dependent mesh transparency)
+# ============================================================
+#
+# Physical mesh spec (Unique Wire Weaving Co. tungsten cloth, per the RFA
+# instrument paper): 25.4 um diameter wires, 500 um opening, 513 um pitch,
+# giving ~93% optical transparency for a single grid at normal incidence.
+# All three grids (g1, g2, g3) are fabricated from the same mesh stock.
+DEFAULT_WIRE_DIAMETER_M = 25.4e-6
+DEFAULT_WIRE_PITCH_M = 513e-6
+
+DEFAULT_GRID_WIRE_GEOMETRY = {
+    "g1_shell": {
+        "wire_diameter_m": DEFAULT_WIRE_DIAMETER_M,
+        "pitch_m": DEFAULT_WIRE_PITCH_M,
+    },
+    "g2_shell": {
+        "wire_diameter_m": DEFAULT_WIRE_DIAMETER_M,
+        "pitch_m": DEFAULT_WIRE_PITCH_M,
+    },
+    "g3_shell": {
+        "wire_diameter_m": DEFAULT_WIRE_DIAMETER_M,
+        "pitch_m": DEFAULT_WIRE_PITCH_M,
+    },
+}
+
+
+def wire_geometry_for_owner(grid_wire_geometry, owner, default=None):
+    """
+    Look up per-shell wire geometry ({"wire_diameter_m", "pitch_m"}).
+
+    Falls back to `default` (or DEFAULT_GRID_WIRE_GEOMETRY's per-shell
+    entry) if grid_wire_geometry is None or does not have this owner.
+    """
+    if default is None:
+        default = DEFAULT_GRID_WIRE_GEOMETRY.get(
+            owner,
+            {
+                "wire_diameter_m": DEFAULT_WIRE_DIAMETER_M,
+                "pitch_m": DEFAULT_WIRE_PITCH_M,
+            },
+        )
+
+    if grid_wire_geometry is None:
+        return default
+
+    return grid_wire_geometry.get(owner, default)
+
+
+def mesh_angular_falloff(wire_diameter_m: float, pitch_m: float, cos_theta_local: float) -> float:
+    """
+    Normalized (dimensionless) falloff factor for woven-mesh transparency
+    as a function of local incidence angle, derived from wire geometry.
+
+    Model: the mesh is treated locally as two orthogonal sets of parallel
+    cylindrical wires (valid since the mesh pitch is tiny compared to the
+    grid's radius of curvature). Viewed at polar angle theta from the
+    local mesh-plane normal, a wire's projected shadow width grows as
+    d / cos(theta), reducing the 1D linear transmittance of one wire set
+    from t0 = (pitch - diameter) / pitch to:
+
+        t(theta) = 1 - (1 - t0) / cos(theta)
+
+    Two orthogonal wire sets combine multiplicatively, so areal
+    transparency scales as t(theta)^2. This function returns that falloff
+    normalized to 1.0 at normal incidence (t(theta)/t0)^2, so it can be
+    multiplied directly against a separately calibrated, measured
+    normal-incidence transparency (see angle_corrected_grid_transparency).
+
+    Returns 0.0 once the local wire shadow fully occludes the opening
+    (the classic "mesh looks opaque at grazing incidence" limit).
+    """
+    if pitch_m <= 0.0:
+        raise ValueError("pitch_m must be positive")
+
+    if wire_diameter_m < 0.0 or wire_diameter_m >= pitch_m:
+        raise ValueError("wire_diameter_m must be in [0, pitch_m)")
+
+    cos_theta_local = float(np.clip(cos_theta_local, 0.0, 1.0))
+
+    t0 = (pitch_m - wire_diameter_m) / pitch_m
+
+    if cos_theta_local <= 0.0:
+        return 0.0
+
+    t = 1.0 - (1.0 - t0) / cos_theta_local
+
+    if t <= 0.0:
+        return 0.0
+
+    return float((t / t0) ** 2)
+
+
+def angle_corrected_grid_transparency(
+    T0_normal: float,
+    wire_diameter_m: float,
+    pitch_m: float,
+    cos_theta_local: float,
+) -> float:
+    """
+    Angle-dependent grid transparency, anchored to a measured/calibrated
+    normal-incidence transparency T0_normal (e.g. grid_transparency["g1_shell"]),
+    with the falloff shape/rate derived purely from wire diameter and pitch.
+
+    T(theta) = T0_normal * mesh_angular_falloff(...)
+
+    so T(theta=0) == T0_normal exactly, and T decreases toward grazing
+    incidence at the rate set by the real wire geometry.
+    """
+    falloff = mesh_angular_falloff(wire_diameter_m, pitch_m, cos_theta_local)
+
+    return float(np.clip(T0_normal * falloff, 0.0, 1.0))
+
+
 def _trajectory_failure(
     reason,
     p,
@@ -339,6 +453,7 @@ def integrate_one_electron(
     max_steps: int = 20000,
     surface_eps: float = 1e-7,
     grid_transparency=None,
+    grid_wire_geometry=None,
     rng=None,
     adaptive_dt: bool = False,
     dt_min: float = 1e-13,
@@ -364,7 +479,18 @@ def integrate_one_electron(
     intersector, face_owner, collision_mesh:
         STL ray-intersection data.
     grid_transparency:
-        Dict such as {"g1_shell": 0.90, ...}.
+        Dict such as {"g1_shell": 0.90, ...}. This is treated as each
+        shell's calibrated NORMAL-INCIDENCE transparency; the actual
+        transmission probability used at each crossing is angle-corrected
+        using grid_wire_geometry (see below).
+    grid_wire_geometry:
+        Optional dict such as {"g1_shell": {"wire_diameter_m": 25.4e-6,
+        "pitch_m": 513e-6}, ...}. Used to derive how transparency falls
+        off away from normal incidence, from the real woven-mesh wire
+        diameter and pitch (see mesh_angular_falloff /
+        angle_corrected_grid_transparency). Defaults to
+        DEFAULT_GRID_WIRE_GEOMETRY (the as-fabricated tungsten mesh spec)
+        for any shell not present in the dict.
     sample_plane_return:
         If True, hits of the analytic sample plane x=0 are terminal.
 
@@ -456,10 +582,24 @@ def integrate_one_electron(
                             n_raw = -n_raw
                         hit_info["normal"] = n_raw
 
+                        speed = np.linalg.norm(v)
+                        cos_theta_local = (
+                            float(-np.dot(v, n_raw) / speed) if speed > 0 else 1.0
+                        )
+                    else:
+                        cos_theta_local = 1.0
+
                     if grid_transparency is None:
                         T = 1.0
                     else:
-                        T = transparency_for_owner(grid_transparency, owner, default=1.0)
+                        T0_normal = transparency_for_owner(grid_transparency, owner, default=1.0)
+                        wire_geom = wire_geometry_for_owner(grid_wire_geometry, owner)
+                        T = angle_corrected_grid_transparency(
+                            T0_normal,
+                            wire_geom["wire_diameter_m"],
+                            wire_geom["pitch_m"],
+                            cos_theta_local,
+                        )
 
                     if rng is None:
                         rng_local = np.random.default_rng()
@@ -486,6 +626,9 @@ def integrate_one_electron(
                         "location": p.copy(),
                         "steps": step,
                         "type": "transmit_fixed_voxel",
+                        "T": T,
+                        "T0_normal": T0_normal,
+                        "cos_theta_local": cos_theta_local,
                     })
 
                     p, cls_after = advance_until_free(
@@ -673,7 +816,36 @@ def integrate_one_electron(
                     }
 
                 if event_type == "transmit_grid":
-                    T = transparency_for_owner(grid_transparency, owner, default=1.0)
+                    T0_normal = transparency_for_owner(grid_transparency, owner, default=1.0)
+
+                    # Local incidence angle at the actual crossing point,
+                    # used to geometrically derate transparency away from
+                    # normal incidence. Prefer the hit's own normal if the
+                    # collision module already supplies one; otherwise fall
+                    # back to the radial direction (valid for the analytic
+                    # spherical grid shells).
+                    n_hit = hit.get("normal", None)
+                    if n_hit is None:
+                        r_hit_norm = np.linalg.norm(hit["location"])
+                        n_hit = (
+                            hit["location"] / r_hit_norm if r_hit_norm > 0 else None
+                        )
+
+                    speed = np.linalg.norm(v_new)
+                    if n_hit is not None and speed > 0:
+                        cos_theta_local = float(
+                            abs(np.dot(v_new, unit(n_hit))) / speed
+                        )
+                    else:
+                        cos_theta_local = 1.0
+
+                    wire_geom = wire_geometry_for_owner(grid_wire_geometry, owner)
+                    T = angle_corrected_grid_transparency(
+                        T0_normal,
+                        wire_geom["wire_diameter_m"],
+                        wire_geom["pitch_m"],
+                        cos_theta_local,
+                    )
 
                     u = rng.random()
 
@@ -698,6 +870,8 @@ def integrate_one_electron(
                         "steps": step,
                         "u": u,
                         "T": T,
+                        "T0_normal": T0_normal,
+                        "cos_theta_local": cos_theta_local,
                     })
 
                     # Step just past the spherical surface to avoid

@@ -406,6 +406,7 @@ def run_one_primary_with_cascade(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    grid_wire_geometry=None,
 
     max_generation: int = 5,
     max_total_electrons: int = 500,
@@ -544,6 +545,7 @@ def run_one_primary_with_cascade(
             max_steps=emitted_max_steps,
             surface_eps=surface_skip_eps,
             grid_transparency=grid_transparency,
+            grid_wire_geometry=grid_wire_geometry,
             rng=rng,
             adaptive_dt=True,
             dt_min=1.0e-13,
@@ -875,6 +877,7 @@ def _run_cascade_chunk(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    grid_wire_geometry=None,
     integrator: str = "verlet",
 ):
     """
@@ -916,6 +919,7 @@ def _run_cascade_chunk(
             voltages=voltages,
             grid_SEY_mult=grid_SEY_mult,
             collector_BSE_mult=collector_BSE_mult,
+            grid_wire_geometry=grid_wire_geometry,
             rng=rng,
 
             sample_y_bounds=sample_y_bounds,
@@ -1029,6 +1033,7 @@ def run_cascade_batch_parallel(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    grid_wire_geometry: dict | None = None,
 
     x_start: float | None = None,
     beam_sigma: float = 150e-6,
@@ -1159,6 +1164,7 @@ def run_cascade_batch_parallel(
     
             grid_SEY_mult=grid_SEY_mult,
             collector_BSE_mult=collector_BSE_mult,
+            grid_wire_geometry=grid_wire_geometry,
     
             sample_y_bounds=sample_y_bounds,
             sample_z_bounds=sample_z_bounds,
@@ -1269,6 +1275,7 @@ def run_cascade_batch_parallel(
         "integrator": integrator,
 
         "grid_transparency": grid_transparency,
+        "grid_wire_geometry": grid_wire_geometry,
         "grid_SEY_mult": grid_SEY_mult,
         "collector_BSE_mult": collector_BSE_mult,
 
