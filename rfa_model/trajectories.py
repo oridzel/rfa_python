@@ -635,6 +635,7 @@ def integrate_one_electron(
                         p,
                         v,
                         field,
+                        owner=owner,
                         max_tries=40,
                         step_fraction_of_h=0.10,
                     )
@@ -708,6 +709,38 @@ def integrate_one_electron(
         
         else:
             raise ValueError(f"Unknown integrator: {integrator}")
+
+        # A Verlet step can produce a finite p_new but a nonfinite v_new when
+        # p_new has crossed outside the interpolation/update domain and the
+        # field evaluation at the new point returns NaN.  Classify that as a
+        # clean boundary exit rather than as an internal numerical failure.
+        if np.all(np.isfinite(p_new)) and not np.all(np.isfinite(v_new)):
+            cls_new = classify_grid_point(p_new, field)
+            if cls_new["status"] in {"left_grid", "left_update_region"}:
+                return _trajectory_failure(
+                    reason=cls_new["status"],
+                    p=p_new,
+                    v=v,
+                    traj=traj + [p_new.copy()],
+                    vel=vel + [v.copy()],
+                    step=step + 1,
+                    hit_info={
+                        **cls_new,
+                        "owner_name": "escaped",
+                        "owner": "escaped",
+                        "location": p_new.copy(),
+                        "v_in": v.copy(),
+                        "KE_hit_eV": kinetic_energy_eV_from_velocity(v),
+                        "boundary_exit": True,
+                    },
+                    extra={
+                        "p_before": p.copy(),
+                        "v_before": v.copy(),
+                        "dt_step": dt_step,
+                        "grid_events": grid_events,
+                        "events": events,
+                    },
+                )
 
         if not np.all(np.isfinite(p_new)) or not np.all(np.isfinite(v_new)):
             return _trajectory_failure(
@@ -1073,32 +1106,45 @@ def advance_grid_transmission_until_free(
     p,
     v,
     field,
+    owner: str | None = None,
     max_tries: int = 40,
     step_fraction_of_h: float = 0.10,
     tangential_tol: float = 1.0e-6,
 ):
     """
-    Move an already-transmitted electron through a voxelized spherical grid.
+    Place an already-transmitted electron on the correct free-vacuum side
+    of a voxelized spherical grid shell without changing its velocity.
 
-    The electron's velocity is preserved. The radial component of that
-    velocity selects the side of the spherical shell toward which the
-    particle is already travelling. This avoids failures for oblique
-    trajectories that can remain inside the shell when stepped along the
-    full velocity vector.
+    The fixed grid voxels are only the numerical representation used by the
+    field solver.  Once the stochastic transparency test says the electron
+    transmitted, its position should be moved across that artificial layer.
 
-    At an almost exactly tangential crossing, both radial sides are tested
-    and the nearest free point is used. Such crossings normally have very
-    small angle-corrected transmission probability.
+    The shell radius is used when the owner is known, so the search starts
+    from the physical analytic grid surface rather than from an arbitrary
+    point inside a thick fixed voxel.  This is much more robust at oblique
+    incidence.  A velocity-directed fallback is retained for compatibility.
     """
     p = np.asarray(p, dtype=float).copy()
     d = unit(np.asarray(v, dtype=float))
-    r_hat = unit(p)
+    r = float(np.linalg.norm(p))
+    if r <= 0.0:
+        return p, classify_grid_point(p, field)
 
+    r_hat = p / r
     h = float(field["h"])
     ds = float(step_fraction_of_h) * h
+    if ds <= 0.0:
+        raise ValueError("step_fraction_of_h must be positive")
+
+    radius_map = {
+        "g1_shell": "R_g1",
+        "g2_shell": "R_g2",
+        "g3_shell": "R_g3",
+    }
+    radius_key = radius_map.get(owner)
+    R_shell = float(field[radius_key]) if radius_key in field else r
 
     radial_component = float(np.dot(d, r_hat))
-
     if radial_component > tangential_tol:
         signs = (1.0,)
     elif radial_component < -tangential_tol:
@@ -1107,33 +1153,42 @@ def advance_grid_transmission_until_free(
         signs = (1.0, -1.0)
 
     candidates = []
-    last_cls = classify_grid_point(p, field)
+    last_p = p.copy()
+    last_cls = classify_grid_point(last_p, field)
 
+    # Search from the known analytic shell radius.  The first candidate is
+    # only 0.1 h beyond the surface, then the clearance is increased locally.
     for sign in signs:
-        p_try = p.copy()
-        cls_try = classify_grid_point(p_try, field)
-
-        for _ in range(max_tries):
-            p_try = p_try + sign * ds * r_hat
+        for itry in range(1, max_tries + 1):
+            clearance = itry * ds
+            p_try = (R_shell + sign * clearance) * r_hat
             cls_try = classify_grid_point(p_try, field)
+            last_p, last_cls = p_try, cls_try
 
             if cls_try["status"] == "free":
-                candidates.append(
-                    (float(np.linalg.norm(p_try - p)), p_try.copy(), cls_try)
-                )
+                candidates.append((clearance, p_try.copy(), cls_try))
                 break
 
             if cls_try["status"] in {"left_grid", "left_update_region"}:
                 break
 
-        last_cls = cls_try
-
     if candidates:
         _, p_best, cls_best = min(candidates, key=lambda item: item[0])
         return p_best, cls_best
 
-    return p, last_cls
+    # Fallback: try the actual trajectory direction.  This helps unusual
+    # geometry near openings or frames while still preserving v exactly.
+    p_try = p.copy()
+    for _ in range(max_tries):
+        p_try = p_try + ds * d
+        cls_try = classify_grid_point(p_try, field)
+        last_p, last_cls = p_try, cls_try
+        if cls_try["status"] == "free":
+            return p_try, cls_try
+        if cls_try["status"] in {"left_grid", "left_update_region"}:
+            break
 
+    return last_p, last_cls
 
 def place_emitted_particle_in_vacuum(
     r_hit,
