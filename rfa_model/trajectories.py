@@ -631,12 +631,12 @@ def integrate_one_electron(
                         "cos_theta_local": cos_theta_local,
                     })
 
-                    p, cls_after = advance_until_free(
+                    p, cls_after = advance_grid_transmission_until_free(
                         p,
                         v,
                         field,
-                        max_tries=20,
-                        step_fraction_of_h=0.25,
+                        max_tries=40,
+                        step_fraction_of_h=0.10,
                     )
 
                     traj.append(p.copy())
@@ -980,6 +980,159 @@ def advance_until_free(
             return p, cls
 
     return p, cls
+
+
+
+def place_grid_emission_in_vacuum(
+    r_hit,
+    emission_direction,
+    field,
+    max_forward_tries: int = 20,
+    max_radial_tries: int = 20,
+    step_fraction_of_h: float = 0.10,
+    tangential_tol: float = 0.05,
+):
+    """
+    Place a NEW electron emitted from a spherical grid shell in free vacuum.
+
+    The angular sampler has already selected the physical emission velocity.
+    This helper preserves that velocity and uses it only to select the
+    physically consistent side of the voxelized shell.
+
+    Search order:
+      1. Try moving directly along the sampled emission direction.
+      2. If voxelization traps the point, search radially toward the side
+         indicated by v_emit dot r_hat.
+      3. For a nearly tangential direction, search both radial sides and
+         choose the closest free point.
+
+    Only the launch position is changed; the caller keeps v0 unchanged.
+    """
+    r_hit = np.asarray(r_hit, dtype=float)
+    d_emit = unit(np.asarray(emission_direction, dtype=float))
+    r_hat = unit(r_hit)
+
+    h = float(field["h"])
+    ds = float(step_fraction_of_h) * h
+
+    if ds <= 0.0:
+        raise ValueError("step_fraction_of_h must be positive")
+
+    # First honor the sampled direction directly.
+    p = r_hit.copy()
+    last_cls = classify_grid_point(p, field)
+
+    for _ in range(max_forward_tries):
+        p = p + ds * d_emit
+        last_cls = classify_grid_point(p, field)
+
+        if last_cls["status"] == "free":
+            return p, last_cls, True
+
+        if last_cls["status"] in {"left_grid", "left_update_region"}:
+            break
+
+    radial_component = float(np.dot(d_emit, r_hat))
+
+    if radial_component > tangential_tol:
+        signs = (1.0,)
+    elif radial_component < -tangential_tol:
+        signs = (-1.0,)
+    else:
+        signs = (1.0, -1.0)
+
+    candidates = []
+
+    for sign in signs:
+        p_try = r_hit.copy()
+        cls_try = classify_grid_point(p_try, field)
+
+        for _ in range(max_radial_tries):
+            p_try = p_try + sign * ds * r_hat
+            cls_try = classify_grid_point(p_try, field)
+
+            if cls_try["status"] == "free":
+                candidates.append(
+                    (float(np.linalg.norm(p_try - r_hit)), p_try.copy(), cls_try)
+                )
+                break
+
+            if cls_try["status"] in {"left_grid", "left_update_region"}:
+                break
+
+        last_cls = cls_try
+
+    if candidates:
+        _, p_best, cls_best = min(candidates, key=lambda item: item[0])
+        return p_best, cls_best, True
+
+    return p, last_cls, False
+
+
+def advance_grid_transmission_until_free(
+    p,
+    v,
+    field,
+    max_tries: int = 40,
+    step_fraction_of_h: float = 0.10,
+    tangential_tol: float = 1.0e-6,
+):
+    """
+    Move an already-transmitted electron through a voxelized spherical grid.
+
+    The electron's velocity is preserved. The radial component of that
+    velocity selects the side of the spherical shell toward which the
+    particle is already travelling. This avoids failures for oblique
+    trajectories that can remain inside the shell when stepped along the
+    full velocity vector.
+
+    At an almost exactly tangential crossing, both radial sides are tested
+    and the nearest free point is used. Such crossings normally have very
+    small angle-corrected transmission probability.
+    """
+    p = np.asarray(p, dtype=float).copy()
+    d = unit(np.asarray(v, dtype=float))
+    r_hat = unit(p)
+
+    h = float(field["h"])
+    ds = float(step_fraction_of_h) * h
+
+    radial_component = float(np.dot(d, r_hat))
+
+    if radial_component > tangential_tol:
+        signs = (1.0,)
+    elif radial_component < -tangential_tol:
+        signs = (-1.0,)
+    else:
+        signs = (1.0, -1.0)
+
+    candidates = []
+    last_cls = classify_grid_point(p, field)
+
+    for sign in signs:
+        p_try = p.copy()
+        cls_try = classify_grid_point(p_try, field)
+
+        for _ in range(max_tries):
+            p_try = p_try + sign * ds * r_hat
+            cls_try = classify_grid_point(p_try, field)
+
+            if cls_try["status"] == "free":
+                candidates.append(
+                    (float(np.linalg.norm(p_try - p)), p_try.copy(), cls_try)
+                )
+                break
+
+            if cls_try["status"] in {"left_grid", "left_update_region"}:
+                break
+
+        last_cls = cls_try
+
+    if candidates:
+        _, p_best, cls_best = min(candidates, key=lambda item: item[0])
+        return p_best, cls_best
+
+    return p, last_cls
 
 
 def place_emitted_particle_in_vacuum(

@@ -36,6 +36,7 @@ from .trajectories import (
     integrate_one_electron,
     advance_until_free,
     place_emitted_particle_in_vacuum,
+    place_grid_emission_in_vacuum,
 )
 from .primary import (
     fly_primary_to_sample,
@@ -232,30 +233,37 @@ def make_emissions_safe_to_launch(
         v0 = np.asarray(e["v0"], dtype=float)
         direction = unit(v0)
 
-        # Use THIS emission's own travel direction to search for a free
-        # vacuum voxel, not the shared macroscopic surface normal.
-        #
-        # For sample/collector/holder/etc. emissions this is nearly
-        # equivalent to n_vacuum, since those emissions are hemisphere-
-        # clamped around n_out anyway. For grid-wire emissions, however,
-        # theta is sampled over the full 0-180 deg range relative to the
-        # beam axis (see samplers.generate_surface_emissions), so v0 can
-        # point tangentially, backward, or forward through the mesh -
-        # directions that can differ substantially from the shared radial
-        # shell normal. Stepping every emission from a hit along one fixed
-        # n_vacuum could push wide-angle emissions to the wrong side of
-        # the mesh or back toward solid material. Falling back to
-        # n_vacuum only covers the degenerate case of a exactly-zero
-        # velocity, which should not occur but is guarded against anyway.
-        launch_direction = direction if np.all(np.isfinite(direction)) else unit(n_vacuum)
+        owner = canonical_surface_name(surface_name) if surface_name is not None else None
+        grid_surfaces = {
+            "g1_shell", "g2_shell", "g3_shell",
+            "g1mesh", "g2mesh", "g3mesh",
+        }
 
-        p_safe, cls, success = place_emitted_particle_in_vacuum(
-            r_hit=r_hit,
-            n_vacuum=launch_direction,
-            field=field,
-            max_tries=max_advance_tries,
-            step_fraction_of_h=normal_step_fraction,
-        )
+        if owner in grid_surfaces:
+            # Grid emission is special: the angular sampler has already
+            # selected the physical emitted direction. Use that direction
+            # to determine which side of the voxelized spherical shell the
+            # electron belongs on, but do not rotate or reflect v0.
+            p_safe, cls, success = place_grid_emission_in_vacuum(
+                r_hit=r_hit,
+                emission_direction=direction,
+                field=field,
+                max_forward_tries=max_advance_tries,
+                max_radial_tries=max_advance_tries,
+                step_fraction_of_h=normal_step_fraction,
+            )
+        else:
+            # For ordinary solid surfaces, move only the launch position
+            # along the known vacuum-side normal. Using v0 here can trap
+            # nearly tangential emissions inside a thick voxelized surface
+            # and was the source of collector/holder/etc. launch failures.
+            p_safe, cls, success = place_emitted_particle_in_vacuum(
+                r_hit=r_hit,
+                n_vacuum=n_vacuum,
+                field=field,
+                max_tries=max_advance_tries,
+                step_fraction_of_h=normal_step_fraction,
+            )
 
         e["raw_hit_location"] = r_hit.copy()
         e["launch_offset_m"] = float(np.linalg.norm(p_safe - r_hit))
