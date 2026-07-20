@@ -365,6 +365,44 @@ def generate_cascade_emissions_from_hit(
         Phi_interp=Phi_interp,
     )
 
+    # Save emitted-direction diagnostics before launch placement.
+    v_in_hat = unit(v_in)
+    r_hat = unit(r_hit)
+
+    for e in emissions:
+        v_emit_hat = unit(e["v0"])
+
+        # Relative to incoming electron:
+        # +1 = continues forward, -1 = reverses direction.
+        forward_cosine = float(np.dot(v_emit_hat, v_in_hat))
+
+        # Relative to spherical grid radius:
+        # +1 = toward larger radius, -1 = toward smaller radius.
+        radial_cosine = float(np.dot(v_emit_hat, r_hat))
+
+        e["emission_forward_cosine"] = forward_cosine
+        e["emission_radial_cosine"] = radial_cosine
+
+        e["emission_scattering_angle_deg"] = float(
+            np.degrees(
+                np.arccos(np.clip(forward_cosine, -1.0, 1.0))
+            )
+        )
+
+        if forward_cosine > 0.0:
+            e["emission_forward_backward"] = "forward"
+        elif forward_cosine < 0.0:
+            e["emission_forward_backward"] = "backward"
+        else:
+            e["emission_forward_backward"] = "tangential"
+
+        if radial_cosine > 0.0:
+            e["emission_radial_direction"] = "outward"
+        elif radial_cosine < 0.0:
+            e["emission_radial_direction"] = "inward"
+        else:
+            e["emission_radial_direction"] = "tangential"
+
     safe_emissions, failed_emissions = make_emissions_safe_to_launch(
         emissions,
         r_hit=r_hit,
@@ -513,6 +551,21 @@ def run_one_primary_with_cascade(
             "launch_grid_status": failed.get(
                 "launch_grid_classification", {}
             ).get("status", None),
+            "emission_forward_cosine": failed.get(
+                "emission_forward_cosine", np.nan
+            ),
+            "emission_radial_cosine": failed.get(
+                "emission_radial_cosine", np.nan
+            ),
+            "emission_scattering_angle_deg": failed.get(
+                "emission_scattering_angle_deg", np.nan
+            ),
+            "emission_forward_backward": failed.get(
+                "emission_forward_backward", None
+            ),
+            "emission_radial_direction": failed.get(
+                "emission_radial_direction", None
+            ),
         })
 
     for e in first_emissions:
@@ -576,6 +629,21 @@ def run_one_primary_with_cascade(
 
         res["E_emit_eV"] = e.get("E_emit_eV", np.nan)
         res["emission_kind"] = e.get("kind", None)
+        res["emission_forward_cosine"] = e.get(
+            "emission_forward_cosine", np.nan
+        )
+        res["emission_radial_cosine"] = e.get(
+            "emission_radial_cosine", np.nan
+        )
+        res["emission_scattering_angle_deg"] = e.get(
+            "emission_scattering_angle_deg", np.nan
+        )
+        res["emission_forward_backward"] = e.get(
+            "emission_forward_backward", None
+        )
+        res["emission_radial_direction"] = e.get(
+            "emission_radial_direction", None
+        )
         res["launch_offset_m"] = e.get("launch_offset_m", np.nan)
         res["Phi_emit"] = e.get("Phi_emit", np.nan)
         res["Phi_launch"] = e.get("Phi_launch", np.nan)
@@ -589,6 +657,7 @@ def run_one_primary_with_cascade(
         cascade_results.append(res)
 
         cascade_log.append({
+            "event": "tracked_emission",
             "electron_id": item["electron_id"],
             "parent_id": item["parent_id"],
             "generation": item["generation"],
@@ -598,6 +667,21 @@ def run_one_primary_with_cascade(
             "emission_kind": e.get("kind", None),
             "E_emit_eV": e.get("E_emit_eV", np.nan),
             "launch_offset_m": e.get("launch_offset_m", np.nan),
+            "emission_forward_cosine": e.get(
+                "emission_forward_cosine", np.nan
+            ),
+            "emission_radial_cosine": e.get(
+                "emission_radial_cosine", np.nan
+            ),
+            "emission_scattering_angle_deg": e.get(
+                "emission_scattering_angle_deg", np.nan
+            ),
+            "emission_forward_backward": e.get(
+                "emission_forward_backward", None
+            ),
+            "emission_radial_direction": e.get(
+                "emission_radial_direction", None
+            ),
         })
 
         # Stop cascade if generation limit reached.
@@ -702,10 +786,15 @@ def run_one_primary_with_cascade(
             "parent_id": item["parent_id"],
             "generation": item["generation"],
             "event": "child_emissions_sampled",
+
             "terminal_owner": terminal_owner,
             "terminal_electrode": terminal_electrode,
             "terminal_Einc_eV": E_term,
             "N_child_emissions": len(child_emissions),
+            "N_child_launch_failures": len(child_launch_failures),
+            "N_child_sampled_total": (
+                len(child_emissions) + len(child_launch_failures)
+            ),
 
             "terminal_cos_theta_raw": terminal_cos_theta_raw,
             "terminal_cos_theta_used": terminal_cos_theta_used,
@@ -731,6 +820,21 @@ def run_one_primary_with_cascade(
                 "launch_grid_status": failed.get(
                     "launch_grid_classification", {}
                 ).get("status", None),
+                "emission_forward_cosine": failed.get(
+                    "emission_forward_cosine", np.nan
+                ),
+                "emission_radial_cosine": failed.get(
+                    "emission_radial_cosine", np.nan
+                ),
+                "emission_scattering_angle_deg": failed.get(
+                    "emission_scattering_angle_deg", np.nan
+                ),
+                "emission_forward_backward": failed.get(
+                    "emission_forward_backward", None
+                ),
+                "emission_radial_direction": failed.get(
+                    "emission_radial_direction", None
+                ),
             })
 
         for child in child_emissions:
@@ -804,6 +908,21 @@ def cascade_results_to_dataframe(
             "emission_kind": res.get("emission_kind", None),
             "E_emit_eV": res.get("E_emit_eV", np.nan),
             "launch_offset_m": res.get("launch_offset_m", np.nan),
+            "emission_forward_cosine": res.get(
+                "emission_forward_cosine", np.nan
+            ),
+            "emission_radial_cosine": res.get(
+                "emission_radial_cosine", np.nan
+            ),
+            "emission_scattering_angle_deg": res.get(
+                "emission_scattering_angle_deg", np.nan
+            ),
+            "emission_forward_backward": res.get(
+                "emission_forward_backward", None
+            ),
+            "emission_radial_direction": res.get(
+                "emission_radial_direction", None
+            ),
             "Phi_emit": res.get("Phi_emit", np.nan),
             "Phi_launch": res.get("Phi_launch", np.nan),
             "phi_launch_correction_eV": res.get(
