@@ -631,19 +631,17 @@ def integrate_one_electron(
                         "cos_theta_local": cos_theta_local,
                     })
 
-                    p, cls_after = advance_grid_transmission_until_free(
-                        p,
-                        v,
-                        field,
+                    p, cls_after, success = place_transmitted_electron_past_grid(
+                        p=p,
+                        v=v,
+                        field=field,
                         owner=owner,
-                        max_tries=80,
-                        step_fraction_of_h=0.10,
                     )
 
                     traj.append(p.copy())
                     vel.append(v.copy())
 
-                    if cls_after["status"] != "free":
+                    if not success:
                         return _trajectory_failure(
                             reason="grid_transmission_placement_failed",
                             p=p,
@@ -656,7 +654,10 @@ def integrate_one_electron(
                                 "owner": owner,
                                 "kind": "grid_transmission_placement_failed",
                             },
-                            extra={"grid_events": grid_events, "events": events},
+                            extra={
+                                "grid_events": grid_events,
+                                "events": events,
+                            },
                         )
 
                     # Continue integration after stepping through shell.
@@ -1014,6 +1015,94 @@ def advance_until_free(
 
     return p, cls
 
+
+def place_transmitted_electron_past_grid(
+    p,
+    v,
+    field,
+    owner,
+    clearance_fraction_of_h=1.5,
+):
+    """
+    Place a transmitted electron past the analytic spherical grid
+    while preserving its physical direction and velocity.
+    """
+    p = np.asarray(p, dtype=float)
+    d = unit(v)
+
+    radius_keys = {
+        "g1_shell": "R_g1",
+        "g2_shell": "R_g2",
+        "g3_shell": "R_g3",
+    }
+
+    R = float(field[radius_keys[owner]])
+    h = float(field["h"])
+
+    b = float(np.dot(p, d))
+    c = float(np.dot(p, p) - R * R)
+    discriminant = b * b - c
+
+    if discriminant < 0.0:
+        return p.copy(), classify_grid_point(p, field), False
+
+    root = np.sqrt(max(discriminant, 0.0))
+
+    s_candidates = [
+        -b - root,
+        -b + root,
+    ]
+
+    # Determine whether the electron travels toward increasing or
+    # decreasing radius at the current location.
+    r_hat = unit(p)
+    radial_sign = np.sign(np.dot(d, r_hat))
+
+    candidates = []
+
+    for s in s_candidates:
+        p_cross = p + s * d
+        r_before = np.linalg.norm(p_cross - 1.0e-9 * d)
+        r_after = np.linalg.norm(p_cross + 1.0e-9 * d)
+
+        crossing_sign = np.sign(r_after - r_before)
+
+        if crossing_sign == radial_sign:
+            candidates.append((abs(s), p_cross))
+
+    if not candidates:
+        # Fall back to nearest analytic intersection.
+        candidates = [
+            (abs(s), p + s * d)
+            for s in s_candidates
+        ]
+
+    _, p_cross = min(candidates, key=lambda item: item[0])
+
+    clearance = clearance_fraction_of_h * h
+    p_safe = p_cross + clearance * d
+
+    cls = classify_grid_point(p_safe, field)
+
+    if cls["status"] == "free":
+        return p_safe, cls, True
+
+    # Continue along exactly the same trajectory if the spherical
+    # voxel shell is thicker at this Cartesian location.
+    for multiplier in (2.0, 3.0, 4.0, 6.0, 8.0):
+        p_try = p_cross + multiplier * clearance * d
+        cls_try = classify_grid_point(p_try, field)
+
+        if cls_try["status"] == "free":
+            return p_try, cls_try, True
+
+        if cls_try["status"] in {
+            "left_grid",
+            "left_update_region",
+        }:
+            return p_try, cls_try, False
+
+    return p_safe, cls, False
 
 
 def place_grid_emission_in_vacuum(
