@@ -636,7 +636,7 @@ def integrate_one_electron(
                         v,
                         field,
                         owner=owner,
-                        max_tries=40,
+                        max_tries=80,
                         step_fraction_of_h=0.10,
                     )
 
@@ -1107,86 +1107,141 @@ def advance_grid_transmission_until_free(
     v,
     field,
     owner: str | None = None,
-    max_tries: int = 40,
+    max_tries: int = 80,
     step_fraction_of_h: float = 0.10,
     tangential_tol: float = 1.0e-6,
 ):
     """
-    Place an already-transmitted electron on the correct free-vacuum side
-    of a voxelized spherical grid shell without changing its velocity.
-
-    The fixed grid voxels are only the numerical representation used by the
-    field solver.  Once the stochastic transparency test says the electron
-    transmitted, its position should be moved across that artificial layer.
-
-    The shell radius is used when the owner is known, so the search starts
-    from the physical analytic grid surface rather than from an arbitrary
-    point inside a thick fixed voxel.  This is much more robust at oblique
-    incidence.  A velocity-directed fallback is retained for compatibility.
+    Move a transmitted electron across the artificial voxelized grid shell
+    without changing its velocity.
     """
     p = np.asarray(p, dtype=float).copy()
-    d = unit(np.asarray(v, dtype=float))
+    v = np.asarray(v, dtype=float)
+
+    d = unit(v)
     r = float(np.linalg.norm(p))
+
     if r <= 0.0:
         return p, classify_grid_point(p, field)
 
     r_hat = p / r
     h = float(field["h"])
     ds = float(step_fraction_of_h) * h
-    if ds <= 0.0:
-        raise ValueError("step_fraction_of_h must be positive")
 
     radius_map = {
         "g1_shell": "R_g1",
         "g2_shell": "R_g2",
         "g3_shell": "R_g3",
     }
+
     radius_key = radius_map.get(owner)
     R_shell = float(field[radius_key]) if radius_key in field else r
 
     radial_component = float(np.dot(d, r_hat))
-    if radial_component > tangential_tol:
-        signs = (1.0,)
-    elif radial_component < -tangential_tol:
-        signs = (-1.0,)
-    else:
-        signs = (1.0, -1.0)
 
-    candidates = []
+    if radial_component > tangential_tol:
+        sign = 1.0
+    elif radial_component < -tangential_tol:
+        sign = -1.0
+    else:
+        # For a nearly tangential trajectory, determine the side from
+        # the current radius relative to the analytic shell.
+        sign = 1.0 if r >= R_shell else -1.0
+
+    def is_correct_side(point):
+        radius = float(np.linalg.norm(point))
+        return sign * (radius - R_shell) > 0.0
+
     last_p = p.copy()
     last_cls = classify_grid_point(last_p, field)
 
-    # Search from the known analytic shell radius.  The first candidate is
-    # only 0.1 h beyond the surface, then the clearance is increased locally.
-    for sign in signs:
-        for itry in range(1, max_tries + 1):
-            clearance = itry * ds
-            p_try = (R_shell + sign * clearance) * r_hat
-            cls_try = classify_grid_point(p_try, field)
-            last_p, last_cls = p_try, cls_try
+    # 1. Radial search from the analytic shell.
+    for itry in range(1, max_tries + 1):
+        clearance = itry * ds
+        p_try = (R_shell + sign * clearance) * r_hat
+        cls_try = classify_grid_point(p_try, field)
 
-            if cls_try["status"] == "free":
-                candidates.append((clearance, p_try.copy(), cls_try))
-                break
+        last_p = p_try
+        last_cls = cls_try
 
-            if cls_try["status"] in {"left_grid", "left_update_region"}:
-                break
+        if cls_try["status"] == "free" and is_correct_side(p_try):
+            return p_try, cls_try
 
-    if candidates:
-        _, p_best, cls_best = min(candidates, key=lambda item: item[0])
-        return p_best, cls_best
+        if cls_try["status"] in {"left_grid", "left_update_region"}:
+            break
 
-    # Fallback: try the actual trajectory direction.  This helps unusual
-    # geometry near openings or frames while still preserving v exactly.
+    # 2. Search along the actual trajectory, but only accept a point
+    # on the correct side of the analytic shell.
     p_try = p.copy()
+
     for _ in range(max_tries):
         p_try = p_try + ds * d
         cls_try = classify_grid_point(p_try, field)
-        last_p, last_cls = p_try, cls_try
-        if cls_try["status"] == "free":
+
+        last_p = p_try
+        last_cls = cls_try
+
+        if cls_try["status"] == "free" and is_correct_side(p_try):
             return p_try, cls_try
+
         if cls_try["status"] in {"left_grid", "left_update_region"}:
             break
+
+    # 3. Small lateral searches around the radial direction to escape
+    # stair-stepped voxel chains.
+    axis_candidates = [
+        np.array([1.0, 0.0, 0.0]),
+        np.array([0.0, 1.0, 0.0]),
+        np.array([0.0, 0.0, 1.0]),
+    ]
+
+    tangent = None
+
+    for axis in axis_candidates:
+        candidate = np.cross(r_hat, axis)
+        norm_candidate = np.linalg.norm(candidate)
+
+        if norm_candidate > 1.0e-12:
+            tangent = candidate / norm_candidate
+            break
+
+    if tangent is not None:
+        bitangent = unit(np.cross(r_hat, tangent))
+
+        lateral_directions = [
+            tangent,
+            -tangent,
+            bitangent,
+            -bitangent,
+            unit(tangent + bitangent),
+            unit(tangent - bitangent),
+            unit(-tangent + bitangent),
+            unit(-tangent - bitangent),
+        ]
+
+        for lateral in lateral_directions:
+            for itry in range(1, max_tries + 1):
+                radial_clearance = itry * ds
+                lateral_offset = min(itry, 4) * 0.25 * ds
+
+                p_try = (
+                    (R_shell + sign * radial_clearance) * r_hat
+                    + lateral_offset * lateral
+                )
+
+                cls_try = classify_grid_point(p_try, field)
+
+                last_p = p_try
+                last_cls = cls_try
+
+                if cls_try["status"] == "free" and is_correct_side(p_try):
+                    return p_try, cls_try
+
+                if cls_try["status"] in {
+                    "left_grid",
+                    "left_update_region",
+                }:
+                    break
 
     return last_p, last_cls
 
