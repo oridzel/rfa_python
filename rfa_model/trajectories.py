@@ -388,8 +388,16 @@ def integrate_one_electron(
     
     traj = [p.copy()]
     vel = [v.copy()]
+    # grid_events and events historically tracked the same kind of
+    # "electron passed through a grid shell" bookkeeping, but from two
+    # different collision-detection code paths (fixed-voxel classification
+    # vs. analytic sphere hit). They are aliased to the same underlying
+    # list here so that every return path can expose both keys
+    # consistently, instead of "grid_events" only appearing on returns
+    # triggered by the fixed-voxel path and "events" only appearing on
+    # returns triggered by the analytic-sphere path.
     grid_events = []
-    events = []
+    events = grid_events
     
     ignore_sphere_owners = set()
     
@@ -401,6 +409,7 @@ def integrate_one_electron(
             traj=traj,
             vel=vel,
             step=0,
+            extra={"grid_events": grid_events, "events": events},
         )
 
     for step in range(max_steps):
@@ -427,6 +436,26 @@ def integrate_one_electron(
                 # absorb electrons. Apply stochastic grid transparency.
                 # ----------------------------------------------------
                 if is_grid_shell_owner(owner):
+                    # Provide an auto-orientable local normal so that
+                    # estimate_surface_normal() in cascade.py can correctly
+                    # orient cascade-emission direction/placement against
+                    # this electron's actual approach direction. Without
+                    # this, a terminal hit reached via the fixed-voxel
+                    # classification path (as opposed to the analytic
+                    # sphere-hit path) has no "normal" key, so
+                    # estimate_surface_normal() falls back to a fixed
+                    # outward-radial normal regardless of whether the
+                    # electron approached from inside or outside the
+                    # shell - misorienting emission for inward-travelling
+                    # electrons and, downstream, misplacing their launch
+                    # point search direction as well.
+                    r_norm = np.linalg.norm(p)
+                    if r_norm > 0:
+                        n_raw = p / r_norm
+                        if np.dot(v, n_raw) > 0:
+                            n_raw = -n_raw
+                        hit_info["normal"] = n_raw
+
                     if grid_transparency is None:
                         T = 1.0
                     else:
@@ -447,6 +476,7 @@ def integrate_one_electron(
                             "traj": np.asarray(traj),
                             "vel": np.asarray(vel),
                             "steps": step,
+                            "events": events,
                             "grid_events": grid_events,
                         }
 
@@ -482,7 +512,7 @@ def integrate_one_electron(
                                 "owner": owner,
                                 "kind": "grid_transmission_placement_failed",
                             },
-                            extra={"grid_events": grid_events},
+                            extra={"grid_events": grid_events, "events": events},
                         )
 
                     # Continue integration after stepping through shell.
@@ -495,6 +525,7 @@ def integrate_one_electron(
                     "traj": np.asarray(traj),
                     "vel": np.asarray(vel),
                     "steps": step,
+                    "events": events,
                     "grid_events": grid_events,
                 }
 
@@ -504,6 +535,7 @@ def integrate_one_electron(
                 "traj": np.asarray(traj),
                 "vel": np.asarray(vel),
                 "steps": step,
+                "events": events,
                 "grid_events": grid_events,
             }
 
@@ -551,6 +583,8 @@ def integrate_one_electron(
                     "p_before": p.copy(),
                     "v_before": v.copy(),
                     "dt_step": dt_step,
+                    "grid_events": grid_events,
+                    "events": events,
                 },
             )
 
@@ -602,6 +636,7 @@ def integrate_one_electron(
                     "traj": np.asarray(traj),
                     "vel": np.asarray(vel),
                     "events": events,
+                    "grid_events": grid_events,
                     "steps": step + 1,
                 }
 
@@ -615,6 +650,7 @@ def integrate_one_electron(
                     "traj": np.asarray(traj),
                     "vel": np.asarray(vel),
                     "events": events,
+                    "grid_events": grid_events,
                     "steps": step + 1,
                 }
 
@@ -632,6 +668,7 @@ def integrate_one_electron(
                         "traj": np.asarray(traj),
                         "vel": np.asarray(vel),
                         "events": events,
+                        "grid_events": grid_events,
                         "steps": step + 1,
                     }
 
@@ -650,6 +687,7 @@ def integrate_one_electron(
                             "traj": np.asarray(traj),
                             "vel": np.asarray(vel),
                             "events": events,
+                            "grid_events": grid_events,
                             "steps": step + 1,
                         }
 
@@ -687,6 +725,7 @@ def integrate_one_electron(
         "traj": np.asarray(traj),
         "vel": np.asarray(vel),
         "events": events,
+        "grid_events": grid_events,
         "steps": max_steps,
     }
 
