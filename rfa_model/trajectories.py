@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from .constants import e_charge, m_e, kinetic_energy_eV_from_velocity
-from .fields import E_at_point
+from .constants import (
+    e_charge,
+    m_e,
+    kinetic_energy_eV_from_velocity,
+    speed_from_energy_eV,
+)
+from .fields import E_at_point, evaluate_potential
 from .collisions import (
     first_segment_hit,
     first_analytic_grid_hit,
@@ -389,6 +394,7 @@ def integrate_one_electron(
     Ex_interp,
     Ey_interp,
     Ez_interp,
+    Phi_interp,
     intersector,
     face_owner,
     collision_mesh,
@@ -527,14 +533,55 @@ def integrate_one_electron(
                         else None
                     )
 
-                    p, cls_after = advance_until_free(
-                        p,
-                        v,
-                        field,
+                    p_before_move = p.copy()
+                    v_before_move = v.copy()
+
+                    p, cls_after = place_transmitted_particle_beyond_grid(
+                        p_shell=p_before_move,
+                        v=v_before_move,
+                        owner=owner,
+                        field=field,
                         p_before=p_before_shell,
-                        max_tries=160,
-                        step_fraction_of_h=0.05,
+                        clearance_fraction_of_h=0.75,
+                        verify_step_fraction_of_h=0.10,
+                        max_verify_tries=20,
                     )
+
+                    if cls_after["status"] == "free":
+                        # Preserve electron total energy while moving it from the
+                        # first fixed-shell voxel to the verified free point.
+                        # In eV for an electron: K - Phi = constant.
+                        if Phi_interp is not None:
+                            phi_ref_point = (
+                                p_before_shell
+                                if p_before_shell is not None
+                                else p_before_move
+                            )
+                            Phi_before = float(evaluate_potential(
+                                phi_ref_point, Phi_interp
+                            ))
+                            Phi_after = float(evaluate_potential(p, Phi_interp))
+                            K_before = float(
+                                kinetic_energy_eV_from_velocity(v_before_move)
+                            )
+                            K_after = K_before + Phi_after - Phi_before
+
+                            cls_after["Phi_before_V"] = Phi_before
+                            cls_after["Phi_after_V"] = Phi_after
+                            cls_after["K_before_eV"] = K_before
+                            cls_after["K_after_eV"] = K_after
+                            cls_after["energy_correction_eV"] = (
+                                Phi_after - Phi_before
+                            )
+
+                            if not np.isfinite(K_after) or K_after <= 0.0:
+                                cls_after["status"] = (
+                                    "insufficient_energy_after_grid_placement"
+                                )
+                            else:
+                                v = unit(v_before_move) * speed_from_energy_eV(
+                                    K_after
+                                )
 
                     traj.append(p.copy())
                     vel.append(v.copy())
@@ -545,6 +592,12 @@ def integrate_one_electron(
                         "placement_method": cls_after.get("placement_method"),
                         "placement_attempts": cls_after.get("placement_attempts"),
                         "placement_offset_m": cls_after.get("placement_offset_m"),
+                        "placement_target_radius_m": cls_after.get("placement_target_radius_m"),
+                        "Phi_before_V": cls_after.get("Phi_before_V"),
+                        "Phi_after_V": cls_after.get("Phi_after_V"),
+                        "K_before_eV": cls_after.get("K_before_eV"),
+                        "K_after_eV": cls_after.get("K_after_eV"),
+                        "energy_correction_eV": cls_after.get("energy_correction_eV"),
                     })
 
                     if cls_after["status"] != "free":
@@ -842,6 +895,114 @@ def grid_shell_transparency_key(owner_name: str) -> str:
     }
 
     return mapping[owner_name]
+
+
+def grid_radius_for_owner(owner: str, field: dict) -> float:
+    """Return the analytic spherical radius for a grid-shell owner."""
+    mapping = {
+        "g1_shell": "R_g1",
+        "g2_shell": "R_g2",
+        "g3_shell": "R_g3",
+    }
+    try:
+        return float(field[mapping[owner]])
+    except KeyError as exc:
+        raise ValueError(f"Unknown analytic grid-shell owner: {owner}") from exc
+
+
+def place_transmitted_particle_beyond_grid(
+    p_shell,
+    v,
+    owner: str,
+    field: dict,
+    p_before=None,
+    clearance_fraction_of_h: float = 0.75,
+    verify_step_fraction_of_h: float = 0.10,
+    max_verify_tries: int = 20,
+):
+    """Place a transmitted electron directly beyond an analytic grid shell.
+
+    The outgoing radial side is inferred from the last free point before the
+    fixed voxel layer.  The particle is placed at the known analytic grid
+    radius plus a modest clearance on that same side.  A short radial search
+    then verifies that the selected point belongs to a free field voxel.
+
+    This avoids numerically walking through a staircase-like fixed voxel shell.
+    Only the position is selected here; the caller applies potential-based
+    kinetic-energy correction after the verified point is found.
+    """
+    p_shell = np.asarray(p_shell, dtype=float)
+    vhat = unit(v)
+    rhat = unit(p_shell)
+    h = float(field["h"])
+    R_grid = grid_radius_for_owner(owner, field)
+
+    if clearance_fraction_of_h <= 0.0:
+        raise ValueError("clearance_fraction_of_h must be positive")
+    if verify_step_fraction_of_h <= 0.0:
+        raise ValueError("verify_step_fraction_of_h must be positive")
+    if max_verify_tries < 0:
+        raise ValueError("max_verify_tries must be nonnegative")
+
+    radial_component = float(np.dot(vhat, rhat))
+    if p_before is not None:
+        p_prev = np.asarray(p_before, dtype=float)
+        if np.all(np.isfinite(p_prev)):
+            dr_enter = float(np.linalg.norm(p_shell) - np.linalg.norm(p_prev))
+        else:
+            dr_enter = 0.0
+    else:
+        dr_enter = 0.0
+
+    if abs(dr_enter) > 1.0e-12:
+        radial_sign = 1.0 if dr_enter > 0.0 else -1.0
+    else:
+        radial_sign = 1.0 if radial_component >= 0.0 else -1.0
+
+    clearance = float(clearance_fraction_of_h) * h
+    verify_ds = float(verify_step_fraction_of_h) * h
+    transmitted_radial = radial_sign * rhat
+
+    target_radius = R_grid + radial_sign * clearance
+    if target_radius <= 0.0:
+        raise RuntimeError(
+            f"Invalid target radius {target_radius} for {owner}"
+        )
+
+    candidate = target_radius * rhat
+    cls = classify_grid_point(candidate, field)
+
+    for attempt in range(max_verify_tries + 1):
+        if cls["status"] == "free":
+            enriched = dict(cls)
+            enriched.update({
+                "placement_method": "analytic_radius_then_radial_verify",
+                "placement_attempts": attempt,
+                "placement_offset_m": float(
+                    np.linalg.norm(candidate - p_shell)
+                ),
+                "placement_radial_sign": radial_sign,
+                "placement_grid_radius_m": R_grid,
+                "placement_target_radius_m": float(np.linalg.norm(candidate)),
+            })
+            return candidate, enriched
+
+        if cls["status"] in {"left_grid", "left_update_region"}:
+            break
+
+        candidate = candidate + verify_ds * transmitted_radial
+        cls = classify_grid_point(candidate, field)
+
+    failed = dict(cls)
+    failed.update({
+        "placement_method": "analytic_radius_then_radial_verify_failed",
+        "placement_attempts": max_verify_tries,
+        "placement_offset_m": float(np.linalg.norm(candidate - p_shell)),
+        "placement_radial_sign": radial_sign,
+        "placement_grid_radius_m": R_grid,
+        "placement_target_radius_m": float(np.linalg.norm(candidate)),
+    })
+    return candidate, failed
 
 
 def advance_until_free(
