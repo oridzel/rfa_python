@@ -185,7 +185,7 @@ def make_emissions_safe_to_launch(
     r_hit,
     field: dict,
     launch_step_fraction_of_h: float = 0.10,
-    max_advance_tries: int = 20,
+    max_advance_tries: int = 60,
     Phi_interp=None,
     surface_name: str | None = None,
     n_vacuum=None,

@@ -147,6 +147,64 @@ def classify_grid_point(p, field):
     }
 
 
+
+
+def is_drifttube_escape_candidate(p, v, field, aperture_radius=None):
+    """Return True when a trajectory is leaving through the +X DT aperture.
+
+    The test is intentionally conservative: the electron must be close to the
+    positive-X edge of the field/update domain, moving toward +X, and inside
+    the circular drift-tube aperture in the YZ plane.
+    """
+    p = np.asarray(p, dtype=float)
+    v = np.asarray(v, dtype=float)
+
+    if p.shape != (3,) or v.shape != (3,):
+        return False
+    if not np.all(np.isfinite(p)) or not np.all(np.isfinite(v)):
+        return False
+    if v[0] <= 0.0:
+        return False
+
+    h = float(field["h"])
+    x_max = float(np.asarray(field["x"])[-1])
+
+    if aperture_radius is None:
+        aperture_radius = float(
+            field.get("drifttube_aperture_radius", 6.0e-3)
+        )
+
+    radial_yz = float(np.hypot(p[1], p[2]))
+    near_positive_x_boundary = p[0] >= x_max - 1.5 * h
+
+    return near_positive_x_boundary and radial_yz <= aperture_radius
+
+
+def drifttube_escape_result(p, v, traj, vel, step, grid_events=None, extra=None):
+    """Build a clean terminal result for a physical DT-aperture escape."""
+    hit_info = {
+        "owner_name": "escaped",
+        "owner": "escaped",
+        "escape_opening": "drifttube",
+        "kind": "drifttube_aperture_escape",
+        "location": np.asarray(p, dtype=float).copy(),
+        "KE_hit_eV": kinetic_energy_eV_from_velocity(v),
+        "v_in": np.asarray(v, dtype=float).copy(),
+    }
+    payload = {"grid_events": [] if grid_events is None else grid_events}
+    if extra:
+        payload.update(extra)
+    return _trajectory_failure(
+        reason="escaped_drifttube",
+        p=p,
+        v=v,
+        traj=traj,
+        vel=vel,
+        step=step,
+        hit_info=hit_info,
+        extra=payload,
+    )
+
 # ============================================================
 # Adaptive timestep
 # ============================================================
@@ -498,6 +556,18 @@ def integrate_one_electron(
                     "grid_events": grid_events,
                 }
 
+            if cls["status"] in {"left_grid", "left_update_region"}:
+                if is_drifttube_escape_candidate(p, v, field):
+                    return drifttube_escape_result(
+                        p=p,
+                        v=v,
+                        traj=traj,
+                        vel=vel,
+                        step=step,
+                        grid_events=grid_events,
+                        extra={"original_grid_status": cls["status"]},
+                    )
+
             return {
                 "reason": cls["status"],
                 "hit_info": hit_info,
@@ -535,6 +605,25 @@ def integrate_one_electron(
             raise ValueError(f"Unknown integrator: {integrator}")
 
         if not np.all(np.isfinite(p_new)) or not np.all(np.isfinite(v_new)):
+            # Field interpolation commonly becomes nonfinite immediately after
+            # a valid electron crosses the +X drift-tube aperture.  Classify
+            # that physical boundary exit before calling it a numerical error.
+            if is_drifttube_escape_candidate(p, v, field):
+                return drifttube_escape_result(
+                    p=p,
+                    v=v,
+                    traj=traj,
+                    vel=vel,
+                    step=step + 1,
+                    grid_events=grid_events,
+                    extra={
+                        "p_before": p.copy(),
+                        "v_before": v.copy(),
+                        "dt_step": dt_step,
+                        "nonfinite_after_boundary_step": True,
+                    },
+                )
+
             return _trajectory_failure(
                 reason="nan_state_after_step",
                 p=p_new,
@@ -735,45 +824,63 @@ def advance_until_free(
     p,
     v,
     field,
-    max_tries: int = 20,
-    step_fraction_of_h: float = 0.25,
+    max_tries: int = 60,
+    step_fraction_of_h: float = 0.10,
 ):
-    """
-    Advance a TRANSMITTED electron along its velocity until it leaves
-    the current fixed voxel layer.
+    """Place a grid-transmitted electron in the nearest free voxel.
 
-    This is the original function, intended for grid-shell transmissions
-    where advancing along the velocity direction is geometrically correct.
-
-    Returns (p, cls) — same signature as before for backward compatibility.
-    The caller should check cls["status"] == "free" if it needs to know
-    whether the search succeeded.
+    Search first along the actual velocity.  For nearly tangential crossings,
+    also search radially on the side indicated by the radial velocity and then
+    on the opposite side.  The closest valid free point is returned.
     """
-    p = np.asarray(p, dtype=float).copy()
-    direction = unit(v)
+    p0 = np.asarray(p, dtype=float).copy()
+    vhat = unit(v)
+    rhat = unit(p0)
+
+    radial_sign = 1.0 if float(np.dot(vhat, rhat)) >= 0.0 else -1.0
+    radial_forward = radial_sign * rhat
+
+    directions = [vhat, radial_forward, -radial_forward]
+    unique = []
+    for d in directions:
+        d = unit(d)
+        if not any(abs(float(np.dot(d, q))) > 1.0 - 1.0e-10 for q in unique):
+            unique.append(d)
 
     h = float(field["h"])
-    ds = step_fraction_of_h * h
+    ds = float(step_fraction_of_h) * h
+    if ds <= 0.0:
+        raise ValueError("step_fraction_of_h must be positive")
 
-    for _ in range(max_tries):
-        p = p + ds * direction
-        cls = classify_grid_point(p, field)
+    best = None
+    last_cls = classify_grid_point(p0, field)
+    last_p = p0.copy()
 
-        if cls["status"] == "free":
-            return p, cls
+    for direction in unique:
+        for n in range(1, max_tries + 1):
+            candidate = p0 + n * ds * direction
+            cls = classify_grid_point(candidate, field)
+            last_p, last_cls = candidate, cls
 
-        # Early exit if already outside valid region — no point continuing.
-        if cls["status"] in {"left_grid", "left_update_region"}:
-            return p, cls
+            if cls["status"] == "free":
+                distance = float(np.linalg.norm(candidate - p0))
+                if best is None or distance < best[0]:
+                    best = (distance, candidate.copy(), cls)
+                break
 
-    return p, cls
+            if cls["status"] in {"left_grid", "left_update_region"}:
+                break
 
+    if best is not None:
+        return best[1], best[2]
+
+    return last_p, last_cls
 
 def place_emitted_particle_in_vacuum(
     r_hit,
     n_vacuum,
     field,
-    max_tries: int = 12,
+    max_tries: int = 60,
     step_fraction_of_h: float = 0.10,
 ):
     """
@@ -800,9 +907,9 @@ def place_emitted_particle_in_vacuum(
     field : dict
         Field dictionary containing at least "h" (voxel size).
     max_tries : int
-        Maximum number of normal-directed steps.  12 steps × 0.10h ≈ 1.2h
-        which is safely larger than the voxel layer thickness without
-        overshooting into the next electrode.
+        Maximum number of normal-directed steps.  The default searches up to
+        6h, which is sufficient for the voxelized grid-shell layers observed
+        in validation runs.
     step_fraction_of_h : float
         Step size as a fraction of h.
 
