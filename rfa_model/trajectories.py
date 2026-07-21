@@ -516,16 +516,36 @@ def integrate_one_electron(
                         "type": "transmit_fixed_voxel",
                     })
 
+                    # The current point is the first fixed-shell voxel reached
+                    # from free vacuum.  Preserve that incoming-side information
+                    # so the placement search exits on the physically transmitted
+                    # side of the shell rather than jumping back to the side from
+                    # which the electron arrived.
+                    p_before_shell = (
+                        np.asarray(traj[-2], dtype=float)
+                        if len(traj) >= 2
+                        else None
+                    )
+
                     p, cls_after = advance_until_free(
                         p,
                         v,
                         field,
-                        max_tries=20,
-                        step_fraction_of_h=0.25,
+                        p_before=p_before_shell,
+                        max_tries=160,
+                        step_fraction_of_h=0.05,
                     )
 
                     traj.append(p.copy())
                     vel.append(v.copy())
+
+                    # Save placement diagnostics in the transmission event.
+                    grid_events[-1].update({
+                        "placement_status": cls_after.get("status"),
+                        "placement_method": cls_after.get("placement_method"),
+                        "placement_attempts": cls_after.get("placement_attempts"),
+                        "placement_offset_m": cls_after.get("placement_offset_m"),
+                    })
 
                     if cls_after["status"] != "free":
                         return _trajectory_failure(
@@ -542,6 +562,10 @@ def integrate_one_electron(
                             },
                             extra={"grid_events": grid_events},
                         )
+
+                    # Avoid immediately detecting the same analytic spherical
+                    # grid after leaving its fixed-potential voxel shell.
+                    ignore_sphere_owners = {owner}
 
                     # Continue integration after stepping through shell.
                     continue
@@ -824,57 +848,136 @@ def advance_until_free(
     p,
     v,
     field,
-    max_tries: int = 60,
-    step_fraction_of_h: float = 0.10,
+    p_before=None,
+    max_tries: int = 160,
+    step_fraction_of_h: float = 0.05,
 ):
-    """Place a grid-transmitted electron in the nearest free voxel.
+    """Place a grid-transmitted electron beyond a fixed voxel shell.
 
-    Search first along the actual velocity.  For nearly tangential crossings,
-    also search radially on the side indicated by the radial velocity and then
-    on the opposite side.  The closest valid free point is returned.
+    The search preserves the physical crossing direction.  It first follows
+    the actual velocity and, if the trajectory is nearly tangent to the
+    voxelized spherical shell, progressively biases the search toward the
+    radial direction on the transmitted side.  It never searches toward the
+    incident side of the shell.
+
+    Parameters
+    ----------
+    p : array (3,)
+        First point classified inside the fixed grid-shell voxel layer.
+    v : array (3,)
+        Electron velocity at the crossing.
+    field : dict
+        Field-grid data.
+    p_before : array (3,), optional
+        Last point in free vacuum before entering the fixed shell.  When
+        supplied, its radius relative to ``p`` determines which radial side is
+        the transmitted side more reliably than velocity alone.
+    max_tries : int
+        Number of samples per search direction.
+    step_fraction_of_h : float
+        Search increment as a fraction of the field-grid spacing.
+
+    Returns
+    -------
+    p_safe, cls
+        ``cls["status"]`` is ``"free"`` on success.  Diagnostic fields are
+        added: ``placement_method``, ``placement_attempts``, and
+        ``placement_offset_m``.
     """
     p0 = np.asarray(p, dtype=float).copy()
     vhat = unit(v)
     rhat = unit(p0)
 
-    radial_sign = 1.0 if float(np.dot(vhat, rhat)) >= 0.0 else -1.0
-    radial_forward = radial_sign * rhat
-
-    directions = [vhat, radial_forward, -radial_forward]
-    unique = []
-    for d in directions:
-        d = unit(d)
-        if not any(abs(float(np.dot(d, q))) > 1.0 - 1.0e-10 for q in unique):
-            unique.append(d)
-
     h = float(field["h"])
     ds = float(step_fraction_of_h) * h
     if ds <= 0.0:
         raise ValueError("step_fraction_of_h must be positive")
+    if max_tries <= 0:
+        raise ValueError("max_tries must be positive")
+
+    # Determine the radial side on which the transmitted electron must exit.
+    # If the prior free point is available, moving from its radius to the
+    # fixed-shell radius gives the crossing sense even for tangential motion.
+    radial_component = float(np.dot(vhat, rhat))
+    if p_before is not None:
+        p_prev = np.asarray(p_before, dtype=float)
+        if np.all(np.isfinite(p_prev)):
+            dr_enter = float(np.linalg.norm(p0) - np.linalg.norm(p_prev))
+            if abs(dr_enter) > 1.0e-12:
+                radial_sign = 1.0 if dr_enter > 0.0 else -1.0
+            else:
+                radial_sign = 1.0 if radial_component >= 0.0 else -1.0
+        else:
+            radial_sign = 1.0 if radial_component >= 0.0 else -1.0
+    else:
+        radial_sign = 1.0 if radial_component >= 0.0 else -1.0
+
+    transmitted_radial = radial_sign * rhat
+
+    # Every candidate direction has a component toward the transmitted side.
+    # The sequence starts with the true velocity and adds increasing radial
+    # bias only as needed for a staircase-like voxel shell.
+    direction_specs = [
+        ("velocity", vhat),
+        ("velocity_plus_0p10_radial", unit(vhat + 0.10 * transmitted_radial)),
+        ("velocity_plus_0p25_radial", unit(vhat + 0.25 * transmitted_radial)),
+        ("velocity_plus_0p50_radial", unit(vhat + 0.50 * transmitted_radial)),
+        ("transmitted_radial", transmitted_radial),
+    ]
+
+    # Remove duplicate directions while preserving order.
+    unique_specs = []
+    for name, direction in direction_specs:
+        direction = unit(direction)
+        if not any(
+            float(np.dot(direction, old_direction)) > 1.0 - 1.0e-10
+            for _, old_direction in unique_specs
+        ):
+            unique_specs.append((name, direction))
 
     best = None
-    last_cls = classify_grid_point(p0, field)
     last_p = p0.copy()
+    last_cls = classify_grid_point(last_p, field)
 
-    for direction in unique:
-        for n in range(1, max_tries + 1):
-            candidate = p0 + n * ds * direction
+    for method, direction in unique_specs:
+        for attempt in range(1, max_tries + 1):
+            candidate = p0 + attempt * ds * direction
             cls = classify_grid_point(candidate, field)
-            last_p, last_cls = candidate, cls
+            last_p = candidate
+            last_cls = cls
 
             if cls["status"] == "free":
-                distance = float(np.linalg.norm(candidate - p0))
-                if best is None or distance < best[0]:
-                    best = (distance, candidate.copy(), cls)
+                offset = float(np.linalg.norm(candidate - p0))
+                enriched = dict(cls)
+                enriched.update({
+                    "placement_method": method,
+                    "placement_attempts": attempt,
+                    "placement_offset_m": offset,
+                    "placement_radial_sign": radial_sign,
+                })
+
+                # Prefer the shortest valid placement among all directions.
+                if best is None or offset < best[0]:
+                    best = (offset, candidate.copy(), enriched)
                 break
 
+            # Once this ray leaves the modeled domain it cannot re-enter in a
+            # physically useful way for this local shell crossing.
             if cls["status"] in {"left_grid", "left_update_region"}:
                 break
 
     if best is not None:
         return best[1], best[2]
 
-    return last_p, last_cls
+    failed = dict(last_cls)
+    failed.update({
+        "placement_method": "failed_all_transmitted_side_directions",
+        "placement_attempts": max_tries,
+        "placement_offset_m": float(np.linalg.norm(last_p - p0)),
+        "placement_radial_sign": radial_sign,
+    })
+    return last_p, failed
+
 
 def place_emitted_particle_in_vacuum(
     r_hit,
