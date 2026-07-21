@@ -36,7 +36,6 @@ from .trajectories import (
     integrate_one_electron,
     advance_until_free,
     place_emitted_particle_in_vacuum,
-    place_grid_emission_in_vacuum,
 )
 from .primary import (
     fly_primary_to_sample,
@@ -233,37 +232,13 @@ def make_emissions_safe_to_launch(
         v0 = np.asarray(e["v0"], dtype=float)
         direction = unit(v0)
 
-        owner = canonical_surface_name(surface_name) if surface_name is not None else None
-        grid_surfaces = {
-            "g1_shell", "g2_shell", "g3_shell",
-            "g1mesh", "g2mesh", "g3mesh",
-        }
-
-        if owner in grid_surfaces:
-            # Grid emission is special: the angular sampler has already
-            # selected the physical emitted direction. Use that direction
-            # to determine which side of the voxelized spherical shell the
-            # electron belongs on, but do not rotate or reflect v0.
-            p_safe, cls, success = place_grid_emission_in_vacuum(
-                r_hit=r_hit,
-                emission_direction=direction,
-                field=field,
-                max_forward_tries=max_advance_tries,
-                max_radial_tries=max_advance_tries,
-                step_fraction_of_h=normal_step_fraction,
-            )
-        else:
-            # For ordinary solid surfaces, move only the launch position
-            # along the known vacuum-side normal. Using v0 here can trap
-            # nearly tangential emissions inside a thick voxelized surface
-            # and was the source of collector/holder/etc. launch failures.
-            p_safe, cls, success = place_emitted_particle_in_vacuum(
-                r_hit=r_hit,
-                n_vacuum=n_vacuum,
-                field=field,
-                max_tries=max_advance_tries,
-                step_fraction_of_h=normal_step_fraction,
-            )
+        p_safe, cls, success = place_emitted_particle_in_vacuum(
+            r_hit=r_hit,
+            n_vacuum=n_vacuum,
+            field=field,
+            max_tries=max_advance_tries,
+            step_fraction_of_h=normal_step_fraction,
+        )
 
         e["raw_hit_location"] = r_hit.copy()
         e["launch_offset_m"] = float(np.linalg.norm(p_safe - r_hit))
@@ -365,44 +340,6 @@ def generate_cascade_emissions_from_hit(
         Phi_interp=Phi_interp,
     )
 
-    # Save emitted-direction diagnostics before launch placement.
-    v_in_hat = unit(v_in)
-    r_hat = unit(r_hit)
-
-    for e in emissions:
-        v_emit_hat = unit(e["v0"])
-
-        # Relative to incoming electron:
-        # +1 = continues forward, -1 = reverses direction.
-        forward_cosine = float(np.dot(v_emit_hat, v_in_hat))
-
-        # Relative to spherical grid radius:
-        # +1 = toward larger radius, -1 = toward smaller radius.
-        radial_cosine = float(np.dot(v_emit_hat, r_hat))
-
-        e["emission_forward_cosine"] = forward_cosine
-        e["emission_radial_cosine"] = radial_cosine
-
-        e["emission_scattering_angle_deg"] = float(
-            np.degrees(
-                np.arccos(np.clip(forward_cosine, -1.0, 1.0))
-            )
-        )
-
-        if forward_cosine > 0.0:
-            e["emission_forward_backward"] = "forward"
-        elif forward_cosine < 0.0:
-            e["emission_forward_backward"] = "backward"
-        else:
-            e["emission_forward_backward"] = "tangential"
-
-        if radial_cosine > 0.0:
-            e["emission_radial_direction"] = "outward"
-        elif radial_cosine < 0.0:
-            e["emission_radial_direction"] = "inward"
-        else:
-            e["emission_radial_direction"] = "tangential"
-
     safe_emissions, failed_emissions = make_emissions_safe_to_launch(
         emissions,
         r_hit=r_hit,
@@ -452,7 +389,6 @@ def run_one_primary_with_cascade(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
-    grid_wire_geometry=None,
 
     max_generation: int = 5,
     max_total_electrons: int = 500,
@@ -551,21 +487,6 @@ def run_one_primary_with_cascade(
             "launch_grid_status": failed.get(
                 "launch_grid_classification", {}
             ).get("status", None),
-            "emission_forward_cosine": failed.get(
-                "emission_forward_cosine", np.nan
-            ),
-            "emission_radial_cosine": failed.get(
-                "emission_radial_cosine", np.nan
-            ),
-            "emission_scattering_angle_deg": failed.get(
-                "emission_scattering_angle_deg", np.nan
-            ),
-            "emission_forward_backward": failed.get(
-                "emission_forward_backward", None
-            ),
-            "emission_radial_direction": failed.get(
-                "emission_radial_direction", None
-            ),
         })
 
     for e in first_emissions:
@@ -606,7 +527,6 @@ def run_one_primary_with_cascade(
             max_steps=emitted_max_steps,
             surface_eps=surface_skip_eps,
             grid_transparency=grid_transparency,
-            grid_wire_geometry=grid_wire_geometry,
             rng=rng,
             adaptive_dt=True,
             dt_min=1.0e-13,
@@ -629,21 +549,6 @@ def run_one_primary_with_cascade(
 
         res["E_emit_eV"] = e.get("E_emit_eV", np.nan)
         res["emission_kind"] = e.get("kind", None)
-        res["emission_forward_cosine"] = e.get(
-            "emission_forward_cosine", np.nan
-        )
-        res["emission_radial_cosine"] = e.get(
-            "emission_radial_cosine", np.nan
-        )
-        res["emission_scattering_angle_deg"] = e.get(
-            "emission_scattering_angle_deg", np.nan
-        )
-        res["emission_forward_backward"] = e.get(
-            "emission_forward_backward", None
-        )
-        res["emission_radial_direction"] = e.get(
-            "emission_radial_direction", None
-        )
         res["launch_offset_m"] = e.get("launch_offset_m", np.nan)
         res["Phi_emit"] = e.get("Phi_emit", np.nan)
         res["Phi_launch"] = e.get("Phi_launch", np.nan)
@@ -657,7 +562,6 @@ def run_one_primary_with_cascade(
         cascade_results.append(res)
 
         cascade_log.append({
-            "event": "tracked_emission",
             "electron_id": item["electron_id"],
             "parent_id": item["parent_id"],
             "generation": item["generation"],
@@ -667,21 +571,6 @@ def run_one_primary_with_cascade(
             "emission_kind": e.get("kind", None),
             "E_emit_eV": e.get("E_emit_eV", np.nan),
             "launch_offset_m": e.get("launch_offset_m", np.nan),
-            "emission_forward_cosine": e.get(
-                "emission_forward_cosine", np.nan
-            ),
-            "emission_radial_cosine": e.get(
-                "emission_radial_cosine", np.nan
-            ),
-            "emission_scattering_angle_deg": e.get(
-                "emission_scattering_angle_deg", np.nan
-            ),
-            "emission_forward_backward": e.get(
-                "emission_forward_backward", None
-            ),
-            "emission_radial_direction": e.get(
-                "emission_radial_direction", None
-            ),
         })
 
         # Stop cascade if generation limit reached.
@@ -786,15 +675,10 @@ def run_one_primary_with_cascade(
             "parent_id": item["parent_id"],
             "generation": item["generation"],
             "event": "child_emissions_sampled",
-
             "terminal_owner": terminal_owner,
             "terminal_electrode": terminal_electrode,
             "terminal_Einc_eV": E_term,
             "N_child_emissions": len(child_emissions),
-            "N_child_launch_failures": len(child_launch_failures),
-            "N_child_sampled_total": (
-                len(child_emissions) + len(child_launch_failures)
-            ),
 
             "terminal_cos_theta_raw": terminal_cos_theta_raw,
             "terminal_cos_theta_used": terminal_cos_theta_used,
@@ -820,21 +704,6 @@ def run_one_primary_with_cascade(
                 "launch_grid_status": failed.get(
                     "launch_grid_classification", {}
                 ).get("status", None),
-                "emission_forward_cosine": failed.get(
-                    "emission_forward_cosine", np.nan
-                ),
-                "emission_radial_cosine": failed.get(
-                    "emission_radial_cosine", np.nan
-                ),
-                "emission_scattering_angle_deg": failed.get(
-                    "emission_scattering_angle_deg", np.nan
-                ),
-                "emission_forward_backward": failed.get(
-                    "emission_forward_backward", None
-                ),
-                "emission_radial_direction": failed.get(
-                    "emission_radial_direction", None
-                ),
             })
 
         for child in child_emissions:
@@ -908,21 +777,6 @@ def cascade_results_to_dataframe(
             "emission_kind": res.get("emission_kind", None),
             "E_emit_eV": res.get("E_emit_eV", np.nan),
             "launch_offset_m": res.get("launch_offset_m", np.nan),
-            "emission_forward_cosine": res.get(
-                "emission_forward_cosine", np.nan
-            ),
-            "emission_radial_cosine": res.get(
-                "emission_radial_cosine", np.nan
-            ),
-            "emission_scattering_angle_deg": res.get(
-                "emission_scattering_angle_deg", np.nan
-            ),
-            "emission_forward_backward": res.get(
-                "emission_forward_backward", None
-            ),
-            "emission_radial_direction": res.get(
-                "emission_radial_direction", None
-            ),
             "Phi_emit": res.get("Phi_emit", np.nan),
             "Phi_launch": res.get("Phi_launch", np.nan),
             "phi_launch_correction_eV": res.get(
@@ -1004,7 +858,6 @@ def _run_cascade_chunk(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
-    grid_wire_geometry=None,
     integrator: str = "verlet",
 ):
     """
@@ -1046,7 +899,6 @@ def _run_cascade_chunk(
             voltages=voltages,
             grid_SEY_mult=grid_SEY_mult,
             collector_BSE_mult=collector_BSE_mult,
-            grid_wire_geometry=grid_wire_geometry,
             rng=rng,
 
             sample_y_bounds=sample_y_bounds,
@@ -1160,7 +1012,6 @@ def run_cascade_batch_parallel(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
-    grid_wire_geometry: dict | None = None,
 
     x_start: float | None = None,
     beam_sigma: float = 150e-6,
@@ -1291,7 +1142,6 @@ def run_cascade_batch_parallel(
     
             grid_SEY_mult=grid_SEY_mult,
             collector_BSE_mult=collector_BSE_mult,
-            grid_wire_geometry=grid_wire_geometry,
     
             sample_y_bounds=sample_y_bounds,
             sample_z_bounds=sample_z_bounds,
@@ -1402,7 +1252,6 @@ def run_cascade_batch_parallel(
         "integrator": integrator,
 
         "grid_transparency": grid_transparency,
-        "grid_wire_geometry": grid_wire_geometry,
         "grid_SEY_mult": grid_SEY_mult,
         "collector_BSE_mult": collector_BSE_mult,
 
