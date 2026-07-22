@@ -643,6 +643,7 @@ def integrate_one_electron(
             if hit["kind"] == "sample_plane":
                 traj.append(hit["location"].copy())
                 vel.append(v_new.copy())
+                hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
 
                 return {
                     "reason": "hit_sample",
@@ -656,6 +657,7 @@ def integrate_one_electron(
             if hit["kind"] == "stl":
                 traj.append(hit["location"].copy())
                 vel.append(v_new.copy())
+                hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
 
                 return {
                     "reason": "hit_stl",
@@ -673,6 +675,7 @@ def integrate_one_electron(
                 if event_type == "hit_collector":
                     traj.append(hit["location"].copy())
                     vel.append(v_new.copy())
+                    hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
 
                     return {
                         "reason": "hit_collector",
@@ -691,6 +694,7 @@ def integrate_one_electron(
                     if u > T:
                         traj.append(hit["location"].copy())
                         vel.append(v_new.copy())
+                        hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
 
                         return {
                             "reason": "hit_grid_wire",
