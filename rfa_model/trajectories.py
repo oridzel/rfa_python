@@ -470,6 +470,22 @@ def integrate_one_electron(
     for step in range(max_steps):
         cls = classify_grid_point(p, field)
 
+        # Grid-shell voxels are retained only as electrostatic boundary
+        # conditions. They are ignored as collision geometry. Physical
+        # crossings are handled exclusively by analytic segment-sphere tests
+        # at R_g1, R_g2, and R_g3 below.
+        if cls["status"] == "hit_fixed":
+            owner_id = cls.get("owner_id", None)
+            owner = fixed_owner_name(owner_id, field=field)
+            if is_grid_shell_owner(owner):
+                cls = {
+                    "status": "free",
+                    "i": cls.get("i"),
+                    "j": cls.get("j"),
+                    "k": cls.get("k"),
+                    "ignored_fixed_owner": owner,
+                }
+
         if cls["status"] != "free":
             hit_info = dict(cls)
 
@@ -828,9 +844,15 @@ def integrate_one_electron(
                         "T": T,
                     })
 
-                    # Step just past the spherical surface to avoid
-                    # detecting the same surface again.
-                    p = hit["location"] + surface_eps * unit(v_new)
+                    # Move only a tiny distance onto the transmitted side
+                    # to avoid detecting the same analytic sphere again.
+                    # No voxel-clearing jump is needed because grid-shell
+                    # voxels do not act as collision geometry.
+                    analytic_eps = max(
+                        float(surface_eps),
+                        1.0e-6 * float(field["h"]),
+                    )
+                    p = hit["location"] + analytic_eps * unit(v_new)
                     v = v_new.copy()
 
                     traj.append(p.copy())
