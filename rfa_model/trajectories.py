@@ -472,14 +472,14 @@ def integrate_one_electron(
     for step in range(max_steps):
         cls = classify_grid_point(p, field)
 
-        # Grid-shell voxels are retained only as electrostatic boundary
-        # conditions. They are ignored as collision geometry. Physical
-        # crossings are handled exclusively by analytic segment-sphere tests
-        # at R_g1, R_g2, and R_g3 below.
+        # Grid-shell AND collector-shell voxels are retained only as
+        # electrostatic boundary conditions. They are ignored as collision
+        # geometry. Physical crossings are handled exclusively by analytic
+        # segment-sphere tests at R_g1, R_g2, R_g3, and R_col below.
         if cls["status"] == "hit_fixed":
             owner_id = cls.get("owner_id", None)
             owner = fixed_owner_name(owner_id, field=field)
-            if is_grid_shell_owner(owner):
+            if is_grid_shell_owner(owner) or owner == "collector_shell":
                 cls = {
                     "status": "free",
                     "i": cls.get("i"),
