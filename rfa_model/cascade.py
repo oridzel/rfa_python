@@ -519,6 +519,7 @@ def run_one_primary_with_cascade(
             Ex_interp=Ex_interp,
             Ey_interp=Ey_interp,
             Ez_interp=Ez_interp,
+            Phi_interp=Phi_interp,
             intersector=intersector_emit,
             face_owner=face_owner_emit,
             collision_mesh=collision_mesh_emit,
