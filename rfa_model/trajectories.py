@@ -15,9 +15,8 @@ from .constants import (
     e_charge,
     m_e,
     kinetic_energy_eV_from_velocity,
-    speed_from_energy_eV,
 )
-from .fields import E_at_point, evaluate_potential
+from .fields import E_at_point
 from .collisions import (
     first_segment_hit,
     first_analytic_grid_hit,
@@ -175,8 +174,11 @@ def is_drifttube_escape_candidate(p, v, field, aperture_radius=None):
     x_max = float(np.asarray(field["x"])[-1])
 
     if aperture_radius is None:
+        # Must match collisions.is_in_drift_tube_aperture()'s default so the
+        # domain-boundary escape check and the grid-opening check agree on
+        # the same physical drift-tube bore radius.
         aperture_radius = float(
-            field.get("drifttube_aperture_radius", 6.0e-3)
+            field.get("drifttube_aperture_radius", 5.6e-3)
         )
 
     radial_yz = float(np.hypot(p[1], p[2]))
@@ -499,147 +501,11 @@ def integrate_one_electron(
                 hit_info["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
                 hit_info["v_in"] = v.copy()
 
-                # ----------------------------------------------------
-                # Special case: fixed spherical grid shell.
-                #
-                # These voxels represent the fixed-potential grid shell
-                # in the field solution. They should not automatically
-                # absorb electrons. Apply stochastic grid transparency.
-                # ----------------------------------------------------
-                if is_grid_shell_owner(owner):
-                    if grid_transparency is None:
-                        T = 1.0
-                    else:
-                        T = transparency_for_owner(grid_transparency, owner, default=1.0)
-
-                    if rng is None:
-                        rng_local = np.random.default_rng()
-                    else:
-                        rng_local = rng
-
-                    if rng_local.random() > T:
-                        # Absorbed by grid wire.
-                        hit_info["kind"] = "grid_wire_fixed_voxel"
-
-                        return {
-                            "reason": "hit_grid_wire",
-                            "hit_info": hit_info,
-                            "traj": np.asarray(traj),
-                            "vel": np.asarray(vel),
-                            "steps": step,
-                            "grid_events": grid_events,
-                        }
-
-                    # Transmitted through the grid shell.
-                    grid_events.append({
-                        "owner": owner,
-                        "location": p.copy(),
-                        "steps": step,
-                        "type": "transmit_fixed_voxel",
-                    })
-
-                    # The current point is the first fixed-shell voxel reached
-                    # from free vacuum.  Preserve that incoming-side information
-                    # so the placement search exits on the physically transmitted
-                    # side of the shell rather than jumping back to the side from
-                    # which the electron arrived.
-                    p_before_shell = (
-                        np.asarray(traj[-2], dtype=float)
-                        if len(traj) >= 2
-                        else None
-                    )
-
-                    p_before_move = p.copy()
-                    v_before_move = v.copy()
-
-                    p, cls_after = place_transmitted_particle_beyond_grid(
-                        p_shell=p_before_move,
-                        v=v_before_move,
-                        owner=owner,
-                        field=field,
-                        p_before=p_before_shell,
-                        clearance_fraction_of_h=2.0,
-                        verify_step_fraction_of_h=0.10,
-                        max_verify_tries=20,
-                    )
-
-                    if cls_after["status"] == "free":
-                        # Preserve electron total energy while moving it from the
-                        # first fixed-shell voxel to the verified free point.
-                        # In eV for an electron: K - Phi = constant.
-                        if Phi_interp is not None:
-                            phi_ref_point = (
-                                p_before_shell
-                                if p_before_shell is not None
-                                else p_before_move
-                            )
-                            Phi_before = float(evaluate_potential(
-                                phi_ref_point, Phi_interp
-                            ))
-                            Phi_after = float(evaluate_potential(p, Phi_interp))
-                            K_before = float(
-                                kinetic_energy_eV_from_velocity(v_before_move)
-                            )
-                            K_after = K_before + Phi_after - Phi_before
-
-                            cls_after["Phi_before_V"] = Phi_before
-                            cls_after["Phi_after_V"] = Phi_after
-                            cls_after["K_before_eV"] = K_before
-                            cls_after["K_after_eV"] = K_after
-                            cls_after["energy_correction_eV"] = (
-                                Phi_after - Phi_before
-                            )
-
-                            if not np.isfinite(K_after) or K_after <= 0.0:
-                                cls_after["status"] = (
-                                    "insufficient_energy_after_grid_placement"
-                                )
-                            else:
-                                v = unit(v_before_move) * speed_from_energy_eV(
-                                    K_after
-                                )
-
-                    traj.append(p.copy())
-                    vel.append(v.copy())
-
-                    # Save placement diagnostics in the transmission event.
-                    grid_events[-1].update({
-                        "placement_status": cls_after.get("status"),
-                        "placement_method": cls_after.get("placement_method"),
-                        "placement_attempts": cls_after.get("placement_attempts"),
-                        "placement_offset_m": cls_after.get("placement_offset_m"),
-                        "placement_target_radius_m": cls_after.get("placement_target_radius_m"),
-                        "Phi_before_V": cls_after.get("Phi_before_V"),
-                        "Phi_after_V": cls_after.get("Phi_after_V"),
-                        "K_before_eV": cls_after.get("K_before_eV"),
-                        "K_after_eV": cls_after.get("K_after_eV"),
-                        "energy_correction_eV": cls_after.get("energy_correction_eV"),
-                    })
-
-                    if cls_after["status"] != "free":
-                        return _trajectory_failure(
-                            reason="grid_transmission_placement_failed",
-                            p=p,
-                            v=v,
-                            traj=traj,
-                            vel=vel,
-                            step=step,
-                            hit_info={
-                                **cls_after,
-                                "owner": owner,
-                                "kind": "grid_transmission_placement_failed",
-                            },
-                            extra={"grid_events": grid_events},
-                        )
-
-                    # Avoid immediately detecting the same analytic spherical
-                    # grid after leaving its fixed-potential voxel shell.
-                    ignore_sphere_owners = {owner}
-
-                    # Continue integration after stepping through shell.
-                    continue
-
-                # Ordinary fixed voxel: absorbing electrode.
+                # Grid-shell owners can never reach this point: they were
+                # already neutralized to "free" above, since grid crossing
+                # is now handled exclusively by the analytic segment-sphere
+                # test later in this loop. Any remaining fixed-voxel hit
+                # here is therefore an ordinary absorbing electrode.
                 return {
                     "reason": "hit_fixed",
                     "hit_info": hit_info,
@@ -900,131 +766,13 @@ def is_grid_shell_owner(owner_name: str) -> bool:
     """
     True for fixed-potential spherical grid-shell voxels.
 
-    These should be treated with stochastic grid transparency,
-    not as ordinary absorbing fixed solids.
+    These are retained only as electrostatic boundary conditions in the
+    field solve. They are ignored as collision geometry: physical grid
+    crossings are handled exclusively by the analytic segment-sphere test
+    (first_analytic_grid_hit / classify_sphere_event) further down in
+    integrate_one_electron().
     """
     return owner_name in ["g1_shell", "g2_shell", "g3_shell"]
-
-
-def grid_shell_transparency_key(owner_name: str) -> str:
-    """
-    Convert fixed-owner grid shell name to transparency dictionary key.
-    """
-    mapping = {
-        "g1_shell": "g1_shell",
-        "g2_shell": "g2_shell",
-        "g3_shell": "g3_shell",
-    }
-
-    return mapping[owner_name]
-
-
-def grid_radius_for_owner(owner: str, field: dict) -> float:
-    """Return the analytic spherical radius for a grid-shell owner."""
-    mapping = {
-        "g1_shell": "R_g1",
-        "g2_shell": "R_g2",
-        "g3_shell": "R_g3",
-    }
-    try:
-        return float(field[mapping[owner]])
-    except KeyError as exc:
-        raise ValueError(f"Unknown analytic grid-shell owner: {owner}") from exc
-
-
-def place_transmitted_particle_beyond_grid(
-    p_shell,
-    v,
-    owner: str,
-    field: dict,
-    p_before=None,
-    clearance_fraction_of_h: float = 2.0,
-    verify_step_fraction_of_h: float = 0.10,
-    max_verify_tries: int = 20,
-):
-    """Place a transmitted electron directly beyond an analytic grid shell.
-
-    The outgoing radial side is inferred from the last free point before the
-    fixed voxel layer.  The particle is placed at the known analytic grid
-    radius plus a 2h clearance on that same side.  A short radial search
-    then verifies that the selected point belongs to a free field voxel.
-
-    This avoids numerically walking through a staircase-like fixed voxel shell.
-    Only the position is selected here; the caller applies potential-based
-    kinetic-energy correction after the verified point is found.
-    """
-    p_shell = np.asarray(p_shell, dtype=float)
-    vhat = unit(v)
-    rhat = unit(p_shell)
-    h = float(field["h"])
-    R_grid = grid_radius_for_owner(owner, field)
-
-    if clearance_fraction_of_h <= 0.0:
-        raise ValueError("clearance_fraction_of_h must be positive")
-    if verify_step_fraction_of_h <= 0.0:
-        raise ValueError("verify_step_fraction_of_h must be positive")
-    if max_verify_tries < 0:
-        raise ValueError("max_verify_tries must be nonnegative")
-
-    radial_component = float(np.dot(vhat, rhat))
-    if p_before is not None:
-        p_prev = np.asarray(p_before, dtype=float)
-        if np.all(np.isfinite(p_prev)):
-            dr_enter = float(np.linalg.norm(p_shell) - np.linalg.norm(p_prev))
-        else:
-            dr_enter = 0.0
-    else:
-        dr_enter = 0.0
-
-    if abs(dr_enter) > 1.0e-12:
-        radial_sign = 1.0 if dr_enter > 0.0 else -1.0
-    else:
-        radial_sign = 1.0 if radial_component >= 0.0 else -1.0
-
-    clearance = float(clearance_fraction_of_h) * h
-    verify_ds = float(verify_step_fraction_of_h) * h
-    transmitted_radial = radial_sign * rhat
-
-    target_radius = R_grid + radial_sign * clearance
-    if target_radius <= 0.0:
-        raise RuntimeError(
-            f"Invalid target radius {target_radius} for {owner}"
-        )
-
-    candidate = target_radius * rhat
-    cls = classify_grid_point(candidate, field)
-
-    for attempt in range(max_verify_tries + 1):
-        if cls["status"] == "free":
-            enriched = dict(cls)
-            enriched.update({
-                "placement_method": "analytic_radius_then_radial_verify",
-                "placement_attempts": attempt,
-                "placement_offset_m": float(
-                    np.linalg.norm(candidate - p_shell)
-                ),
-                "placement_radial_sign": radial_sign,
-                "placement_grid_radius_m": R_grid,
-                "placement_target_radius_m": float(np.linalg.norm(candidate)),
-            })
-            return candidate, enriched
-
-        if cls["status"] in {"left_grid", "left_update_region"}:
-            break
-
-        candidate = candidate + verify_ds * transmitted_radial
-        cls = classify_grid_point(candidate, field)
-
-    failed = dict(cls)
-    failed.update({
-        "placement_method": "analytic_radius_then_radial_verify_failed",
-        "placement_attempts": max_verify_tries,
-        "placement_offset_m": float(np.linalg.norm(candidate - p_shell)),
-        "placement_radial_sign": radial_sign,
-        "placement_grid_radius_m": R_grid,
-        "placement_target_radius_m": float(np.linalg.norm(candidate)),
-    })
-    return candidate, failed
 
 
 def advance_until_free(

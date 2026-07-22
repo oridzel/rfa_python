@@ -232,9 +232,24 @@ def make_emissions_safe_to_launch(
         v0 = np.asarray(e["v0"], dtype=float)
         direction = unit(v0)
 
+        # Use THIS emission's own travel direction to search for a free
+        # vacuum voxel, not the shared macroscopic surface normal n_vacuum.
+        #
+        # For sample/collector/holder/etc. emissions this is nearly
+        # equivalent to n_vacuum, since those emissions are hemisphere-
+        # clamped around n_out anyway. For grid-wire emissions, however,
+        # theta is sampled over the full 0-180 deg range relative to the
+        # beam axis (see samplers.generate_surface_emissions), so v0 can
+        # point tangentially, backward, or forward through the mesh -
+        # directions that can differ substantially from the shared radial
+        # shell normal. Stepping every emission from a hit along one fixed
+        # n_vacuum can push wide-angle emissions to the wrong side of the
+        # mesh or back toward the fixed-potential grid-shell voxels.
+        launch_direction = direction if np.all(np.isfinite(direction)) else unit(n_vacuum)
+
         p_safe, cls, success = place_emitted_particle_in_vacuum(
             r_hit=r_hit,
-            n_vacuum=n_vacuum,
+            n_vacuum=launch_direction,
             field=field,
             max_tries=max_advance_tries,
             step_fraction_of_h=normal_step_fraction,

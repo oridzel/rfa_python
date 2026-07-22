@@ -419,14 +419,23 @@ def first_sphere_segment_crossing(
 def is_in_drift_tube_aperture(
     p,
     field: dict,
-    r_hole: float = 0.0056,
+    r_hole: float | None = None,
 ) -> bool:
     """
     Check whether point on a spherical surface lies in the drift-tube aperture.
 
     The drift-tube aperture is near +X and has radius r_hole in the YZ plane.
+
+    r_hole defaults to field["drifttube_aperture_radius"] when present, and
+    falls back to 5.6 mm (0.0056 m) otherwise. This is the single source of
+    truth for the drift-tube bore radius, also used by
+    trajectories.is_drifttube_escape_candidate() for the domain-boundary
+    escape check, so both checks agree on the same physical aperture.
     """
     p = np.asarray(p, dtype=float)
+
+    if r_hole is None:
+        r_hole = float((field or {}).get("drifttube_aperture_radius", 0.0056))
 
     rho_yz = np.sqrt(p[1]**2 + p[2]**2)
 
@@ -436,12 +445,18 @@ def is_in_drift_tube_aperture(
 def is_in_rod_opening(
     p,
     field: dict,
-    r_rod: float = 0.011,
+    r_rod: float | None = None,
 ) -> bool:
     """
     Check whether point is in the lower rod opening.
+
+    r_rod defaults to field["rod_opening_radius"] when present, and falls
+    back to 11 mm (0.011 m) otherwise.
     """
     p = np.asarray(p, dtype=float)
+
+    if r_rod is None:
+        r_rod = float((field or {}).get("rod_opening_radius", 0.011))
 
     rho_xy = np.sqrt(p[0]**2 + p[1]**2)
 
@@ -480,13 +495,21 @@ def sphere_crossing_is_opening(
 ) -> bool:
     """
     Return True if a spherical-surface crossing is inside a known opening.
+
+    The drift-tube and support-rod apertures pass through every shell
+    (grids and collector alike), so they are checked unconditionally.
+    Each grid additionally has its own azimuthal service/exchange cap.
+    The collector explicitly has BOTH: the drift-tube aperture (checked
+    below, shared with the grids) AND its own azimuthal service cap
+    (COLLECTOR_OPENING_ALPHA_DEG) - matching the physical instrument,
+    which has a beam-line exit as well as a separate access port.
     """
     p = np.asarray(p, dtype=float)
 
-    if is_in_drift_tube_aperture(p, field, r_hole=0.0056):
+    if is_in_drift_tube_aperture(p, field):
         return True
 
-    if is_in_rod_opening(p, field, r_rod=0.011):
+    if is_in_rod_opening(p, field):
         return True
 
     # Side service/opening cap direction, matching notebook convention.
@@ -506,6 +529,8 @@ def sphere_crossing_is_opening(
         return is_in_spherical_cap_opening(p, u_open, alpha_deg=14.0)
 
     if owner == "collector_shell":
+        # Drift-tube aperture already checked above (shared with grids).
+        # This adds the collector's own azimuthal service-port opening.
         return is_in_spherical_cap_opening(
             p,
             u_open,
