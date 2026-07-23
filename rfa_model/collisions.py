@@ -416,6 +416,94 @@ def first_sphere_segment_crossing(
 # Grid / collector openings
 # ============================================================
 
+def compute_rod_opening_geometry(
+    rod_mesh,
+    shell_radii: dict,
+    clearance_m: float = 1.0e-3,
+    band_thickness_m: float = 2.0e-3,
+    n_samples: int = 200_000,
+    seed: int = 0,
+):
+    """
+    Precompute the ROD's actual local footprint (as seen by each analytic
+    shell) directly from the rod STL mesh, replacing the fixed
+    radius=11mm-circle-at-origin approximation that ignores the rod's real
+    off-axis position and irregular cross-section (e.g. near the sample
+    receiver attachment).
+
+    For each shell radius R in shell_radii, area-weighted surface points are
+    sampled from the rod mesh (NOT just mesh vertices - a coarse mesh can
+    easily have zero vertices in a thin radial band even though a face
+    clearly crosses it) and the subset within +/- band_thickness_m of R is
+    used to fit a local bounding circle in the (x, y) plane, inflated by
+    clearance_m to leave physical clearance between the rod and the grid
+    wire / collector material around it.
+
+    Call this ONCE at setup time (alongside computing R_g1/R_g2/R_g3/R_col)
+    and store the result as field["rod_openings"]; is_in_rod_opening() then
+    just does a fast lookup + point-in-circle test per trajectory step.
+
+    Parameters
+    ----------
+    rod_mesh:
+        The rod's trimesh.Trimesh (e.g. collision_meshes_emit["rod"]).
+    shell_radii:
+        Dict like {"g1_shell": R_g1, "g2_shell": R_g2, "g3_shell": R_g3,
+        "collector_shell": R_col}.
+    clearance_m:
+        Extra radius added on top of the rod's measured footprint, to
+        represent manufacturing/assembly clearance between the rod and
+        the surrounding mesh/collector (default 1 mm, per instrument spec).
+    band_thickness_m:
+        Half-thickness of the radial shell used to collect sample points
+        for a given shell radius.
+    n_samples:
+        Number of area-weighted surface samples drawn from the whole rod
+        mesh. Larger values increase the chance of finding thin/rare
+        crossings (e.g. at large shell radii where only a small part of
+        the rod's length is nearby).
+
+    Returns
+    -------
+    dict[shell_name] -> {"center_xy": (x0, y0), "z_ref": z0, "radius": r_eff}
+        or None if no sampled points were found near that shell radius
+        (i.e. the rod does not appear to cross that shell at all).
+    """
+    import trimesh
+
+    rng = np.random.default_rng(seed)
+    pts, _ = trimesh.sample.sample_surface(rod_mesh, n_samples, seed=rng)
+    pts = np.asarray(pts, dtype=float)
+    r = np.linalg.norm(pts, axis=1)
+
+    openings = {}
+    for name, R in shell_radii.items():
+        mask = np.abs(r - float(R)) < band_thickness_m
+        band_pts = pts[mask]
+
+        if len(band_pts) == 0:
+            openings[name] = None
+            continue
+
+        x0 = float(np.mean(band_pts[:, 0]))
+        y0 = float(np.mean(band_pts[:, 1]))
+        z0 = float(np.mean(band_pts[:, 2]))
+
+        d = np.sqrt(
+            (band_pts[:, 0] - x0) ** 2 + (band_pts[:, 1] - y0) ** 2
+        )
+        r_eff = float(d.max()) + float(clearance_m)
+
+        openings[name] = {
+            "center_xy": (x0, y0),
+            "z_ref": z0,
+            "radius": r_eff,
+            "n_points": int(len(band_pts)),
+        }
+
+    return openings
+
+
 def is_in_drift_tube_aperture(
     p,
     field: dict,
@@ -431,6 +519,11 @@ def is_in_drift_tube_aperture(
     truth for the drift-tube bore radius, also used by
     trajectories.is_drifttube_escape_candidate() for the domain-boundary
     escape check, so both checks agree on the same physical aperture.
+
+    NOTE: this is still the fixed-circle approximation (unlike
+    is_in_rod_opening, which is now derived from the real rod STL). If the
+    drift tube also turns out to be measurably off-axis, the same
+    compute_rod_opening_geometry() approach can be reused here.
     """
     p = np.asarray(p, dtype=float)
 
@@ -444,23 +537,57 @@ def is_in_drift_tube_aperture(
 
 def is_in_rod_opening(
     p,
+    owner: str,
     field: dict,
-    r_rod: float | None = None,
 ) -> bool:
     """
-    Check whether point is in the lower rod opening.
+    Check whether point p, known to lie on analytic shell `owner`, falls
+    within that shell's rod opening.
 
-    r_rod defaults to field["rod_opening_radius"] when present, and falls
-    back to 11 mm (0.011 m) otherwise.
+    Uses field["rod_openings"][owner] - precomputed once from the real rod
+    STL mesh via compute_rod_opening_geometry() - rather than a single
+    fixed radius=11mm circle centered at the origin. The real rod is
+    measurably off-axis (by several mm at some shells) and not perfectly
+    circular, so a shared fixed circle either clips real rod-bound
+    trajectories onto the grid/collector, or lets grid/collector-bound
+    trajectories slip through as if the rod were there - both of which look
+    exactly like "rod current is structurally too low, regardless of any
+    yield/transparency parameter", which is the symptom this was chasing.
+
+    Falls back to False (no opening - treat as solid) for a shell where no
+    rod-mesh samples were found nearby, and to the old fixed-circle
+    approximation only if field["rod_openings"] itself is entirely absent
+    (e.g. not yet computed for this field), to avoid silently breaking
+    existing setups.
     """
     p = np.asarray(p, dtype=float)
 
-    if r_rod is None:
+    rod_openings = (field or {}).get("rod_openings", None)
+
+    if rod_openings is None:
+        # Backward-compatible fallback: old fixed-circle approximation.
         r_rod = float((field or {}).get("rod_opening_radius", 0.011))
+        rho_xy = np.sqrt(p[0] ** 2 + p[1] ** 2)
+        return (rho_xy <= r_rod) and (p[2] <= 0.0)
 
-    rho_xy = np.sqrt(p[0]**2 + p[1]**2)
+    geom = rod_openings.get(owner, None)
 
-    return (rho_xy <= r_rod) and (p[2] <= 0.0)
+    if geom is None:
+        # No rod-mesh samples found near this shell -> rod doesn't cross
+        # it (or the sampling density was too low there) -> no opening.
+        return False
+
+    x0, y0 = geom["center_xy"]
+    r_eff = geom["radius"]
+    z_ref = geom["z_ref"]
+
+    rho = np.sqrt((p[0] - x0) ** 2 + (p[1] - y0) ** 2)
+
+    # A given (x, y) maps to two possible points on the sphere (+/- z);
+    # only the side where the rod actually crosses should count as open.
+    same_side = (p[2] <= 0.0) if z_ref <= 0.0 else (p[2] >= 0.0)
+
+    return (rho <= r_eff) and same_side
 
 
 def is_in_spherical_cap_opening(
@@ -509,7 +636,7 @@ def sphere_crossing_is_opening(
     if is_in_drift_tube_aperture(p, field):
         return True
 
-    if is_in_rod_opening(p, field):
+    if is_in_rod_opening(p, owner, field):
         return True
 
     # Side service/opening cap direction, matching notebook convention.
