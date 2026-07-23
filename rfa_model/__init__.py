@@ -59,7 +59,8 @@ from .accounting import (
 
 from .collisions import (
     build_stl_intersector,
-    build_stl_bounding_boxes
+    build_stl_bounding_boxes,
+    compute_rod_opening_geometry,
 )
 
 from .trajectories import unit
