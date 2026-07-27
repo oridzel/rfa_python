@@ -469,23 +469,10 @@ def integrate_one_electron(
         )
 
     for step in range(max_steps):
-        cls = classify_grid_point(p, field)
-
-        # Grid-shell AND collector-shell voxels are retained only as
-        # electrostatic boundary conditions. They are ignored as collision
-        # geometry. Physical crossings are handled exclusively by analytic
-        # segment-sphere tests at R_g1, R_g2, R_g3, and R_col below.
-        if cls["status"] == "hit_fixed":
-            owner_id = cls.get("owner_id", None)
-            owner = fixed_owner_name(owner_id, field=field)
-            if is_grid_shell_owner(owner) or owner == "collector_shell":
-                cls = {
-                    "status": "free",
-                    "i": cls.get("i"),
-                    "j": cls.get("j"),
-                    "k": cls.get("k"),
-                    "ignored_fixed_owner": owner,
-                }
+        # Use the same effective collision classification everywhere,
+        # including launch placement. Grid/collector shell voxels impose the
+        # field boundary but are not physical collision geometry.
+        cls = classify_effective_vacuum_point(p, field)
 
         if cls["status"] != "free":
             hit_info = dict(cls)
@@ -499,6 +486,10 @@ def integrate_one_electron(
                 hit_info["location"] = p.copy()
                 hit_info["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
                 hit_info["v_in"] = v.copy()
+                if len(traj) >= 2:
+                    hit_info["p_before"] = np.asarray(
+                        traj[-2], dtype=float
+                    ).copy()
 
                 # Grid-shell owners can never reach this point: they were
                 # already neutralized to "free" above, since grid crossing
@@ -660,6 +651,7 @@ def integrate_one_electron(
                 vel.append(v_new.copy())
                 hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
                 hit["v_in"] = np.asarray(v_new, dtype=float).copy()
+                hit["p_before"] = np.asarray(p, dtype=float).copy()
 
                 return {
                     "reason": "hit_stl",
@@ -772,6 +764,50 @@ def fixed_owner_name(owner_id, field=None):
         return field["owner_name_map"].get(owner_id, f"owner_{owner_id}")
 
     return f"owner_{owner_id}"
+
+
+IGNORED_FIXED_BOUNDARY_OWNERS = frozenset({
+    "g1_shell",
+    "g2_shell",
+    "g3_shell",
+    "collector_shell",
+})
+IGNORED_FIXED_BOUNDARY_OWNER_IDS = frozenset({9, 10, 11, 12})
+
+
+def classify_effective_vacuum_point(p, field):
+    """
+    Classify a point using the same collision rule as trajectory tracking.
+
+    The voxelized grid and collector shells are electrostatic boundary
+    conditions only.  They must not block a trajectory or a newly emitted
+    particle.  Physical STL owners, including g1frame/g2frame/g3frame, remain
+    solid.
+
+    The returned dictionary preserves the raw voxel classification and owner
+    so launch-failure diagnostics can distinguish an ignored analytic shell
+    from a real solid.
+    """
+    raw = dict(classify_grid_point(p, field))
+    owner_id = raw.get("owner_id", None)
+    owner_name = fixed_owner_name(owner_id, field=field)
+
+    effective = dict(raw)
+    effective["raw_status"] = raw.get("status", None)
+    effective["raw_owner_id"] = owner_id
+    effective["raw_owner_name"] = owner_name
+
+    if (
+        raw.get("status", None) == "hit_fixed"
+        and (
+            owner_name in IGNORED_FIXED_BOUNDARY_OWNERS
+            or owner_id in IGNORED_FIXED_BOUNDARY_OWNER_IDS
+        )
+    ):
+        effective["status"] = "free"
+        effective["ignored_fixed_owner"] = owner_name
+
+    return effective
 
 
 def is_grid_shell_owner(owner_name: str) -> bool:
@@ -928,6 +964,7 @@ def place_emitted_particle_in_vacuum(
     field,
     max_tries: int = 60,
     step_fraction_of_h: float = 0.10,
+    fallback_vacuum_point=None,
 ):
     """
     Find a free-vacuum launch point for a NEWLY EMITTED particle.
@@ -958,6 +995,10 @@ def place_emitted_particle_in_vacuum(
         in validation runs.
     step_fraction_of_h : float
         Step size as a fraction of h.
+    fallback_vacuum_point : array (3,), optional
+        Last known vacuum point before the surface hit.  If the surface-normal
+        search fails, retry toward this point.  This is a geometry-grounded
+        fallback for grazing STL hits and is safer than guessing with -v_in.
 
     Returns
     -------
@@ -975,20 +1016,69 @@ def place_emitted_particle_in_vacuum(
     h = float(field["h"])
     ds = step_fraction_of_h * h
 
-    cls = classify_grid_point(p, field)
+    cls = classify_effective_vacuum_point(p, field)
 
-    for _ in range(max_tries):
-        p = p + ds * n_vac
-        cls = classify_grid_point(p, field)
+    for attempt in range(1, max_tries + 1):
+        p = np.asarray(r_hit, dtype=float) + attempt * ds * n_vac
+        cls = classify_effective_vacuum_point(p, field)
 
         if cls["status"] == "free":
+            cls = dict(cls)
+            cls.update({
+                "placement_method": "solid_vacuum_normal_search",
+                "placement_attempts": attempt,
+                "placement_offset_m": float(np.linalg.norm(
+                    p - np.asarray(r_hit, dtype=float)
+                )),
+            })
             return p, cls, True
 
         # Stepped outside the field entirely — give up immediately.
         if cls["status"] in {"left_grid", "left_update_region"}:
-            return p, cls, False
+            break
+
+    # A real STL face normal can be poorly oriented or nearly tangential for
+    # overlapping/non-manifold geometry.  The preceding trajectory point is
+    # known to be on the incident vacuum side, so it provides a safe fallback.
+    if fallback_vacuum_point is not None:
+        p_prev = np.asarray(fallback_vacuum_point, dtype=float)
+        fallback_vec = p_prev - np.asarray(r_hit, dtype=float)
+        fallback_norm = float(np.linalg.norm(fallback_vec))
+
+        if np.all(np.isfinite(p_prev)) and fallback_norm > 0.0:
+            fallback_dir = fallback_vec / fallback_norm
+
+            for attempt in range(1, max_tries + 1):
+                p = (
+                    np.asarray(r_hit, dtype=float)
+                    + attempt * ds * fallback_dir
+                )
+                cls = classify_effective_vacuum_point(p, field)
+
+                if cls["status"] == "free":
+                    cls = dict(cls)
+                    cls.update({
+                        "placement_method":
+                            "solid_previous_vacuum_point_search",
+                        "placement_attempts": attempt,
+                        "placement_offset_m": float(np.linalg.norm(
+                            p - np.asarray(r_hit, dtype=float)
+                        )),
+                    })
+                    return p, cls, True
+
+                if cls["status"] in {"left_grid", "left_update_region"}:
+                    break
 
     # Exhausted all tries without finding free vacuum.
+    cls = dict(cls)
+    cls.update({
+        "placement_method": "failed_solid_launch_searches",
+        "placement_attempts": max_tries,
+        "placement_offset_m": float(np.linalg.norm(
+            p - np.asarray(r_hit, dtype=float)
+        )),
+    })
     return p, cls, False
 
 

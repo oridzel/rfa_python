@@ -33,9 +33,8 @@ import pandas as pd
 from .constants import kinetic_energy_eV_from_velocity
 from .trajectories import (
     unit,
-    classify_grid_point,
+    classify_effective_vacuum_point,
     integrate_one_electron,
-    advance_until_free,
     place_emitted_particle_in_vacuum,
 )
 from .primary import (
@@ -190,6 +189,7 @@ def make_emissions_safe_to_launch(
     Phi_interp=None,
     surface_name: str | None = None,
     n_vacuum=None,
+    fallback_vacuum_point=None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Place newly emitted electrons in a free-vacuum voxel.
@@ -247,30 +247,26 @@ def make_emissions_safe_to_launch(
             # fixed grid-shell voxels.
             launch_eps = max(1.0e-9, 1.0e-3 * float(field["h"]))
             p_safe = r_hit + launch_eps * direction
-            cls = dict(classify_grid_point(p_safe, field))
+            cls = dict(classify_effective_vacuum_point(p_safe, field))
             cls.update({
                 "placement_method": "analytic_grid_along_emission_direction",
                 "placement_attempts": 1,
                 "placement_offset_m": launch_eps,
             })
-            success = cls["status"] not in {
-                "left_grid", "left_update_region"
-            }
+            success = cls["status"] == "free"
 
         elif surface in analytic_collector_surfaces:
             # The collector's vacuum side is radially inward. Its fixed shell
             # also exists only to impose the electrostatic boundary.
             launch_eps = max(1.0e-9, 1.0e-3 * float(field["h"]))
             p_safe = r_hit + launch_eps * unit(n_vacuum)
-            cls = dict(classify_grid_point(p_safe, field))
+            cls = dict(classify_effective_vacuum_point(p_safe, field))
             cls.update({
                 "placement_method": "analytic_collector_vacuum_normal",
                 "placement_attempts": 1,
                 "placement_offset_m": launch_eps,
             })
-            success = cls["status"] not in {
-                "left_grid", "left_update_region"
-            }
+            success = cls["status"] == "free"
 
         else:
             # For sample, holder, receiver, rod, drift tube, and frames, the
@@ -283,6 +279,7 @@ def make_emissions_safe_to_launch(
                 field=field,
                 max_tries=max_advance_tries,
                 step_fraction_of_h=normal_step_fraction,
+                fallback_vacuum_point=fallback_vacuum_point,
             )
             cls = dict(cls)
             cls.setdefault("placement_method", "solid_vacuum_normal_search")
@@ -396,6 +393,9 @@ def generate_cascade_emissions_from_hit(
         Phi_interp=Phi_interp,
         surface_name=surface_name,
         n_vacuum=n_out,   # n_out points from the surface into vacuum
+        fallback_vacuum_point=(
+            None if hit_info is None else hit_info.get("p_before", None)
+        ),
     )
 
     return safe_emissions, failed_emissions
@@ -535,6 +535,18 @@ def run_one_primary_with_cascade(
             "launch_grid_status": failed.get(
                 "launch_grid_classification", {}
             ).get("status", None),
+            "launch_raw_grid_status": failed.get(
+                "launch_grid_classification", {}
+            ).get("raw_status", None),
+            "launch_raw_owner_id": failed.get(
+                "launch_grid_classification", {}
+            ).get("raw_owner_id", None),
+            "launch_raw_owner_name": failed.get(
+                "launch_grid_classification", {}
+            ).get("raw_owner_name", None),
+            "launch_ignored_fixed_owner": failed.get(
+                "launch_grid_classification", {}
+            ).get("ignored_fixed_owner", None),
             "launch_placement_method": failed.get(
                 "launch_placement_method", None
             ),
@@ -756,6 +768,18 @@ def run_one_primary_with_cascade(
                 "launch_grid_status": failed.get(
                     "launch_grid_classification", {}
                 ).get("status", None),
+                "launch_raw_grid_status": failed.get(
+                    "launch_grid_classification", {}
+                ).get("raw_status", None),
+                "launch_raw_owner_id": failed.get(
+                    "launch_grid_classification", {}
+                ).get("raw_owner_id", None),
+                "launch_raw_owner_name": failed.get(
+                    "launch_grid_classification", {}
+                ).get("raw_owner_name", None),
+                "launch_ignored_fixed_owner": failed.get(
+                    "launch_grid_classification", {}
+                ).get("ignored_fixed_owner", None),
                 "launch_placement_method": failed.get(
                     "launch_placement_method", None
                 ),
