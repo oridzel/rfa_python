@@ -33,6 +33,7 @@ import pandas as pd
 from .constants import kinetic_energy_eV_from_velocity
 from .trajectories import (
     unit,
+    classify_grid_point,
     integrate_one_electron,
     advance_until_free,
     place_emitted_particle_in_vacuum,
@@ -193,11 +194,12 @@ def make_emissions_safe_to_launch(
     """
     Place newly emitted electrons in a free-vacuum voxel.
 
-    Every particle passed to this function is a NEW surface emission, so its
-    launch position is displaced along the vacuum-side surface normal.  The
-    sampled emission velocity is preserved.  Velocity-directed stepping is
-    reserved for already-travelling electrons transmitted through grid shells
-    inside integrate_one_electron().
+    Solid-surface emissions are displaced along the vacuum-side surface
+    normal until a free voxel is reached. Analytic grid-wire emissions use a
+    tiny displacement along their own sampled direction so forward and
+    backward emission are both preserved. Analytic collector emissions use a
+    tiny displacement along the inward vacuum normal. Grid/collector fixed
+    voxels are field boundary conditions, not collision geometry.
 
     Returns
     -------
@@ -213,6 +215,12 @@ def make_emissions_safe_to_launch(
     failed: list[dict] = []
 
     r_hit = np.asarray(r_hit, dtype=float)
+    surface = canonical_surface_name(surface_name)
+    analytic_grid_surfaces = {
+        "g1_shell", "g2_shell", "g3_shell",
+        "g1mesh", "g2mesh", "g3mesh",
+    }
+    analytic_collector_surfaces = {"collector", "collector_shell"}
 
     if n_vacuum is None:
         raise ValueError(
@@ -232,32 +240,57 @@ def make_emissions_safe_to_launch(
         v0 = np.asarray(e["v0"], dtype=float)
         direction = unit(v0)
 
-        # Use THIS emission's own travel direction to search for a free
-        # vacuum voxel, not the shared macroscopic surface normal n_vacuum.
-        #
-        # For sample/collector/holder/etc. emissions this is nearly
-        # equivalent to n_vacuum, since those emissions are hemisphere-
-        # clamped around n_out anyway. For grid-wire emissions, however,
-        # theta is sampled over the full 0-180 deg range relative to the
-        # beam axis (see samplers.generate_surface_emissions), so v0 can
-        # point tangentially, backward, or forward through the mesh -
-        # directions that can differ substantially from the shared radial
-        # shell normal. Stepping every emission from a hit along one fixed
-        # n_vacuum can push wide-angle emissions to the wrong side of the
-        # mesh or back toward the fixed-potential grid-shell voxels.
-        launch_direction = direction if np.all(np.isfinite(direction)) else unit(n_vacuum)
+        if surface in analytic_grid_surfaces:
+            # A wire is represented by a zero-thickness analytic sphere
+            # during tracking. Preserve the sampled forward/backward side and
+            # do not demand that the launch point clear the field-solver's
+            # fixed grid-shell voxels.
+            launch_eps = max(1.0e-9, 1.0e-3 * float(field["h"]))
+            p_safe = r_hit + launch_eps * direction
+            cls = dict(classify_grid_point(p_safe, field))
+            cls.update({
+                "placement_method": "analytic_grid_along_emission_direction",
+                "placement_attempts": 1,
+                "placement_offset_m": launch_eps,
+            })
+            success = cls["status"] not in {
+                "left_grid", "left_update_region"
+            }
 
-        p_safe, cls, success = place_emitted_particle_in_vacuum(
-            r_hit=r_hit,
-            n_vacuum=launch_direction,
-            field=field,
-            max_tries=max_advance_tries,
-            step_fraction_of_h=normal_step_fraction,
-        )
+        elif surface in analytic_collector_surfaces:
+            # The collector's vacuum side is radially inward. Its fixed shell
+            # also exists only to impose the electrostatic boundary.
+            launch_eps = max(1.0e-9, 1.0e-3 * float(field["h"]))
+            p_safe = r_hit + launch_eps * unit(n_vacuum)
+            cls = dict(classify_grid_point(p_safe, field))
+            cls.update({
+                "placement_method": "analytic_collector_vacuum_normal",
+                "placement_attempts": 1,
+                "placement_offset_m": launch_eps,
+            })
+            success = cls["status"] not in {
+                "left_grid", "left_update_region"
+            }
+
+        else:
+            # For sample, holder, receiver, rod, drift tube, and frames, the
+            # fixed/STL geometry is physical. Move along the known vacuum-side
+            # normal; using a tangential sampled velocity can remain trapped
+            # in the solid for the full search distance.
+            p_safe, cls, success = place_emitted_particle_in_vacuum(
+                r_hit=r_hit,
+                n_vacuum=n_vacuum,
+                field=field,
+                max_tries=max_advance_tries,
+                step_fraction_of_h=normal_step_fraction,
+            )
+            cls = dict(cls)
+            cls.setdefault("placement_method", "solid_vacuum_normal_search")
 
         e["raw_hit_location"] = r_hit.copy()
         e["launch_offset_m"] = float(np.linalg.norm(p_safe - r_hit))
         e["launch_grid_classification"] = cls
+        e["launch_placement_method"] = cls.get("placement_method", None)
 
         if not success:
             e["launch_failed"] = True
@@ -502,6 +535,9 @@ def run_one_primary_with_cascade(
             "launch_grid_status": failed.get(
                 "launch_grid_classification", {}
             ).get("status", None),
+            "launch_placement_method": failed.get(
+                "launch_placement_method", None
+            ),
         })
 
     for e in first_emissions:
@@ -720,6 +756,9 @@ def run_one_primary_with_cascade(
                 "launch_grid_status": failed.get(
                     "launch_grid_classification", {}
                 ).get("status", None),
+                "launch_placement_method": failed.get(
+                    "launch_placement_method", None
+                ),
             })
 
         for child in child_emissions:

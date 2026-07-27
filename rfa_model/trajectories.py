@@ -455,7 +455,6 @@ def integrate_one_electron(
     traj = [p.copy()]
     vel = [v.copy()]
     grid_events = []
-    events = []
     
     ignore_sphere_owners = set()
     
@@ -651,7 +650,8 @@ def integrate_one_electron(
                     "hit_info": hit,
                     "traj": np.asarray(traj),
                     "vel": np.asarray(vel),
-                    "events": events,
+                    "grid_events": grid_events,
+                    "events": grid_events,
                     "steps": step + 1,
                 }
 
@@ -666,7 +666,8 @@ def integrate_one_electron(
                     "hit_info": hit,
                     "traj": np.asarray(traj),
                     "vel": np.asarray(vel),
-                    "events": events,
+                    "grid_events": grid_events,
+                    "events": grid_events,
                     "steps": step + 1,
                 }
 
@@ -685,7 +686,8 @@ def integrate_one_electron(
                         "hit_info": hit,
                         "traj": np.asarray(traj),
                         "vel": np.asarray(vel),
-                        "events": events,
+                        "grid_events": grid_events,
+                        "events": grid_events,
                         "steps": step + 1,
                     }
 
@@ -705,15 +707,16 @@ def integrate_one_electron(
                             "hit_info": hit,
                             "traj": np.asarray(traj),
                             "vel": np.asarray(vel),
-                            "events": events,
+                            "grid_events": grid_events,
+                            "events": grid_events,
                             "steps": step + 1,
                         }
 
-                    events.append({
+                    grid_events.append({
                         "type": "transmit_grid",
                         "owner": owner,
                         "location": hit["location"],
-                        "steps": step,
+                        "step": step,
                         "u": u,
                         "T": T,
                     })
@@ -748,7 +751,8 @@ def integrate_one_electron(
         "hit_info": None,
         "traj": np.asarray(traj),
         "vel": np.asarray(vel),
-        "events": events,
+        "grid_events": grid_events,
+        "events": grid_events,
         "steps": max_steps,
     }
 
