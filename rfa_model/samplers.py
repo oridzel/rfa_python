@@ -57,6 +57,21 @@ COLLECTOR_SURFACES = {
     "collector_shell",
 }
 
+# Measured normal-incidence yields for the carbon coating on stainless steel.
+#
+# TEY is the arithmetic mean of all three 2026-07-28 measurements.
+# BSEY is the arithmetic mean of measurements 1 and 2; measurement 3 was
+# excluded from the BSEY average because of its isolated 400 eV outlier.
+# SEY in the CSV is calculated consistently as TEY_mean_1_to_3 -
+# BSEY_mean_1_to_2.
+MEASURED_CARBON_BSEY_FILENAME = "BSEYFromPlane_measured_C_on_SS.csv"
+MEASURED_CARBON_SEY_FILENAME = "SEYFromPlane_measured_C_on_SS.csv"
+
+MEASURED_CARBON_SOURCE = (
+    "C-on-SS measured 2026-07-28: TEY mean runs 1-3; "
+    "BSEY mean runs 1-2; SEY=TEY-BSEY"
+)
+
 
 def canonical_surface_name_for_sey(surface_name):
     if surface_name is None:
@@ -324,6 +339,7 @@ def load_theta_sampler_csv(path: str | Path) -> dict:
 def load_default_surface_models(
     model_dir: str | Path,
     bronstein_dir: str | Path | None = None,
+    use_measured_carbon_coating: bool = True,
 ) -> tuple[dict, dict, dict]:
     """
     Load the same surface models used in the MATLAB setup.
@@ -335,6 +351,12 @@ def load_default_surface_models(
     bronstein_dir:
         Directory containing Bronstein Mo/Ti yield files.
         If None, uses model_dir.
+    use_measured_carbon_coating:
+        If True (default), use the measured C-on-SS yield curves for the
+        collector, rod, and drift tube. Their emitted-energy and angle
+        distributions remain the JMONSEL thick-glassy-carbon distributions.
+        Below 150 eV, the JMONSEL shape is scaled to join the measured curve
+        continuously, with a zero-yield anchor at 0 eV.
 
     Returns
     -------
@@ -396,6 +418,35 @@ def load_default_surface_models(
         "SE": energy_models["sample"]["SE"],
     }
 
+    collector_bsey_jmonsel = load_yield_curve_csv(
+        model_dir / "BSEYFromPlane_glassyCarbon_t150000nmCuFPA.csv"
+    )
+    collector_sey_jmonsel = load_yield_curve_csv(
+        model_dir / "SEYFromPlane_glassyCarbon_t150000nmCuFPA.csv"
+    )
+
+    if use_measured_carbon_coating:
+        measured_carbon_bsey = load_yield_curve_csv(
+            model_dir / MEASURED_CARBON_BSEY_FILENAME
+        )
+        measured_carbon_sey = load_yield_curve_csv(
+            model_dir / MEASURED_CARBON_SEY_FILENAME
+        )
+
+        collector_bsey = _make_measured_carbon_hybrid_curve(
+            jmonsel_model=collector_bsey_jmonsel,
+            measured_model=measured_carbon_bsey,
+            yield_kind="BSEY",
+        )
+        collector_sey = _make_measured_carbon_hybrid_curve(
+            jmonsel_model=collector_sey_jmonsel,
+            measured_model=measured_carbon_sey,
+            yield_kind="SEY",
+        )
+    else:
+        collector_bsey = collector_bsey_jmonsel
+        collector_sey = collector_sey_jmonsel
+
     yield_models = {
         "sample": {
             "BSEY": load_yield_curve_csv(model_dir / "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
@@ -414,12 +465,89 @@ def load_default_surface_models(
             "SEY": load_yield_curve_csv(model_dir / "SEYFromWire_glassyCarbon_t70nmWFPA.csv"),
         },
         "collector": {
-            "BSEY": load_yield_curve_csv(model_dir / "BSEYFromPlane_glassyCarbon_t150000nmCuFPA.csv"),
-            "SEY": load_yield_curve_csv(model_dir / "SEYFromPlane_glassyCarbon_t150000nmCuFPA.csv"),
+            "BSEY": collector_bsey,
+            "SEY": collector_sey,
         },
     }
 
     return yield_models, energy_models, theta_models
+
+
+def _make_measured_carbon_hybrid_curve(
+    jmonsel_model: dict,
+    measured_model: dict,
+    yield_kind: str,
+) -> dict:
+    """
+    Build the collector-family yield curve used by the cascade model.
+
+    The measured table is used from 150 eV through 10 keV. Below 150 eV,
+    the original JMONSEL curve is scaled to meet the measured 150 eV value.
+    A (0 eV, 0) anchor avoids holding the first JMONSEL value constant all
+    the way to zero incident energy.
+    """
+    measured_E = np.asarray(measured_model["E"], dtype=float)
+    measured_y = np.asarray(measured_model["Y"], dtype=float)
+
+    if (
+        measured_E.ndim != 1
+        or measured_y.ndim != 1
+        or measured_E.size != measured_y.size
+        or measured_E.size < 2
+    ):
+        raise ValueError(
+            f"Invalid measured carbon {yield_kind} table"
+        )
+    if not np.all(np.diff(measured_E) > 0.0):
+        raise ValueError(
+            f"Measured carbon {yield_kind} energies must be strictly increasing"
+        )
+    if not np.isclose(measured_E[0], 150.0):
+        raise ValueError(
+            f"Measured carbon {yield_kind} table must begin at 150 eV"
+        )
+    if measured_E[-1] < 10000.0:
+        raise ValueError(
+            f"Measured carbon {yield_kind} table must extend to 10000 eV"
+        )
+
+    jE = np.asarray(jmonsel_model["E"], dtype=float)
+    jY = np.asarray(jmonsel_model["Y"], dtype=float)
+
+    join_energy_eV = float(measured_E[0])
+    y_jmonsel_at_150 = float(np.interp(join_energy_eV, jE, jY))
+    if not np.isfinite(y_jmonsel_at_150) or y_jmonsel_at_150 <= 0.0:
+        raise ValueError(
+            f"Cannot scale JMONSEL {yield_kind} below 150 eV"
+        )
+
+    scale = float(measured_y[0]) / y_jmonsel_at_150
+    low_mask = (jE > 0.0) & (jE < join_energy_eV)
+    low_E = jE[low_mask]
+    low_Y = scale * jY[low_mask]
+
+    E = np.concatenate((
+        np.array([0.0]),
+        low_E,
+        measured_E,
+    ))
+    Y = np.concatenate((
+        np.array([0.0]),
+        low_Y,
+        measured_y,
+    ))
+
+    return {
+        "E": E,
+        "Y": Y,
+        "source": MEASURED_CARBON_SOURCE,
+        "yield_kind": str(yield_kind),
+        "measured_energy_min_eV": float(measured_E[0]),
+        "measured_energy_max_eV": float(measured_E[-1]),
+        "low_energy_model": "scaled JMONSEL shape with zero-energy anchor",
+        "jmonsel_scale_below_150_eV": scale,
+        "allow_collector_BSE_mult": False,
+    }
 
 
 # ============================================================
@@ -603,10 +731,25 @@ def sample_surface_event(
         )
     
     if fam == "collector":
-        bsey_val *= bse_multiplier_for_surface(
-            surface_name=surface_name,
-            collector_BSE_mult=collector_BSE_mult,
+        allow_multiplier = bool(
+            bsey_mdl.get("allow_collector_BSE_mult", True)
         )
+
+        if not allow_multiplier:
+            requested_mult = (
+                1.0 if collector_BSE_mult is None
+                else float(collector_BSE_mult)
+            )
+            if not np.isclose(requested_mult, 1.0):
+                raise ValueError(
+                    "collector_BSE_mult must be 1.0 when using the measured "
+                    "carbon-coating BSEY table"
+                )
+        else:
+            bsey_val *= bse_multiplier_for_surface(
+                surface_name=surface_name,
+                collector_BSE_mult=collector_BSE_mult,
+            )
     
     sey_val = max(0.0, float(sey_val))
     bsey_val = max(0.0, min(float(bsey_val), 0.99))

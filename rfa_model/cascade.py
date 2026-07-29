@@ -1137,6 +1137,31 @@ def run_cascade_batch_parallel(
     if collector_BSE_mult is None:
         collector_BSE_mult = 1.0
 
+    collector_bsey_model = (
+        yield_models.get("collector", {}).get("BSEY", {})
+    )
+    if (
+        not collector_bsey_model.get(
+            "allow_collector_BSE_mult", True
+        )
+        and not np.isclose(float(collector_BSE_mult), 1.0)
+    ):
+        raise ValueError(
+            "collector_BSE_mult must be 1.0 when using the measured "
+            "carbon-coating BSEY table"
+        )
+
+    yield_model_sources = {}
+    for family, family_models in yield_models.items():
+        yield_model_sources[family] = {}
+        for yield_kind, model in family_models.items():
+            if isinstance(model, dict):
+                yield_model_sources[family][yield_kind] = model.get(
+                    "source", "legacy table"
+                )
+            else:
+                yield_model_sources[family][yield_kind] = "unknown"
+
     t0 = time.perf_counter()
 
     rng = np.random.default_rng(seed)
@@ -1333,6 +1358,7 @@ def run_cascade_batch_parallel(
         "grid_transparency": grid_transparency,
         "grid_SEY_mult": grid_SEY_mult,
         "collector_BSE_mult": collector_BSE_mult,
+        "yield_model_sources": yield_model_sources,
 
         "max_generation": max_generation,
         "max_total_electrons_per_primary": max_total_electrons_per_primary,
