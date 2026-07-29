@@ -331,7 +331,13 @@ def mark_mesh_voxels_by_voxelized(
 
     t0 = time.perf_counter()
 
-    vox = mesh.voxelized(pitch=pitch)
+    if owner_name == "drifttube":
+        vox = mesh.voxelized(
+            pitch=pitch,
+            method="ray",
+        )
+    else:
+        vox = mesh.voxelized(pitch=pitch)
     points = np.asarray(vox.points, dtype=float)
 
     _log(
@@ -542,6 +548,7 @@ def mark_analytic_rfa_surfaces(
     R_g3: float,
     R_col: float,
     shell_thickness: float | None = None,
+    include_analytic_drifttube=True,
     verbose: bool = False,
 ) -> dict:
     """
@@ -567,18 +574,20 @@ def mark_analytic_rfa_surfaces(
         R_g2=R_g2,
         R_g3=R_g3,
         R_col=R_col,
+        include_drifttube=include_analytic_drifttube,
     )
 
     _log(verbose, "Assigning analytic fixed-potential boundaries ...")
 
     n_before = int(np.count_nonzero(field["fixed"]))
 
-    _set_fixed_mask(
-        field,
-        field["drift_bc"],
-        voltage=float(voltages.get("Vdt", 0.0)),
-        owner_name="drifttube",
-    )
+    if include_analytic_drifttube:
+        _set_fixed_mask(
+            field,
+            field["drift_bc"],
+            voltage=float(voltages.get("Vdt", 0.0)),
+            owner_name="drifttube",
+        )
 
     _set_fixed_mask(
         field,
@@ -648,6 +657,7 @@ def make_analytic_rfa_boundary_masks(
     r_rod: float = 0.011,
     r_dt_i: float = 4.3e-3,
     t_dt: float = 0.25e-3,
+    include_drifttube=True,
 ) -> dict:
     """
     Create and store analytic RFA boundary masks.
@@ -763,11 +773,14 @@ def make_analytic_rfa_boundary_masks(
     in_range = (X >= x_dt_near - 5.0 * h) & (X <= x_dt_far)
     dt_band_bc = max(t_dt, 2.0 * h)
 
-    drift_bc = (
-        in_range
-        & (rho_yz >= r_dt_i)
-        & (rho_yz <= r_dt_i + dt_band_bc)
-    )
+    if include_drifttube:
+        drift_bc = (
+            in_range
+            & (rho_yz >= r_dt_i)
+            & (rho_yz <= r_dt_i + dt_band_bc)
+        )
+    else:
+        drift_bc = np.zeros(full_shape, dtype=bool)
 
     # Broadcast/copy to real full-size boolean arrays.
     g1_bdry = np.broadcast_to(g1_bdry, full_shape).copy()
@@ -1535,6 +1548,24 @@ def build_rfa_field(
 
     _log(verbose, "\n[5/7] Marking analytic grid/collector shells ...")
 
+    has_drifttube_stl = (
+        meshes is not None
+        and "drifttube" in meshes
+        and meshes["drifttube"] is not None
+    )
+
+    field["drifttube_geometry"] = (
+        "stl" if has_drifttube_stl else "analytic"
+    )
+
+    if has_drifttube_stl:
+        field["drifttube_bounds_m"] = meshes["drifttube"].bounds.copy()
+        field["drifttube_nose_x_m"] = float(
+            meshes["drifttube"].bounds[0, 0]
+        )
+    else:
+        field["drifttube_nose_x_m"] = 0.047
+
     mark_analytic_rfa_surfaces(
         field,
         voltages=voltages,
@@ -1542,6 +1573,7 @@ def build_rfa_field(
         R_g2=R_g2,
         R_g3=R_g3,
         R_col=R_col,
+        include_analytic_drifttube=not has_drifttube_stl,
         verbose=verbose,
     )
     

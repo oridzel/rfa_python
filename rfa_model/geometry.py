@@ -347,7 +347,17 @@ def load_and_align_sample_assembly(
     sample_parts:
         The Part definitions used for loading.
     """
-    sample_parts = default_sample_parts()
+    drifttube_part = Part(
+        name="drifttube",
+        filename="Drift tube gh.stl",
+        rotation=Ry(90.0),                     # raw +z → model +x
+        translation=np.array([0.047, 0.0, 0.0]),
+        center=False,
+        scale=1e-3,
+        voltage=0.0,
+        color="cornflowerblue",
+    )
+    sample_parts = default_sample_parts() + [drifttube_part]
     meshes = load_parts(sample_parts, stl_dir)
     meshes = apply_rfa_alignment(meshes, alpha_deg=alpha_deg)
 
@@ -669,6 +679,9 @@ def build_collision_mesh_dict(
         "g3_low_frame": frame_meshes["g3_low_frame"],
         "g3_upper_frame": frame_meshes["g3_upper_frame"],
     })
+
+    if "drifttube" in meshes:
+        collision_meshes["drifttube"] = meshes["drifttube"]
 
     return collision_meshes
 
