@@ -504,6 +504,166 @@ def compute_rod_opening_geometry(
     return openings
 
 
+def compute_drifttube_bore_geometry(
+    dt_mesh,
+    x_domain_max: float,
+    band_thickness_m: float = 1.0e-3,
+    n_samples: int = 200_000,
+    probe_fractions=(0.30, 0.50, 0.70),
+    seed: int = 0,
+):
+    """
+    Derive the drift tube's real bore radius, axis offset, and exit plane
+    directly from its STL mesh.
+
+    This replaces the fixed on-axis 5.6 mm circle that
+    is_in_drift_tube_aperture() and trajectories.is_drifttube_escape_candidate()
+    both fell back on. Now that the drift tube is real collision geometry, the
+    analytic escape aperture and the STL must describe the same bore, otherwise
+    an electron can be judged "escaped" through a nominal circle that the real
+    tube wall would actually have intercepted (or vice versa).
+
+    Method (mirrors compute_rod_opening_geometry): area-weighted surface points
+    are sampled from the whole mesh, then thin YZ slabs are taken at several
+    interior x positions. Mesh VERTICES are not used, because a coarse tube mesh
+    can easily have no vertices inside a thin slab even though faces clearly
+    cross it. Interior probe planes are used rather than the ends so that end
+    caps or flanges cannot contaminate the inner-wall radius estimate.
+
+    In each slab the radii cluster at the inner wall and the outer wall. The
+    inner cluster is isolated with a midpoint threshold, its centroid gives the
+    bore axis offset, and the median of its radii gives the bore radius. The
+    median is robust to the handful of stray points a triangulated fillet or
+    chamfer contributes.
+
+    Parameters
+    ----------
+    dt_mesh:
+        The drift tube's trimesh.Trimesh, already aligned into RFA coordinates
+        (e.g. collision_meshes_emit["drifttube"]). If None, returns None.
+    x_domain_max:
+        Largest x of the field/update domain, i.e. field["x"][-1]. The escape
+        plane is the smaller of the tube's own +X end and this value, since an
+        electron cannot be tracked past the domain edge.
+    band_thickness_m:
+        Half-thickness of each YZ slab used to sample the bore.
+    n_samples:
+        Number of area-weighted surface samples over the whole mesh.
+    probe_fractions:
+        Fractional positions along the tube's x-span at which to probe the bore.
+        The median across probes is returned, so a locally odd slab cannot skew
+        the result.
+
+    Returns
+    -------
+    dict with:
+        center_yz    (y0, z0) bore axis offset from the RFA axis, metres
+        radius       bore radius, metres
+        x_min, x_max the tube's own x extent, metres
+        x_exit       escape plane, min(x_max, x_domain_max), metres
+        n_probes     how many probe planes yielded a usable inner-wall cluster
+        source       provenance string for logging
+    or None if dt_mesh is None or no probe plane yielded a usable cluster,
+    in which case callers fall back to the legacy on-axis circle.
+    """
+    if dt_mesh is None:
+        return None
+
+    import trimesh
+
+    rng = np.random.default_rng(seed)
+    pts, _ = trimesh.sample.sample_surface(dt_mesh, n_samples, seed=rng)
+    pts = np.asarray(pts, dtype=float)
+
+    x_lo = float(pts[:, 0].min())
+    x_hi = float(pts[:, 0].max())
+    span = x_hi - x_lo
+
+    if not np.isfinite(span) or span <= 0.0:
+        return None
+
+    radii = []
+    centers = []
+
+    for frac in probe_fractions:
+        x_probe = x_lo + float(frac) * span
+        slab = pts[np.abs(pts[:, 0] - x_probe) < band_thickness_m]
+
+        if len(slab) < 50:
+            continue
+
+        # Provisional centre, then isolate the inner-wall cluster.
+        y0 = float(np.mean(slab[:, 1]))
+        z0 = float(np.mean(slab[:, 2]))
+        rho = np.hypot(slab[:, 1] - y0, slab[:, 2] - z0)
+
+        r_in_guess = float(np.percentile(rho, 2.0))
+        r_out_guess = float(np.percentile(rho, 98.0))
+
+        if not np.isfinite(r_in_guess) or r_out_guess <= 0.0:
+            continue
+
+        inner = slab[rho < 0.5 * (r_in_guess + r_out_guess)]
+
+        if len(inner) < 20:
+            continue
+
+        # Refine the axis on the inner wall only, then measure the bore.
+        y1 = float(np.mean(inner[:, 1]))
+        z1 = float(np.mean(inner[:, 2]))
+        rho_inner = np.hypot(inner[:, 1] - y1, inner[:, 2] - z1)
+
+        radii.append(float(np.median(rho_inner)))
+        centers.append((y1, z1))
+
+    if not radii:
+        return None
+
+    radius = float(np.median(radii))
+    y_c = float(np.median([c[0] for c in centers]))
+    z_c = float(np.median([c[1] for c in centers]))
+
+    return {
+        "center_yz": (y_c, z_c),
+        "radius": radius,
+        "x_min": x_lo,
+        "x_max": x_hi,
+        "x_exit": float(min(x_hi, float(x_domain_max))),
+        "n_probes": int(len(radii)),
+        "source": "drift tube STL, area-weighted interior slabs",
+    }
+
+
+def drifttube_bore_from_field(field: dict | None):
+    """
+    Return field["drifttube_bore"] if it looks usable, else None.
+
+    Centralises the "do we have real bore geometry?" test so the aperture check
+    and the escape check cannot disagree about which representation is active.
+    """
+    if not isinstance(field, dict):
+        return None
+
+    bore = field.get("drifttube_bore", None)
+
+    if not isinstance(bore, dict):
+        return None
+
+    try:
+        radius = float(bore["radius"])
+        y0, z0 = bore["center_yz"]
+        float(y0)
+        float(z0)
+        float(bore["x_exit"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if not np.isfinite(radius) or radius <= 0.0:
+        return None
+
+    return bore
+
+
 def is_in_drift_tube_aperture(
     p,
     field: dict,
@@ -514,20 +674,31 @@ def is_in_drift_tube_aperture(
 
     The drift-tube aperture is near +X and has radius r_hole in the YZ plane.
 
-    r_hole defaults to field["drifttube_aperture_radius"] when present, and
-    falls back to 5.6 mm (0.0056 m) otherwise. This is the single source of
-    truth for the drift-tube bore radius, also used by
-    trajectories.is_drifttube_escape_candidate() for the domain-boundary
-    escape check, so both checks agree on the same physical aperture.
+    Preferred path: field["drifttube_bore"], derived from the real drift-tube
+    STL by compute_drifttube_bore_geometry(). That supplies both the bore radius
+    and its actual offset from the RFA axis, so an off-axis tube is handled the
+    same way is_in_rod_opening() already handles the off-axis rod.
 
-    NOTE: this is still the fixed-circle approximation (unlike
-    is_in_rod_opening, which is now derived from the real rod STL). If the
-    drift tube also turns out to be measurably off-axis, the same
-    compute_rod_opening_geometry() approach can be reused here.
+    Legacy path: field["drifttube_aperture_radius"], falling back to 5.6 mm,
+    treated as a circle centred exactly on the axis. Kept so that setups which
+    have not yet called compute_drifttube_bore_geometry() still run unchanged.
+
+    An explicit r_hole argument always wins, and is always interpreted on-axis.
+
+    trajectories.is_drifttube_escape_candidate() resolves the geometry through
+    the same helper, so both checks always describe the same physical bore.
     """
     p = np.asarray(p, dtype=float)
 
     if r_hole is None:
+        bore = drifttube_bore_from_field(field)
+
+        if bore is not None:
+            y0, z0 = bore["center_yz"]
+            rho_yz = float(np.hypot(p[1] - float(y0), p[2] - float(z0)))
+
+            return (p[0] > 0.0) and (rho_yz <= float(bore["radius"]))
+
         r_hole = float((field or {}).get("drifttube_aperture_radius", 0.0056))
 
     rho_yz = np.sqrt(p[1]**2 + p[2]**2)

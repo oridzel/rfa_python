@@ -57,6 +57,36 @@ COLLECTOR_SURFACES = {
     "collector_shell",
 }
 
+# Analytic zero-thickness spheres standing in for the woven wire mesh.
+#
+# These are the ONLY surfaces excluded from the incidence-angle yield law.
+# Two independent reasons:
+#   1. The normal used for a mesh hit is the sphere's radial direction, which
+#      is not the local normal of a wire. The true incidence angle on the wire
+#      depends on where around the wire circumference the electron lands, and
+#      that information does not exist in the analytic-sphere representation.
+#   2. The grid yield curves are JMONSEL "FromWire" tables, which already
+#      average over wire geometry. Applying a secant law on top would
+#      double-count the geometric enhancement.
+#
+# Grid FRAMES are NOT in this set: they are real STL solids with genuine face
+# normals from collisions.py, so they take the angular law like any other solid.
+ANALYTIC_MESH_SURFACES = {
+    "g1mesh",
+    "g2mesh",
+    "g3mesh",
+}
+
+# Cap on the 1/cos(theta) incidence-angle yield enhancement.
+#
+# The secant law diverges at grazing incidence, while real surfaces roll over
+# because of roughness and finite escape depth. The previous cos_theta floor of
+# 0.05 permitted a 20x enhancement, which would put the Poisson mean for a
+# measured C-on-SS SEY of ~0.72 at ~14 secondaries from a single grazing hit.
+# That matters now that the drift tube is real STL geometry: grazing incidence
+# on a tube bore is the common case, not the exception.
+MAX_ANGULAR_YIELD_GAIN = 4.0
+
 # Measured normal-incidence yields for the carbon coating on stainless steel.
 #
 # TEY is the arithmetic mean of all three 2026-07-28 measurements.
@@ -169,6 +199,50 @@ def sey_multiplier_for_surface(
     # Do not tune collector SEY separately.
     # Leave sample, holder, receiver, rod, drifttube, collector unchanged.
     return 1.0
+
+
+def angular_yield_gain(
+    cos_theta: float,
+    max_gain: float = MAX_ANGULAR_YIELD_GAIN,
+) -> float:
+    """
+    Capped secant-law incidence-angle yield enhancement.
+
+    The measured C-on-SS tables and the JMONSEL "FromPlane" tables are all
+    NORMAL-INCIDENCE yields, so using them at oblique incidence requires an
+    explicit angular law. The standard escape-depth argument gives
+
+        Y(theta) = Y(0) / cos(theta)
+
+    because the primary deposits its energy over a path length that is longer
+    by 1/cos(theta) within the shallow escape layer.
+
+    The pure secant law is unbounded, so it is capped at max_gain. See
+    MAX_ANGULAR_YIELD_GAIN for why the cap matters here specifically.
+
+    Parameters
+    ----------
+    cos_theta:
+        Cosine of the incidence angle measured against the vacuum-side normal.
+        Non-finite or non-positive values return max_gain.
+    max_gain:
+        Upper bound on the enhancement factor.
+
+    Returns
+    -------
+    Multiplicative gain in [1.0, max_gain].
+    """
+    max_gain = float(max_gain)
+
+    if max_gain < 1.0:
+        raise ValueError("max_gain must be >= 1.0")
+
+    c = float(cos_theta)
+
+    if not np.isfinite(c) or c <= 0.0:
+        return max_gain
+
+    return float(min(1.0 / c, max_gain))
 
 
 # ============================================================
@@ -705,6 +779,7 @@ def sample_surface_event(
         Poisson-sampled number of secondary electrons.
     """
     fam = surface_family(surface_name)
+    surf = canonical_surface_name(surface_name)
 
     sey_mdl = yield_models[fam]["SEY"]
     bsey_mdl = yield_models[fam]["BSEY"]
@@ -712,17 +787,23 @@ def sample_surface_event(
     sey_base = interp_yield_model(sey_mdl, Einc)
     bsey_base = interp_yield_model(bsey_mdl, Einc)
 
-    cos_theta_eff = max(float(cos_theta), 0.05)    
-    
-    if fam in ["grid", "collector"]:
-        # For analytic grid shells and collector shell, do not apply
-        # incidence-angle yield amplification.
-        sey_val = sey_base
-        bsey_val = bsey_base
+    # Incidence-angle yield enhancement now applies to every surface that has a
+    # physically meaningful local normal:
+    #
+    #   sample / holder / receiver  real STL or analytic plane
+    #   rod / drifttube            real STL solids (drift tube is now a real mesh)
+    #   g1frame / g2frame / g3frame real STL solids with genuine face normals
+    #   collector                  exact analytic sphere, so its radial normal
+    #                              IS the true local normal
+    #
+    # Only the analytic wire meshes are excluded; see ANALYTIC_MESH_SURFACES.
+    if surf in ANALYTIC_MESH_SURFACES:
+        angular_gain = 1.0
     else:
-        # Real material surfaces.
-        sey_val = sey_base / cos_theta_eff
-        bsey_val = bsey_base / cos_theta_eff
+        angular_gain = angular_yield_gain(cos_theta)
+
+    sey_val = sey_base * angular_gain
+    bsey_val = bsey_base * angular_gain
 
     if fam == "grid":
         sey_val *= sey_multiplier_for_surface(
@@ -1107,14 +1188,22 @@ def generate_surface_emissions(
     v_in = np.asarray(v_in, dtype=float)
 
     fam = surface_family(surface_name)
+    surf = canonical_surface_name(surface_name)
 
-    if fam != "grid":
+    # Orient the normal against the incoming velocity for every surface that
+    # has a real local normal. Grid FRAMES are included now: their STL face
+    # normal is already oriented by cascade.estimate_surface_normal(), so this
+    # is a no-op there, but it makes the sign of cos_theta safe by construction
+    # rather than by assumption.
+    if surf not in ANALYTIC_MESH_SURFACES:
         n_out = orient_normal_against_incoming(n_out, v_in)
-    
+
     vhat = unit(v_in)
-    
-    if fam in ["grid", "collector"]:
-        # We do not want incidence-angle yield amplification for these shells.
+
+    if surf in ANALYTIC_MESH_SURFACES:
+        # Zero-thickness analytic sphere standing in for woven wire: the radial
+        # normal is not the local wire normal, so no meaningful incidence angle
+        # exists here. Leave the yield at its normal-incidence value.
         cos_theta = 1.0
     else:
         cos_theta = max(0.05, -float(np.dot(vhat, n_out)))

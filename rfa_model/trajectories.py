@@ -156,10 +156,33 @@ def classify_grid_point(p, field):
 def is_drifttube_escape_candidate(p, v, field, aperture_radius=None):
     """Return True when a trajectory is leaving through the +X DT aperture.
 
-    The test is intentionally conservative: the electron must be close to the
-    positive-X edge of the field/update domain, moving toward +X, and inside
-    the circular drift-tube aperture in the YZ plane.
+    The test is intentionally conservative: the electron must be moving toward
+    +X, be close to the drift tube's exit plane, and lie inside the bore in the
+    YZ plane.
+
+    Two geometry sources, resolved through the same helper that
+    collisions.is_in_drift_tube_aperture() uses so the two can never disagree:
+
+    Preferred - field["drifttube_bore"] from compute_drifttube_bore_geometry(),
+    giving the real bore radius, the bore's offset from the RFA axis, and the
+    tube's own x extent. The escape plane is then x_exit = min(tube +X end,
+    domain +X edge) rather than always the domain edge. This matters because the
+    drift tube is now real collision geometry: an electron inside the bore that
+    strikes the wall is DT current and is caught by the STL test, so the only
+    electrons that should be classified as escapes are those still inside the
+    bore when they reach the exit. Testing at the domain edge with a nominal
+    on-axis circle could label an electron an escape at a radius the real tube
+    wall would have intercepted.
+
+    Legacy - field["drifttube_aperture_radius"] (default 5.6 mm) as a circle
+    centred exactly on the axis, evaluated at the domain +X edge. Retained so
+    setups that have not called compute_drifttube_bore_geometry() are unchanged.
+
+    An explicit aperture_radius argument always wins and is interpreted on-axis
+    at the domain edge.
     """
+    from .collisions import drifttube_bore_from_field
+
     p = np.asarray(p, dtype=float)
     v = np.asarray(v, dtype=float)
 
@@ -174,6 +197,17 @@ def is_drifttube_escape_candidate(p, v, field, aperture_radius=None):
     x_max = float(np.asarray(field["x"])[-1])
 
     if aperture_radius is None:
+        bore = drifttube_bore_from_field(field)
+
+        if bore is not None:
+            y0, z0 = bore["center_yz"]
+            radial_yz = float(np.hypot(p[1] - float(y0), p[2] - float(z0)))
+            x_exit = min(float(bore["x_exit"]), x_max)
+
+            return (p[0] >= x_exit - 1.5 * h) and (
+                radial_yz <= float(bore["radius"])
+            )
+
         # Must match collisions.is_in_drift_tube_aperture()'s default so the
         # domain-boundary escape check and the grid-opening check agree on
         # the same physical drift-tube bore radius.
