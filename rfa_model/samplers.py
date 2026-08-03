@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
@@ -55,6 +57,24 @@ GRID_SURFACES = {
 COLLECTOR_SURFACES = {
     "collector",
     "collector_shell",
+}
+
+# Every surface carrying the airbrushed colloidal-graphite coating.
+#
+# Per the instrument paper: "The upper and lower collector shells, sample
+# support rod, and the outer surface of the drift tube were coated with
+# graphite". All three therefore share ONE physical coating and, at a given
+# impact energy and angle, one SEY and one BSEY.
+#
+# This is why the yield multipliers below default to acting on the whole set
+# rather than on the collector alone. Before this change, bse_multiplier_for_
+# surface() applied collector_BSE_mult only to COLLECTOR_SURFACES while
+# surface_family() routed rod and drifttube to the SAME "collector" yield
+# curves -- so a fitted multiplier silently gave the three identically-coated
+# electrodes two different effective yields.
+CARBON_COATED_SURFACES = COLLECTOR_SURFACES | {
+    "rod",
+    "drifttube",
 }
 
 # Analytic zero-thickness spheres standing in for the woven wire mesh.
@@ -148,56 +168,141 @@ def orient_normal_against_incoming(n_out, v_in):
     return n_out
 
 
+def _carbon_family_multiplier(
+    canonical_name: str,
+    shared: float | None,
+    collector: float | None,
+    rod: float | None,
+    drifttube: float | None,
+    fallback: float | None,
+) -> float:
+    """
+    Resolve the multiplier for one carbon-coated surface.
+
+    Precedence, most specific first:
+        1. the per-surface override for this electrode
+        2. the shared carbon-coating multiplier
+        3. the global fallback multiplier
+        4. 1.0
+
+    Prefer the shared knob. The collector, rod, and drift tube carry the SAME
+    graphite coating, so their true yields cannot differ except through impact
+    energy and angle, which the sampler already handles. Per-surface overrides
+    exist for diagnostics -- if the fit wants very different values for the
+    three, that is evidence of a GEOMETRY error (e.g. the known rod-current
+    deficit) being absorbed into a yield parameter, not of a real coating
+    difference.
+    """
+    per_surface = {
+        "collector": collector,
+        "rod": rod,
+        "drifttube": drifttube,
+    }
+
+    value = per_surface.get(canonical_name, None)
+
+    if value is not None:
+        return float(value)
+
+    if shared is not None:
+        return float(shared)
+
+    if fallback is not None:
+        return float(fallback)
+
+    return 1.0
+
+
 def bse_multiplier_for_surface(
     surface_name,
     BSE_mult: float = 1.0,
     grid_BSE_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    carbon_BSE_mult: float | None = None,
+    rod_BSE_mult: float | None = None,
+    drifttube_BSE_mult: float | None = None,
 ) -> float:
     """
     Surface-specific BSEY multiplier.
 
-    For now we mainly need collector_BSE_mult because collector BSEs
-    redistribute current away from the collector.
+    Parameters
+    ----------
+    grid_BSE_mult:
+        Applies to grid meshes and grid frames.
+    carbon_BSE_mult:
+        Applies to every graphite-coated electrode: collector, rod, and drift
+        tube. This is the physically correct knob, since they share a coating.
+    collector_BSE_mult, rod_BSE_mult, drifttube_BSE_mult:
+        Per-electrode overrides that beat carbon_BSE_mult. collector_BSE_mult
+        is kept for backward compatibility with earlier fits; note that using
+        it ALONE scales the collector while leaving the identically-coated rod
+        and drift tube at 1.0.
+    BSE_mult:
+        Global fallback for grid and carbon surfaces when nothing more
+        specific is supplied.
     """
     s = canonical_surface_name_for_sey(surface_name)
 
-    if grid_BSE_mult is None:
-        grid_BSE_mult = BSE_mult
-
-    if collector_BSE_mult is None:
-        collector_BSE_mult = BSE_mult
-
     if s in GRID_SURFACES:
-        return float(grid_BSE_mult)
+        return float(
+            grid_BSE_mult if grid_BSE_mult is not None else BSE_mult
+        )
 
-    if s in COLLECTOR_SURFACES:
-        return float(collector_BSE_mult)
+    if s in CARBON_COATED_SURFACES:
+        return _carbon_family_multiplier(
+            canonical_name=s,
+            shared=carbon_BSE_mult,
+            collector=collector_BSE_mult,
+            rod=rod_BSE_mult,
+            drifttube=drifttube_BSE_mult,
+            fallback=BSE_mult,
+        )
 
+    # sample, holder, receiver: not tuned here.
     return 1.0
 
 
 def sey_multiplier_for_surface(
     surface_name,
     grid_SEY_mult: float | None = None,
+    SEY_mult: float = 1.0,
+    carbon_SEY_mult: float | None = None,
+    collector_SEY_mult: float | None = None,
+    rod_SEY_mult: float | None = None,
+    drifttube_SEY_mult: float | None = None,
 ) -> float:
     """
     Surface-specific SEY multiplier.
 
-    grid_SEY_mult applies to grid shells and grid frames.
-    Collector SEY is not separately scaled because collector SEs mostly
-    return to the collector in this geometry.
+    Mirrors bse_multiplier_for_surface. carbon_SEY_mult is the preferred knob
+    for the graphite-coated electrodes (collector, rod, drift tube); the
+    per-electrode overrides beat it.
+
+    Note that collector SEY is NOT self-cancelling in this geometry: with the
+    collector biased positive relative to the grounded grids, secondaries born
+    on the collector are pulled back to it, but at +1 kV the grid-mesh field
+    leak-through extracts a fraction of them inward. Scaling collector SEY is
+    therefore a meaningful degree of freedom, which the earlier hard-coded 1.0
+    denied.
     """
     s = canonical_surface_name_for_sey(surface_name)
 
-    if grid_SEY_mult is None:
-        grid_SEY_mult = 1.0
-
     if s in GRID_SURFACES:
-        return float(grid_SEY_mult)
+        return float(
+            grid_SEY_mult if grid_SEY_mult is not None else SEY_mult
+        )
 
-    # Do not tune collector SEY separately.
-    # Leave sample, holder, receiver, rod, drifttube, collector unchanged.
+    if s in CARBON_COATED_SURFACES:
+        return _carbon_family_multiplier(
+            canonical_name=s,
+            shared=carbon_SEY_mult,
+            collector=collector_SEY_mult,
+            rod=rod_SEY_mult,
+            drifttube=drifttube_SEY_mult,
+            fallback=SEY_mult,
+        )
+
+    # sample, holder, receiver: not tuned here.
     return 1.0
 
 
@@ -620,7 +725,11 @@ def _make_measured_carbon_hybrid_curve(
         "measured_energy_max_eV": float(measured_E[-1]),
         "low_energy_model": "scaled JMONSEL shape with zero-energy anchor",
         "jmonsel_scale_below_150_eV": scale,
-        "allow_collector_BSE_mult": False,
+        # Multipliers are ALLOWED on this curve (previously blocked).
+        # Kept as metadata so downstream code/logs can still tell that
+        # this is measured data rather than a model curve.
+        "allow_collector_BSE_mult": True,
+        "is_measured": True,
     }
 
 
@@ -757,6 +866,49 @@ def interp_yield_model(model: dict, Einc: float) -> float:
     return float(np.interp(Einc, E, Y, left=Y[0], right=Y[-1]))
 
 
+_MEASURED_SCALING_WARNED: set = set()
+
+
+def _warn_scaling_measured_curve(model, mult, kind, surface_name):
+    """
+    Emit one warning per (curve, kind, surface) when a MEASURED yield table is
+    scaled by a multiplier other than 1.
+
+    The point is provenance, not prohibition. A fitted value that stays close
+    to 1 says the witness-coupon measurement transfers well to the in-situ
+    electrodes; a value far from 1 is a real result worth reporting, and
+    should not be quietly folded into a "measured" label.
+    """
+    if model is None or np.isclose(float(mult), 1.0):
+        return
+
+    source = str(model.get("source", "")) if isinstance(model, dict) else ""
+
+    if "measured" not in source.lower():
+        return
+
+    key = (source, str(kind), canonical_surface_name_for_sey(surface_name))
+
+    if key in _MEASURED_SCALING_WARNED:
+        return
+
+    _MEASURED_SCALING_WARNED.add(key)
+
+    warnings.warn(
+        f"{kind} multiplier {float(mult):.4g} applied on top of the measured "
+        f"curve '{source}' for surface '{surface_name}'. Results no longer "
+        f"reflect the measured yields at face value; report the fitted "
+        f"multiplier alongside them.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def reset_measured_scaling_warnings():
+    """Clear the one-time warning cache (useful between parameter-scan runs)."""
+    _MEASURED_SCALING_WARNED.clear()
+
+
 def sample_surface_event(
     yield_models: dict,
     surface_name: str,
@@ -767,9 +919,24 @@ def sample_surface_event(
     BSE_mult: float = 1.0,
     grid_BSE_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    SEY_mult: float = 1.0,
+    carbon_SEY_mult: float | None = None,
+    carbon_BSE_mult: float | None = None,
+    collector_SEY_mult: float | None = None,
+    rod_SEY_mult: float | None = None,
+    rod_BSE_mult: float | None = None,
+    drifttube_SEY_mult: float | None = None,
+    drifttube_BSE_mult: float | None = None,
 ) -> tuple[bool, int]:
     """
     Sample whether a BSE occurs and how many SE electrons are emitted.
+
+    Multipliers
+    -----------
+    Grid surfaces take grid_SEY_mult / grid_BSE_mult.
+    Graphite-coated surfaces (collector, rod, drift tube) take
+    carbon_SEY_mult / carbon_BSE_mult, with optional per-electrode overrides.
+    See bse_multiplier_for_surface for the precedence rules.
 
     Returns
     -------
@@ -805,33 +972,39 @@ def sample_surface_event(
     sey_val = sey_base * angular_gain
     bsey_val = bsey_base * angular_gain
 
-    if fam == "grid":
-        sey_val *= sey_multiplier_for_surface(
-            surface_name=surface_name,
-            grid_SEY_mult=grid_SEY_mult,
-        )
-    
-    if fam == "collector":
-        allow_multiplier = bool(
-            bsey_mdl.get("allow_collector_BSE_mult", True)
-        )
+    # Yield multipliers.
+    #
+    # Both SEY and BSEY are now scalable on both families. The measured
+    # carbon-coating tables no longer BLOCK a multiplier: scaling a measured
+    # curve is a legitimate fit degree of freedom (coating thickness, surface
+    # roughness, and the airbrushed-vs-witness-sample difference are all real),
+    # so it is reported rather than forbidden. See _warn_scaling_measured_curve.
+    sey_mult = sey_multiplier_for_surface(
+        surface_name=surface_name,
+        grid_SEY_mult=grid_SEY_mult,
+        SEY_mult=SEY_mult,
+        carbon_SEY_mult=carbon_SEY_mult,
+        collector_SEY_mult=collector_SEY_mult,
+        rod_SEY_mult=rod_SEY_mult,
+        drifttube_SEY_mult=drifttube_SEY_mult,
+    )
 
-        if not allow_multiplier:
-            requested_mult = (
-                1.0 if collector_BSE_mult is None
-                else float(collector_BSE_mult)
-            )
-            if not np.isclose(requested_mult, 1.0):
-                raise ValueError(
-                    "collector_BSE_mult must be 1.0 when using the measured "
-                    "carbon-coating BSEY table"
-                )
-        else:
-            bsey_val *= bse_multiplier_for_surface(
-                surface_name=surface_name,
-                collector_BSE_mult=collector_BSE_mult,
-            )
-    
+    bse_mult = bse_multiplier_for_surface(
+        surface_name=surface_name,
+        BSE_mult=BSE_mult,
+        grid_BSE_mult=grid_BSE_mult,
+        collector_BSE_mult=collector_BSE_mult,
+        carbon_BSE_mult=carbon_BSE_mult,
+        rod_BSE_mult=rod_BSE_mult,
+        drifttube_BSE_mult=drifttube_BSE_mult,
+    )
+
+    _warn_scaling_measured_curve(sey_mdl, sey_mult, "SEY", surface_name)
+    _warn_scaling_measured_curve(bsey_mdl, bse_mult, "BSEY", surface_name)
+
+    sey_val *= sey_mult
+    bsey_val *= bse_mult
+
     sey_val = max(0.0, float(sey_val))
     bsey_val = max(0.0, min(float(bsey_val), 0.99))
 
@@ -1168,6 +1341,14 @@ def generate_surface_emissions(
     BSE_mult: float = 1.0,
     grid_BSE_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    SEY_mult: float = 1.0,
+    carbon_SEY_mult: float | None = None,
+    carbon_BSE_mult: float | None = None,
+    collector_SEY_mult: float | None = None,
+    rod_SEY_mult: float | None = None,
+    rod_BSE_mult: float | None = None,
+    drifttube_SEY_mult: float | None = None,
+    drifttube_BSE_mult: float | None = None,
     sample_launch_eps: float = 1.0e-6,
     U0: float = 15.0,
     Phi_interp=None,
@@ -1257,6 +1438,14 @@ def generate_surface_emissions(
         BSE_mult=BSE_mult,
         grid_BSE_mult=grid_BSE_mult,
         collector_BSE_mult=collector_BSE_mult,
+        SEY_mult=SEY_mult,
+        carbon_SEY_mult=carbon_SEY_mult,
+        carbon_BSE_mult=carbon_BSE_mult,
+        collector_SEY_mult=collector_SEY_mult,
+        rod_SEY_mult=rod_SEY_mult,
+        rod_BSE_mult=rod_BSE_mult,
+        drifttube_SEY_mult=drifttube_SEY_mult,
+        drifttube_BSE_mult=drifttube_BSE_mult,
     )
 
     if did_bse:
