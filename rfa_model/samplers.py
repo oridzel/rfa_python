@@ -97,6 +97,36 @@ ANALYTIC_MESH_SURFACES = {
     "g3mesh",
 }
 
+# Grid support frames: DMLS 316 stainless steel, carbon sputter-coated.
+#
+# This is the SAME material system as the measured C-on-SS witness coupon, and
+# the frames are flat hoops rather than wires, so the measured flat-plane curve
+# applies to them directly with no geometry correction. They are also real STL
+# solids, so they already take the ordinary 1/cos incidence law.
+GRID_FRAME_SURFACES = {
+    "g1frame",
+    "g2frame",
+    "g3frame",
+}
+
+# Wire-geometry gain for converting a FLAT-PLANE yield curve to a WOVEN-WIRE
+# surface.
+#
+# A cylindrical wire presents a range of local incidence angles to a parallel
+# beam. Averaging the escape-depth factor 1/cos(theta) over the illuminated
+# half-cylinder, weighted by projected area (uniform impact parameter b, with
+# cos(theta) = sqrt(1 - b^2)):
+#
+#     <1/cos> = (1/2) * integral_{-1}^{1} db / sqrt(1 - b^2) = pi/2
+#
+# so a wire yields pi/2 ~ 1.571 times the flat-plane value at normal incidence
+# on the mesh plane.
+#
+# This factor must be applied when (and only when) a plane-derived curve is
+# used on the analytic mesh. The JMONSEL "FromWire" curves already contain it
+# by construction, which is why they are used with a gain of exactly 1.0.
+WIRE_GEOMETRY_GAIN = float(np.pi / 2.0)
+
 # Cap on the 1/cos(theta) incidence-angle yield enhancement.
 #
 # The secant law diverges at grazing incidence, while real surfaces roll over
@@ -519,6 +549,7 @@ def load_default_surface_models(
     model_dir: str | Path,
     bronstein_dir: str | Path | None = None,
     use_measured_carbon_coating: bool = True,
+    use_measured_carbon_for_grids: bool = False,
 ) -> tuple[dict, dict, dict]:
     """
     Load the same surface models used in the MATLAB setup.
@@ -536,6 +567,15 @@ def load_default_surface_models(
         distributions remain the JMONSEL thick-glassy-carbon distributions.
         Below 150 eV, the JMONSEL shape is scaled to join the measured curve
         continuously, with a zero-yield anchor at 0 eV.
+    use_measured_carbon_for_grids:
+        If True, also use the measured C-on-SS curves for the grid meshes and
+        grid frames, replacing the JMONSEL glassy-carbon-on-tungsten "FromWire"
+        curves. The grid wires and frames are carbon sputter-coated, and the
+        frames are carbon on 316 stainless -- the same system as the witness
+        coupon. Because the measured curve is a flat-plane measurement, the
+        mesh additionally receives WIRE_GEOMETRY_GAIN = pi/2; the flat frames
+        do not. Emitted energy/angle distributions stay JMONSEL FromWire.
+        Requires use_measured_carbon_coating=True.
 
     Returns
     -------
@@ -626,6 +666,39 @@ def load_default_surface_models(
         collector_bsey = collector_bsey_jmonsel
         collector_sey = collector_sey_jmonsel
 
+    # Grid curves. Two options:
+    #   use_measured_carbon_for_grids=False (default, unchanged behaviour)
+    #       JMONSEL glassy-carbon-on-tungsten "FromWire" curves. Wire geometry
+    #       is already averaged into these, so geometry="wire".
+    #   use_measured_carbon_for_grids=True
+    #       The measured C-on-SS curves, which are FLAT-PLANE measurements, so
+    #       geometry="plane". sample_surface_event() then applies
+    #       WIRE_GEOMETRY_GAIN on the mesh and nothing extra on the frames.
+    grid_bsey_jmonsel = load_yield_curve_csv(
+        model_dir / "BSEYFromWire_glassyCarbon_t70nmWFPA.csv"
+    )
+    grid_sey_jmonsel = load_yield_curve_csv(
+        model_dir / "SEYFromWire_glassyCarbon_t70nmWFPA.csv"
+    )
+    grid_bsey_jmonsel = dict(grid_bsey_jmonsel, geometry="wire")
+    grid_sey_jmonsel = dict(grid_sey_jmonsel, geometry="wire")
+
+    if use_measured_carbon_for_grids:
+        if not use_measured_carbon_coating:
+            raise ValueError(
+                "use_measured_carbon_for_grids=True requires "
+                "use_measured_carbon_coating=True"
+            )
+        grid_bsey = dict(collector_bsey, geometry="plane")
+        grid_sey = dict(collector_sey, geometry="plane")
+        gridframe_bsey = dict(collector_bsey, geometry="plane")
+        gridframe_sey = dict(collector_sey, geometry="plane")
+    else:
+        grid_bsey = grid_bsey_jmonsel
+        grid_sey = grid_sey_jmonsel
+        gridframe_bsey = grid_bsey_jmonsel
+        gridframe_sey = grid_sey_jmonsel
+
     yield_models = {
         "sample": {
             "BSEY": load_yield_curve_csv(model_dir / "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
@@ -640,8 +713,12 @@ def load_default_surface_models(
             "SEY": load_yield_curve_csv(bronstein_dir / "SEY_Ti_Bronstein.csv"),
         },
         "grid": {
-            "BSEY": load_yield_curve_csv(model_dir / "BSEYFromWire_glassyCarbon_t70nmWFPA.csv"),
-            "SEY": load_yield_curve_csv(model_dir / "SEYFromWire_glassyCarbon_t70nmWFPA.csv"),
+            "BSEY": grid_bsey,
+            "SEY": grid_sey,
+        },
+        "gridframe": {
+            "BSEY": gridframe_bsey,
+            "SEY": gridframe_sey,
         },
         "collector": {
             "BSEY": collector_bsey,
@@ -948,29 +1025,43 @@ def sample_surface_event(
     fam = surface_family(surface_name)
     surf = canonical_surface_name(surface_name)
 
-    sey_mdl = yield_models[fam]["SEY"]
-    bsey_mdl = yield_models[fam]["BSEY"]
+    # Grid frames may carry their own curves (carbon on 316 SS, flat hoops)
+    # distinct from the woven wire mesh. Fall back to the grid family when no
+    # separate "gridframe" entry was loaded, so older model dicts still work.
+    model_key = fam
+
+    if surf in GRID_FRAME_SURFACES and "gridframe" in yield_models:
+        model_key = "gridframe"
+
+    sey_mdl = yield_models[model_key]["SEY"]
+    bsey_mdl = yield_models[model_key]["BSEY"]
 
     sey_base = interp_yield_model(sey_mdl, Einc)
     bsey_base = interp_yield_model(bsey_mdl, Einc)
 
-    # Incidence-angle yield enhancement now applies to every surface that has a
-    # physically meaningful local normal:
+    # Geometry gain. Three cases:
     #
-    #   sample / holder / receiver  real STL or analytic plane
-    #   rod / drifttube            real STL solids (drift tube is now a real mesh)
-    #   g1frame / g2frame / g3frame real STL solids with genuine face normals
-    #   collector                  exact analytic sphere, so its radial normal
-    #                              IS the true local normal
+    #   analytic mesh + "wire" curve   gain 1.0
+    #       JMONSEL FromWire already averages over the wire cross-section.
+    #   analytic mesh + "plane" curve  gain WIRE_GEOMETRY_GAIN = pi/2
+    #       A flat-plane measurement applied to a cylindrical wire needs the
+    #       projected-area average of 1/cos restored.
+    #   everything else                gain 1/cos(theta), capped
+    #       Real surfaces with a meaningful local normal: sample, holder,
+    #       receiver, rod, drift tube, grid frames, collector sphere.
     #
-    # Only the analytic wire meshes are excluded; see ANALYTIC_MESH_SURFACES.
-    if surf in ANALYTIC_MESH_SURFACES:
-        angular_gain = 1.0
-    else:
-        angular_gain = angular_yield_gain(cos_theta)
+    # The SEY and BSEY curves are checked independently so a mixed pair cannot
+    # silently pick up the wrong gain.
+    def _geometry_gain(model):
+        if surf in ANALYTIC_MESH_SURFACES:
+            geom = "wire"
+            if isinstance(model, dict):
+                geom = str(model.get("geometry", "wire"))
+            return WIRE_GEOMETRY_GAIN if geom == "plane" else 1.0
+        return angular_yield_gain(cos_theta)
 
-    sey_val = sey_base * angular_gain
-    bsey_val = bsey_base * angular_gain
+    sey_val = sey_base * _geometry_gain(sey_mdl)
+    bsey_val = bsey_base * _geometry_gain(bsey_mdl)
 
     # Yield multipliers.
     #
