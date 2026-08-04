@@ -331,7 +331,7 @@ def mark_mesh_voxels_by_voxelized(
 
     t0 = time.perf_counter()
 
-    if owner_name == "drifttube":
+    if owner_name in {"rod", "drifttube"}:
         vox = mesh.voxelized(
             pitch=pitch,
             method="ray",
