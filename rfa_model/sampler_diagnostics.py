@@ -195,10 +195,6 @@ def validate_yield_sampling_at_energy(
             Einc=E0,
             cos_theta=cos_theta,
             rng=rng,
-            grid_SEY_mult=1.0,
-            BSE_mult=1.0,
-            grid_BSE_mult=1.0,
-            collector_BSE_mult=1.0,
         )
 
         bse_count += int(did_bse)
@@ -269,10 +265,6 @@ def sweep_yield_sampling(
                 yield_models=yield_models,
                 surface_name=surface_name,
                 Einc=E0,
-                grid_SEY_mult=1.0,
-                BSE_mult=1.0,
-                grid_BSE_mult=1.0,
-                collector_BSE_mult=1.0,
                 cos_theta=cos_theta,
                 rng=rng,
             )

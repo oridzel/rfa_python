@@ -345,9 +345,6 @@ def generate_cascade_emissions_from_hit(
     origin: str,
     hit_info: dict | None = None,
     launch_step_fraction_of_h: float = 0.10,
-    grid_SEY_mult: float | None = None,
-    collector_BSE_mult: float | None = None,
-    yield_multipliers: dict | None = None,
     Phi_interp=None,
 ) -> tuple[list[dict], list[dict]]:
     """
@@ -377,12 +374,6 @@ def generate_cascade_emissions_from_hit(
         energy_models=energy_models,
         theta_models=theta_models,
         voltages=voltages,
-        grid_SEY_mult=grid_SEY_mult,
-        collector_BSE_mult=collector_BSE_mult,
-        # Extra per-family yield multipliers (carbon_SEY_mult, carbon_BSE_mult,
-        # rod_*, drifttube_*, collector_SEY_mult, grid_BSE_mult, ...) travel as
-        # a dict so the whole call chain does not need a new keyword for each.
-        **(yield_multipliers or {}),
         rng=rng,
         origin=origin,
         sample_launch_eps=1.0e-6,
@@ -440,10 +431,6 @@ def run_one_primary_with_cascade(
     sample_y_bounds,
     sample_z_bounds,
     
-    grid_SEY_mult: float | None = None,
-    collector_BSE_mult: float | None = None,
-    yield_multipliers: dict | None = None,
-
     max_generation: int = 5,
     max_total_electrons: int = 500,
     min_incident_energy_eV: float = 0.1,
@@ -516,9 +503,6 @@ def run_one_primary_with_cascade(
         energy_models=energy_models,
         theta_models=theta_models,
         voltages=voltages,
-        grid_SEY_mult=grid_SEY_mult,
-        collector_BSE_mult=collector_BSE_mult,
-        yield_multipliers=yield_multipliers,
         rng=rng,
         origin="gun",
         hit_info=hit,
@@ -732,9 +716,6 @@ def run_one_primary_with_cascade(
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
-            grid_SEY_mult=grid_SEY_mult,
-            collector_BSE_mult=collector_BSE_mult,
-            yield_multipliers=yield_multipliers,
             rng=rng,
             origin=res.get("emission_kind", "cascade"),
             hit_info=hit_info,
@@ -943,9 +924,6 @@ def _run_cascade_chunk(
     
     launch_step_fraction_of_h,
     
-    grid_SEY_mult: float | None = None,
-    collector_BSE_mult: float | None = None,
-    yield_multipliers: dict | None = None,
     integrator: str = "verlet",
 ):
     """
@@ -985,9 +963,6 @@ def _run_cascade_chunk(
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
-            grid_SEY_mult=grid_SEY_mult,
-            collector_BSE_mult=collector_BSE_mult,
-            yield_multipliers=yield_multipliers,
             rng=rng,
 
             sample_y_bounds=sample_y_bounds,
@@ -1099,10 +1074,6 @@ def run_cascade_batch_parallel(
     sample_y_bounds,
     sample_z_bounds,
     
-    grid_SEY_mult: float | None = None,
-    collector_BSE_mult: float | None = None,
-    yield_multipliers: dict | None = None,
-
     x_start: float | None = None,
     beam_sigma: float = 150e-6,
     energy_spread_eV: float = 0.0,
@@ -1142,53 +1113,6 @@ def run_cascade_batch_parallel(
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
 
-    if grid_SEY_mult is None:
-        grid_SEY_mult = 1.0
-
-    if collector_BSE_mult is None:
-        collector_BSE_mult = 1.0
-
-    # Yield multipliers on the measured carbon curves are ALLOWED.
-    #
-    # Previously a measured BSEY table hard-blocked collector_BSE_mult != 1.0.
-    # That prevented fitting the graphite-coated electrodes at all, even though
-    # the coating on the collector/rod/drift tube is airbrushed colloidal
-    # graphite while the measured curve comes from a separately-coated witness
-    # coupon -- thickness, roughness and adhesion can legitimately differ.
-    # The multiplier is now a normal fit parameter; samplers.py warns once per
-    # curve so the provenance is never lost.
-    yield_multipliers = dict(yield_multipliers or {})
-
-    _ALLOWED_YIELD_MULTIPLIERS = {
-        "SEY_mult",
-        "BSE_mult",
-        "grid_BSE_mult",
-        "carbon_SEY_mult",
-        "carbon_BSE_mult",
-        "collector_SEY_mult",
-        "rod_SEY_mult",
-        "rod_BSE_mult",
-        "drifttube_SEY_mult",
-        "drifttube_BSE_mult",
-    }
-
-    unknown = set(yield_multipliers) - _ALLOWED_YIELD_MULTIPLIERS
-    if unknown:
-        raise ValueError(
-            "unknown yield_multipliers keys: "
-            f"{sorted(unknown)}; allowed: "
-            f"{sorted(_ALLOWED_YIELD_MULTIPLIERS)}. "
-            "grid_SEY_mult and collector_BSE_mult stay top-level arguments."
-        )
-
-    for _k, _v in yield_multipliers.items():
-        if _v is None:
-            continue
-        if not np.isfinite(float(_v)) or float(_v) < 0.0:
-            raise ValueError(
-                f"yield_multipliers['{_k}'] must be finite and >= 0, got {_v!r}"
-            )
-
     yield_model_sources = {}
     for family, family_models in yield_models.items():
         yield_model_sources[family] = {}
@@ -1199,6 +1123,26 @@ def run_cascade_batch_parallel(
                 )
             else:
                 yield_model_sources[family][yield_kind] = "unknown"
+
+    # Announce which curve every family actually runs on.
+    #
+    # A loader flag silently defaulting to False is invisible in the results:
+    # a run made with the JMONSEL FromWire grid curves and one made with the
+    # measured C-on-SS curves differ only in numbers that look plausible
+    # either way. Printing provenance at the start means the run reports what
+    # it used, instead of the operator having to recall which cell ran last.
+    if verbose:
+        print("[cascade] yield curves in use:")
+        for family in sorted(yield_model_sources):
+            for yield_kind in ("SEY", "BSEY"):
+                if yield_kind not in yield_model_sources[family]:
+                    continue
+                model = yield_models.get(family, {}).get(yield_kind, {})
+                geom = str(model.get("geometry", "-")) if isinstance(model, dict) else "?"
+                print(
+                    f"    {family:11}{yield_kind:6}{geom:8}"
+                    f"{yield_model_sources[family][yield_kind]}"
+                )
 
     t0 = time.perf_counter()
 
@@ -1281,10 +1225,6 @@ def run_cascade_batch_parallel(
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
-    
-            grid_SEY_mult=grid_SEY_mult,
-            collector_BSE_mult=collector_BSE_mult,
-            yield_multipliers=yield_multipliers,
     
             sample_y_bounds=sample_y_bounds,
             sample_z_bounds=sample_z_bounds,
@@ -1395,9 +1335,6 @@ def run_cascade_batch_parallel(
         "integrator": integrator,
 
         "grid_transparency": grid_transparency,
-        "grid_SEY_mult": grid_SEY_mult,
-        "collector_BSE_mult": collector_BSE_mult,
-        "yield_multipliers": dict(yield_multipliers),
         "yield_model_sources": yield_model_sources,
 
         "max_generation": max_generation,

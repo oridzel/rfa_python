@@ -59,8 +59,6 @@ def run_first_generation_batch_serial(
     energy_models: dict,
     theta_models: dict,
     voltages: dict,
-    SEY_mult: float,
-
     sample_y_bounds,
     sample_z_bounds,
 
@@ -167,7 +165,6 @@ def run_first_generation_batch_serial(
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
-            SEY_mult=SEY_mult,
             rng=rng,
 
             sample_y_bounds=sample_y_bounds,
@@ -407,8 +404,6 @@ def _run_first_generation_chunk(
     energy_models,
     theta_models,
     voltages,
-    SEY_mult,
-
     sample_y_bounds,
     sample_z_bounds,
 
@@ -453,7 +448,6 @@ def _run_first_generation_chunk(
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
-            SEY_mult=SEY_mult,
             rng=rng,
 
             sample_y_bounds=sample_y_bounds,
@@ -499,8 +493,6 @@ def run_first_generation_batch_parallel(
     energy_models: dict,
     theta_models: dict,
     voltages: dict,
-    SEY_mult: float,
-
     sample_y_bounds,
     sample_z_bounds,
 
@@ -600,8 +592,6 @@ def run_first_generation_batch_parallel(
             energy_models=energy_models,
             theta_models=theta_models,
             voltages=voltages,
-            SEY_mult=SEY_mult,
-
             sample_y_bounds=sample_y_bounds,
             sample_z_bounds=sample_z_bounds,
 
