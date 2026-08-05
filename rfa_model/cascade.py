@@ -347,6 +347,7 @@ def generate_cascade_emissions_from_hit(
     launch_step_fraction_of_h: float = 0.10,
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    yield_multipliers: dict | None = None,
     Phi_interp=None,
 ) -> tuple[list[dict], list[dict]]:
     """
@@ -378,6 +379,10 @@ def generate_cascade_emissions_from_hit(
         voltages=voltages,
         grid_SEY_mult=grid_SEY_mult,
         collector_BSE_mult=collector_BSE_mult,
+        # Extra per-family yield multipliers (carbon_SEY_mult, carbon_BSE_mult,
+        # rod_*, drifttube_*, collector_SEY_mult, grid_BSE_mult, ...) travel as
+        # a dict so the whole call chain does not need a new keyword for each.
+        **(yield_multipliers or {}),
         rng=rng,
         origin=origin,
         sample_launch_eps=1.0e-6,
@@ -437,6 +442,7 @@ def run_one_primary_with_cascade(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    yield_multipliers: dict | None = None,
 
     max_generation: int = 5,
     max_total_electrons: int = 500,
@@ -512,6 +518,7 @@ def run_one_primary_with_cascade(
         voltages=voltages,
         grid_SEY_mult=grid_SEY_mult,
         collector_BSE_mult=collector_BSE_mult,
+        yield_multipliers=yield_multipliers,
         rng=rng,
         origin="gun",
         hit_info=hit,
@@ -727,6 +734,7 @@ def run_one_primary_with_cascade(
             voltages=voltages,
             grid_SEY_mult=grid_SEY_mult,
             collector_BSE_mult=collector_BSE_mult,
+            yield_multipliers=yield_multipliers,
             rng=rng,
             origin=res.get("emission_kind", "cascade"),
             hit_info=hit_info,
@@ -937,6 +945,7 @@ def _run_cascade_chunk(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    yield_multipliers: dict | None = None,
     integrator: str = "verlet",
 ):
     """
@@ -978,6 +987,7 @@ def _run_cascade_chunk(
             voltages=voltages,
             grid_SEY_mult=grid_SEY_mult,
             collector_BSE_mult=collector_BSE_mult,
+            yield_multipliers=yield_multipliers,
             rng=rng,
 
             sample_y_bounds=sample_y_bounds,
@@ -1091,6 +1101,7 @@ def run_cascade_batch_parallel(
     
     grid_SEY_mult: float | None = None,
     collector_BSE_mult: float | None = None,
+    yield_multipliers: dict | None = None,
 
     x_start: float | None = None,
     beam_sigma: float = 150e-6,
@@ -1137,19 +1148,46 @@ def run_cascade_batch_parallel(
     if collector_BSE_mult is None:
         collector_BSE_mult = 1.0
 
-    collector_bsey_model = (
-        yield_models.get("collector", {}).get("BSEY", {})
-    )
-    if (
-        not collector_bsey_model.get(
-            "allow_collector_BSE_mult", True
-        )
-        and not np.isclose(float(collector_BSE_mult), 1.0)
-    ):
+    # Yield multipliers on the measured carbon curves are ALLOWED.
+    #
+    # Previously a measured BSEY table hard-blocked collector_BSE_mult != 1.0.
+    # That prevented fitting the graphite-coated electrodes at all, even though
+    # the coating on the collector/rod/drift tube is airbrushed colloidal
+    # graphite while the measured curve comes from a separately-coated witness
+    # coupon -- thickness, roughness and adhesion can legitimately differ.
+    # The multiplier is now a normal fit parameter; samplers.py warns once per
+    # curve so the provenance is never lost.
+    yield_multipliers = dict(yield_multipliers or {})
+
+    _ALLOWED_YIELD_MULTIPLIERS = {
+        "SEY_mult",
+        "BSE_mult",
+        "grid_BSE_mult",
+        "carbon_SEY_mult",
+        "carbon_BSE_mult",
+        "collector_SEY_mult",
+        "rod_SEY_mult",
+        "rod_BSE_mult",
+        "drifttube_SEY_mult",
+        "drifttube_BSE_mult",
+    }
+
+    unknown = set(yield_multipliers) - _ALLOWED_YIELD_MULTIPLIERS
+    if unknown:
         raise ValueError(
-            "collector_BSE_mult must be 1.0 when using the measured "
-            "carbon-coating BSEY table"
+            "unknown yield_multipliers keys: "
+            f"{sorted(unknown)}; allowed: "
+            f"{sorted(_ALLOWED_YIELD_MULTIPLIERS)}. "
+            "grid_SEY_mult and collector_BSE_mult stay top-level arguments."
         )
+
+    for _k, _v in yield_multipliers.items():
+        if _v is None:
+            continue
+        if not np.isfinite(float(_v)) or float(_v) < 0.0:
+            raise ValueError(
+                f"yield_multipliers['{_k}'] must be finite and >= 0, got {_v!r}"
+            )
 
     yield_model_sources = {}
     for family, family_models in yield_models.items():
@@ -1246,6 +1284,7 @@ def run_cascade_batch_parallel(
     
             grid_SEY_mult=grid_SEY_mult,
             collector_BSE_mult=collector_BSE_mult,
+            yield_multipliers=yield_multipliers,
     
             sample_y_bounds=sample_y_bounds,
             sample_z_bounds=sample_z_bounds,
@@ -1358,6 +1397,7 @@ def run_cascade_batch_parallel(
         "grid_transparency": grid_transparency,
         "grid_SEY_mult": grid_SEY_mult,
         "collector_BSE_mult": collector_BSE_mult,
+        "yield_multipliers": dict(yield_multipliers),
         "yield_model_sources": yield_model_sources,
 
         "max_generation": max_generation,
