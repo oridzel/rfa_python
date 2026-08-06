@@ -107,6 +107,15 @@ def attach_rfa_metadata(
     field["R_col"] = float(R_col)
     field["voltages"] = dict(voltages)
 
+    # Physical opening through the supporting frames around the +X drift-tube
+    # axis.  This is 5.6 mm; it is not the tube's inner bore.  Keep the older
+    # metadata key as a compatibility alias for existing notebooks.
+    field.setdefault("grid_frame_opening_radius", 0.0056)
+    field.setdefault(
+        "drifttube_aperture_radius",
+        field["grid_frame_opening_radius"],
+    )
+
     attach_default_owner_name_map(field)
 
     return field
@@ -140,6 +149,23 @@ def _log(verbose: bool, message: str):
     """
     if verbose:
         print(message, flush=True)
+
+
+def _count_updatable_voxels(
+    update_region: np.ndarray,
+    fixed: np.ndarray,
+    chunk_size: int = 8_000_000,
+) -> int:
+    """Count active non-fixed cells without a full-grid temporary mask."""
+    update_flat = np.ravel(update_region)
+    fixed_flat = np.ravel(fixed)
+    total = 0
+    for start in range(0, update_flat.size, chunk_size):
+        stop = min(start + chunk_size, update_flat.size)
+        active = np.logical_not(fixed_flat[start:stop])
+        np.logical_and(update_flat[start:stop], active, out=active)
+        total += int(np.count_nonzero(active))
+    return total
 
 
 # ============================================================
@@ -322,22 +348,42 @@ def mark_mesh_voxels_by_voxelized(
     verbose: bool = False,
 ) -> dict:
     """
-    Mark fixed-potential voxels using trimesh mesh.voxelized(pitch=h).
+    Mark fixed-potential voxels using ``trimesh.Trimesh.voxelized``.
+
+    The aligned rod and drift-tube STLs use Trimesh's ray voxelizer.  Their
+    long, thin axial triangles can exceed the default recursive-subdivision
+    limit at the production 0.25 mm pitch.  Ray voxelization is bounded in
+    memory for these two geometries.
     """
     if pitch is None:
         pitch = float(field["h"])
 
-    _log(verbose, f"  Voxelizing {owner_name!r} with pitch = {pitch:.3e} m ...")
+    voxel_method = "ray" if owner_name in {"rod", "drifttube"} else None
+    method_label = voxel_method or "subdivide"
+
+    _log(
+        verbose,
+        f"  Voxelizing {owner_name!r} with pitch = {pitch:.3e} m "
+        f"(method={method_label}) ...",
+    )
 
     t0 = time.perf_counter()
 
-    if owner_name in {"rod", "drifttube"}:
-        vox = mesh.voxelized(
-            pitch=pitch,
-            method="ray",
-        )
-    else:
-        vox = mesh.voxelized(pitch=pitch)
+    try:
+        if voxel_method is None:
+            vox = mesh.voxelized(pitch=pitch)
+        else:
+            vox = mesh.voxelized(pitch=pitch, method=voxel_method)
+    except ModuleNotFoundError as exc:
+        if voxel_method == "ray" and exc.name == "rtree":
+            raise RuntimeError(
+                f"{owner_name!r} ray voxelization requires the 'rtree' "
+                "package. "
+                "Install it in the notebook environment with "
+                "`pip install rtree`, restart the kernel, and rebuild the "
+                "field from scratch."
+            ) from exc
+        raise
     points = np.asarray(vox.points, dtype=float)
 
     _log(
@@ -367,6 +413,8 @@ def mark_mesh_voxels_by_voxelized(
 
     n_valid = int(valid.sum())
     n_outside = int(len(valid) - n_valid)
+
+    field.setdefault("mesh_voxel_counts", {})[owner_name] = n_valid
 
     i = i[valid]
     j = j[valid]
@@ -548,14 +596,18 @@ def mark_analytic_rfa_surfaces(
     R_g3: float,
     R_col: float,
     shell_thickness: float | None = None,
-    include_analytic_drifttube=True,
+    include_analytic_drifttube: bool = True,
     verbose: bool = False,
 ) -> dict:
     """
     Mark analytic g1/g2/g3 grid shells, collector shell,
-    and drift-tube boundary.
+    and optionally the legacy analytic drift-tube boundary.
 
     This version stores the masks in the field dictionary.
+
+    Set ``include_analytic_drifttube=False`` when the aligned physical
+    ``meshes["drifttube"]`` STL has already been voxelized.  This prevents the
+    legacy cylindrical approximation from duplicating or overwriting the STL.
     """
     attach_rfa_metadata(
         field=field,
@@ -620,7 +672,12 @@ def mark_analytic_rfa_surfaces(
     n_after = int(np.count_nonzero(field["fixed"]))
 
     _log(verbose, f"  analytic fixed voxels added: {n_after - n_before:,}")
-    _log(verbose, f"  update voxels: {int(np.count_nonzero(field['update_region'] & ~field['fixed'])):,}")
+    if verbose:
+        _log(
+            True,
+            "  update voxels: "
+            f"{_count_updatable_voxels(field['update_region'], field['fixed']):,}",
+        )
 
     return field
 
@@ -657,7 +714,7 @@ def make_analytic_rfa_boundary_masks(
     r_rod: float = 0.011,
     r_dt_i: float = 4.3e-3,
     t_dt: float = 0.25e-3,
-    include_drifttube=True,
+    include_drifttube: bool = True,
 ) -> dict:
     """
     Create and store analytic RFA boundary masks.
@@ -694,7 +751,9 @@ def make_analytic_rfa_boundary_masks(
     band_col = 2.0 * h
     pad = 2.0 * h
 
-    x_dt_near = 0.048
+    # This is used only by the legacy analytic-cylinder fallback.  The normal
+    # build path uses the physical STL whose nose is aligned at x=0.047 m.
+    x_dt_near = 0.047
     x_dt_far = R_col + pad
 
     # --------------------------------------------------------
@@ -780,6 +839,8 @@ def make_analytic_rfa_boundary_masks(
             & (rho_yz <= r_dt_i + dt_band_bc)
         )
     else:
+        # Keep a full-size compatibility mask, but do not add any approximate
+        # drift-tube conductor when the real STL is present.
         drift_bc = np.zeros(full_shape, dtype=bool)
 
     # Broadcast/copy to real full-size boolean arrays.
@@ -1017,6 +1078,56 @@ def solve_laplace_sor_numba(
         print(f"Finished: it = {it}, max dV = {dmax:.3e} V", flush=True)
         print(f"runtime = {field['solver']['runtime_s']:.2f} s", flush=True)
 
+    return field
+
+
+def solve_laplace_sor_taichi(
+    field: dict,
+    max_iter: int = 20_000,
+    tol: float = 1e-5,
+    omega: float = 1.85,
+    check_every: int = 25,
+    arch: str = "cpu",
+    precision: str | None = None,
+    cpu_max_num_threads: int | None = None,
+    verbose: bool = True,
+) -> dict:
+    """Solve Laplace's equation with optional Taichi red-black SOR.
+
+    ``arch="cpu"`` defaults to f64 and operates directly on the existing
+    NumPy arrays.  ``arch="metal"`` defaults to f32 and keeps device arrays
+    resident for the full iterative solve.  Geometry and boundary masks are
+    not rebuilt or modified by this function.
+    """
+    try:
+        from .taichi_sor import solve_red_black_sor_taichi
+    except ImportError as exc:
+        raise ImportError(
+            "solver='taichi_sor' requires the optional Taichi package and "
+            "the rfa_model/taichi_sor.py backend module. Install Taichi with "
+            "`python -m pip install taichi`, then restart the kernel."
+        ) from exc
+
+    update_region = field.get("update_region")
+    if update_region is None:
+        update_region = np.ones_like(field["fixed"], dtype=bool)
+
+    V, solver_metadata = solve_red_black_sor_taichi(
+        V=field["V"],
+        fixed=field["fixed"],
+        update_region=update_region,
+        max_iter=max_iter,
+        tol=tol,
+        omega=omega,
+        check_every=check_every,
+        arch=arch,
+        precision=precision,
+        cpu_max_num_threads=cpu_max_num_threads,
+        verbose=verbose,
+    )
+
+    field["V"] = V
+    field["solver"] = solver_metadata
     return field
     
 
@@ -1458,10 +1569,23 @@ def build_rfa_field(
     max_iter: int = 20_000,
     tol: float = 1e-5,
     omega: float | None = None,
+    taichi_arch: str = "cpu",
+    taichi_precision: str | None = None,
+    taichi_check_every: int = 25,
+    taichi_cpu_threads: int | None = None,
     verbose: bool = True,
 ) -> dict:
     """
     Build and solve a complete RFA electrostatic field.
+
+    If ``meshes`` contains ``"drifttube"``, that aligned STL is voxelized at
+    ``pitch=h`` and used as the only drift-tube conductor.  The legacy
+    analytic cylinder is disabled automatically.  A fresh call to this
+    function is therefore required after changing the drift-tube alignment.
+
+    Select ``solver="taichi_sor"`` for the optional Taichi red-black SOR
+    backend.  Its validation default is CPU/f64.  On macOS, request
+    ``taichi_arch="metal"`` for the Apple GPU; Metal uses f32.
     """
 
     if voltages is None:
@@ -1502,6 +1626,34 @@ def build_rfa_field(
         R_g3=R_g3,
         R_col=R_col,
     )
+
+    has_drifttube_stl = bool(
+        meshes is not None
+        and "drifttube" in meshes
+        and meshes["drifttube"] is not None
+    )
+    field["drifttube_geometry"] = "stl" if has_drifttube_stl else "analytic"
+
+    if has_drifttube_stl:
+        field["drifttube_bounds_m"] = np.asarray(
+            meshes["drifttube"].bounds,
+            dtype=float,
+        ).copy()
+        field["drifttube_nose_x_m"] = float(
+            field["drifttube_bounds_m"][0, 0]
+        )
+        _log(
+            verbose,
+            "Using aligned drift-tube STL: "
+            f"nose x = {1e3 * field['drifttube_nose_x_m']:.3f} mm",
+        )
+    else:
+        field["drifttube_nose_x_m"] = 0.047
+        _log(
+            verbose,
+            "No drift-tube STL supplied; using the legacy analytic "
+            "cylinder at x = 47.000 mm.",
+        )
 
     if outer_boundary_voltage is None:
         outer_boundary_voltage = float(voltages.get("Vdt", 0.0))
@@ -1548,24 +1700,6 @@ def build_rfa_field(
 
     _log(verbose, "\n[5/7] Marking analytic grid/collector shells ...")
 
-    has_drifttube_stl = (
-        meshes is not None
-        and "drifttube" in meshes
-        and meshes["drifttube"] is not None
-    )
-
-    field["drifttube_geometry"] = (
-        "stl" if has_drifttube_stl else "analytic"
-    )
-
-    if has_drifttube_stl:
-        field["drifttube_bounds_m"] = meshes["drifttube"].bounds.copy()
-        field["drifttube_nose_x_m"] = float(
-            meshes["drifttube"].bounds[0, 0]
-        )
-    else:
-        field["drifttube_nose_x_m"] = 0.047
-
     mark_analytic_rfa_surfaces(
         field,
         voltages=voltages,
@@ -1578,7 +1712,12 @@ def build_rfa_field(
     )
     
     _log(verbose, f"  fixed voxels after analytic shells = {int(field['fixed'].sum()):,}")
-    _log(verbose, f"  update voxels = {int(np.count_nonzero(field['update_region'] & ~field['fixed'])):,}")
+    if verbose:
+        _log(
+            True,
+            "  update voxels = "
+            f"{_count_updatable_voxels(field['update_region'], field['fixed']):,}",
+        )
 
     field["Vfix"] = field["V"].copy()
 
@@ -1592,7 +1731,20 @@ def build_rfa_field(
 
     _log(verbose, "\n[7/7] Solving Laplace equation ...")
 
-    if solver == "numba_sor":
+    if solver in {"taichi", "taichi_sor"}:
+        solve_laplace_sor_taichi(
+            field,
+            max_iter=max_iter,
+            tol=tol,
+            omega=omega if omega is not None else 1.85,
+            check_every=taichi_check_every,
+            arch=taichi_arch,
+            precision=taichi_precision,
+            cpu_max_num_threads=taichi_cpu_threads,
+            verbose=verbose,
+        )
+
+    elif solver == "numba_sor":
         solve_laplace_sor_numba(
             field,
             max_iter=max_iter,
@@ -1626,7 +1778,9 @@ def build_rfa_field(
         )
 
     else:
-        raise ValueError("solver must be 'sor' or 'jacobi'")
+        raise ValueError(
+            "solver must be 'taichi_sor', 'numba_sor', 'sor', or 'jacobi'"
+        )
 
     _log(verbose, "\nCalculating electric field Ex, Ey, Ez ...")
     calculate_electric_field(field)
