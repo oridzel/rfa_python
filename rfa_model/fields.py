@@ -39,7 +39,6 @@ OWNER_ID = {
     "g2_shell": 10,
     "g3_shell": 11,
     "collector_shell": 12,
-    "outer_boundary": 13,
 }
 
 
@@ -412,23 +411,14 @@ def mark_mesh_voxels_by_voxelized(
         & (k >= 0) & (k < len(z))
     )
 
-    n_valid_points = int(valid.sum())
-    n_outside = int(len(valid) - n_valid_points)
+    n_valid = int(valid.sum())
+    n_outside = int(len(valid) - n_valid)
+
+    field.setdefault("mesh_voxel_counts", {})[owner_name] = n_valid
 
     i = i[valid]
     j = j[valid]
     k = k[valid]
-
-    # Ray voxelization may return several points that round to the same field
-    # cell.  Deduplicate the integer indices so metadata reports actual cells,
-    # not raw point rows.
-    flat = np.ravel_multi_index((i, j, k), field["V"].shape)
-    flat = np.unique(flat)
-    i, j, k = np.unravel_index(flat, field["V"].shape)
-    n_unique = int(flat.size)
-
-    field.setdefault("mesh_voxel_counts", {})[owner_name] = n_unique
-    field.setdefault("mesh_voxel_point_counts", {})[owner_name] = n_valid_points
 
     owner_id = owner_id_from_name(owner_name)
 
@@ -438,9 +428,7 @@ def mark_mesh_voxels_by_voxelized(
 
     _log(
         verbose,
-        f"    assigned unique fixed voxels: {n_unique:,}; "
-        f"in-bounds voxel points: {n_valid_points:,}; "
-        f"outside grid: {n_outside:,}; "
+        f"    assigned fixed voxels: {n_valid:,}; outside grid: {n_outside:,}; "
         f"V = {voltage:g} V; owner_id = {owner_id}"
     )
 
@@ -957,7 +945,7 @@ def set_update_region_spherical(
 def set_outer_boundary_fixed(
     field: dict,
     voltage: float = 0.0,
-    owner_name: str = "outer_boundary",
+    owner_name: str = "drifttube",
 ) -> dict:
     """
     Fix the six outer faces of the grid domain.
@@ -989,6 +977,74 @@ def set_outer_boundary_fixed(
 # Laplace solver
 # ============================================================
 
+def _best_tracking_metadata(
+    tol: float,
+    final_delta: float,
+    best_delta: float,
+    best_iteration: int,
+    selected_delta: float,
+    selected_iteration: int,
+    restored_best: bool,
+    restore_best_on_max_iter: bool,
+) -> dict:
+    """
+    Build the best-iterate portion of a solver metadata dictionary.
+
+    Every backend produces the same keys so that downstream code can inspect
+    a solve without caring which solver ran.  ``last_delta`` describes the
+    potential that is actually returned, which is the best checkpointed
+    iterate when a restore happened and the final iterate otherwise.
+    """
+    converged = bool(min(float(final_delta), float(best_delta)) < float(tol))
+
+    return {
+        "last_delta": float(selected_delta),
+        "final_iteration_delta": float(final_delta),
+        "best_delta": float(best_delta),
+        "best_iteration": int(best_iteration),
+        "selected_iteration": int(selected_iteration),
+        "restored_best": bool(restored_best),
+        "restore_best_on_max_iter": bool(restore_best_on_max_iter),
+        "converged": converged,
+        "termination_reason": "tolerance" if converged else "max_iter",
+    }
+
+
+def _select_best_iterate(
+    V: np.ndarray,
+    best_V: np.ndarray | None,
+    tol: float,
+    final_delta: float,
+    best_delta: float,
+    best_iteration: int,
+    final_iteration: int,
+    restore_best_on_max_iter: bool,
+) -> tuple[float, int, bool]:
+    """
+    Copy the best checkpointed iterate back into ``V`` when appropriate.
+
+    A restore happens only when the solve stopped on ``max_iter`` rather than
+    on tolerance, and only when the best checkpoint is not already the final
+    iterate.  ``V`` is modified in place.  Returns the delta, iteration index,
+    and restore flag describing the potential that ``V`` now holds.
+    """
+    if (
+        restore_best_on_max_iter
+        and best_V is not None
+        and float(final_delta) >= float(tol)
+        and int(best_iteration) != int(final_iteration)
+    ):
+        np.copyto(V, best_V)
+        return float(best_delta), int(best_iteration), True
+
+    return float(final_delta), int(final_iteration), False
+
+
+def _checkpoint_bytes(V: np.ndarray, enabled: bool) -> float:
+    """Extra megabytes held by the best-iterate checkpoint."""
+    return (V.nbytes / 1e6) if enabled else 0.0
+
+
 @njit
 def _solve_laplace_sor_numba(
     V,
@@ -998,8 +1054,15 @@ def _solve_laplace_sor_numba(
     omega,
     tol,
     maxit,
+    best_V,
+    restore_best,
+    checkpoint_every,
 ):
     Nx, Ny, Nz = V.shape
+
+    best_delta = np.inf
+    best_iteration = 0
+    dmax = np.inf
 
     for it in range(1, maxit + 1):
         dmax = 0.0
@@ -1033,9 +1096,29 @@ def _solve_laplace_sor_numba(
                         V[i, j, k] = Vfix[i, j, k]
 
         if dmax < tol:
-            return V, it, dmax
+            if dmax < best_delta:
+                best_delta = dmax
+                best_iteration = it
 
-    return V, maxit, dmax
+            return V, it, dmax, best_delta, best_iteration
+
+        # This solver evaluates the residual on every sweep, but copying the
+        # whole potential that often would dominate the runtime, so the
+        # checkpoint itself is thinned by checkpoint_every.
+        is_checkpoint = (
+            it == 1
+            or it % checkpoint_every == 0
+            or it == maxit
+        )
+
+        if is_checkpoint and dmax < best_delta:
+            best_delta = dmax
+            best_iteration = it
+
+            if restore_best:
+                best_V[:, :, :] = V
+
+    return V, maxit, dmax, best_delta, best_iteration
 
 
 def solve_laplace_sor_numba(
@@ -1043,17 +1126,31 @@ def solve_laplace_sor_numba(
     max_iter: int = 20_000,
     tol: float = 2e-5,
     omega: float = 1.90,
+    checkpoint_every: int = 25,
+    restore_best_on_max_iter: bool = True,
     verbose: bool = True,
 ) -> dict:
     """
     Solve Laplace equation using the same Numba in-place SOR method
     used in the old test notebook.
+
+    ``restore_best_on_max_iter`` returns the checkpointed sweep with the
+    smallest maximum update when the tolerance is never reached, instead of
+    whatever the last sweep happened to produce.  ``checkpoint_every``
+    controls how often a checkpoint is taken; the residual itself is still
+    evaluated on every sweep.  Keeping the checkpoint costs one additional
+    full potential array.
     """
     Vfix = field.get("Vfix", field["V"].copy())
     fixed = field["fixed"]
     update_region = field["update_region"]
 
     V = field["V"].copy()
+
+    if int(checkpoint_every) < 1:
+        raise ValueError("checkpoint_every must be at least 1.")
+
+    best_V = np.empty_like(V) if restore_best_on_max_iter else None
 
     if verbose:
         print("Solving Laplace with Numba SOR ...", flush=True)
@@ -1062,10 +1159,16 @@ def solve_laplace_sor_numba(
         print(f"  update voxels: {int(np.count_nonzero(update_region & ~fixed)):,}", flush=True)
         print(f"  omega = {omega}", flush=True)
         print(f"  tol   = {tol}", flush=True)
+        print(
+            f"  restore_best_on_max_iter = {bool(restore_best_on_max_iter)}"
+            f" (+{_checkpoint_bytes(V, restore_best_on_max_iter):.0f} MB,"
+            f" every {int(checkpoint_every)} sweeps)",
+            flush=True,
+        )
 
     t0 = time.perf_counter()
 
-    V, it, dmax = _solve_laplace_sor_numba(
+    V, it, final_delta, best_delta, best_iteration = _solve_laplace_sor_numba(
         V,
         Vfix,
         fixed,
@@ -1073,6 +1176,20 @@ def solve_laplace_sor_numba(
         float(omega),
         float(tol),
         int(max_iter),
+        best_V if best_V is not None else np.empty((1, 1, 1), dtype=V.dtype),
+        bool(restore_best_on_max_iter),
+        int(checkpoint_every),
+    )
+
+    selected_delta, selected_iteration, restored_best = _select_best_iterate(
+        V=V,
+        best_V=best_V,
+        tol=tol,
+        final_delta=final_delta,
+        best_delta=best_delta,
+        best_iteration=best_iteration,
+        final_iteration=it,
+        restore_best_on_max_iter=restore_best_on_max_iter,
     )
 
     field["V"] = V
@@ -1080,14 +1197,32 @@ def solve_laplace_sor_numba(
         "method": "numba_sor",
         "iterations": int(it),
         "tol": float(tol),
-        "last_delta": float(dmax),
         "omega": float(omega),
+        "checkpoint_every": int(checkpoint_every),
         "runtime_s": time.perf_counter() - t0,
-        "converged": bool(dmax < tol),
+        **_best_tracking_metadata(
+            tol=tol,
+            final_delta=final_delta,
+            best_delta=best_delta,
+            best_iteration=best_iteration,
+            selected_delta=selected_delta,
+            selected_iteration=selected_iteration,
+            restored_best=restored_best,
+            restore_best_on_max_iter=restore_best_on_max_iter,
+        ),
     }
 
     if verbose:
-        print(f"Finished: it = {it}, max dV = {dmax:.3e} V", flush=True)
+        if restored_best:
+            print(
+                f"Finished: it = {it}, restored best iterate {selected_iteration} "
+                f"(max dV = {selected_delta:.3e} V, "
+                f"final sweep was {final_delta:.3e} V)",
+                flush=True,
+            )
+        else:
+            print(f"Finished: it = {it}, max dV = {selected_delta:.3e} V", flush=True)
+
         print(f"runtime = {field['solver']['runtime_s']:.2f} s", flush=True)
 
     return field
@@ -1111,6 +1246,9 @@ def solve_laplace_sor_taichi(
     NumPy arrays.  ``arch="metal"`` defaults to f32 and keeps device arrays
     resident for the full iterative solve.  Geometry and boundary masks are
     not rebuilt or modified by this function.
+
+    ``restore_best_on_max_iter`` returns the checked iterate with the
+    smallest maximum update when the tolerance is never reached.
     """
     try:
         from .taichi_sor import solve_red_black_sor_taichi
@@ -1143,7 +1281,7 @@ def solve_laplace_sor_taichi(
     field["V"] = V
     field["solver"] = solver_metadata
     return field
-    
+
 
 def initialize_potential_linear_x(
     field: dict,
@@ -1183,6 +1321,7 @@ def solve_laplace_jacobi(
     tol: float = 1e-5,
     omega: float = 1.0,
     check_every: int = 100,
+    restore_best_on_max_iter: bool = True,
     verbose: bool = True,
 ) -> dict:
     """
@@ -1203,6 +1342,10 @@ def solve_laplace_jacobi(
         For Jacobi, values <=1 are safest.
     check_every:
         Print/check convergence every this many iterations.
+    restore_best_on_max_iter:
+        When the tolerance is never reached, return the checked iterate with
+        the smallest maximum update rather than the final one. Costs one
+        additional full potential array.
     verbose:
         Print progress.
 
@@ -1219,6 +1362,10 @@ def solve_laplace_jacobi(
 
     Vnew = V.copy()
 
+    best_V = np.empty_like(V) if restore_best_on_max_iter else None
+    best_delta = np.inf
+    best_iteration = 0
+
     t0 = time.perf_counter()
     last_delta = np.inf
 
@@ -1227,6 +1374,10 @@ def solve_laplace_jacobi(
         print(f"grid shape: {V.shape}")
         print(f"update voxels: {int(update.sum())}")
         print(f"fixed voxels:  {int(fixed.sum())}")
+        print(
+            f"restore_best_on_max_iter: {bool(restore_best_on_max_iter)} "
+            f"(+{_checkpoint_bytes(V, restore_best_on_max_iter):.0f} MB)"
+        )
 
     for it in range(1, max_iter + 1):
         avg = (
@@ -1250,9 +1401,18 @@ def solve_laplace_jacobi(
                 + omega * avg[inner_update]
             )
 
-        if it % check_every == 0 or it == 1:
+        if it % check_every == 0 or it == 1 or it == max_iter:
             diff = np.abs(Vnew - V)
             last_delta = float(diff[update].max()) if update.any() else 0.0
+
+            if last_delta < best_delta:
+                best_delta = last_delta
+                best_iteration = it
+
+                if best_V is not None:
+                    # Vnew holds the iterate this residual describes; the
+                    # swap below has not happened yet.
+                    np.copyto(best_V, Vnew)
 
             if verbose:
                 elapsed = time.perf_counter() - t0
@@ -1267,15 +1427,37 @@ def solve_laplace_jacobi(
 
         V, Vnew = Vnew, V
 
+    final_delta = last_delta
+
+    selected_delta, selected_iteration, restored_best = _select_best_iterate(
+        V=V,
+        best_V=best_V,
+        tol=tol,
+        final_delta=final_delta,
+        best_delta=best_delta,
+        best_iteration=best_iteration,
+        final_iteration=it,
+        restore_best_on_max_iter=restore_best_on_max_iter,
+    )
+
     field["V"] = V
     field["solver"] = {
         "method": "weighted_jacobi",
-        "iterations": it,
-        "tol": tol,
-        "last_delta": last_delta,
-        "omega": omega,
+        "iterations": int(it),
+        "tol": float(tol),
+        "omega": float(omega),
+        "check_every": int(check_every),
         "runtime_s": time.perf_counter() - t0,
-        "converged": bool(last_delta < tol),
+        **_best_tracking_metadata(
+            tol=tol,
+            final_delta=final_delta,
+            best_delta=best_delta,
+            best_iteration=best_iteration,
+            selected_delta=selected_delta,
+            selected_iteration=selected_iteration,
+            restored_best=restored_best,
+            restore_best_on_max_iter=restore_best_on_max_iter,
+        ),
     }
 
     if verbose:
@@ -1291,12 +1473,17 @@ def solve_laplace_red_black_sor(
     tol: float = 1e-5,
     omega: float = 1.85,
     check_every: int = 100,
+    restore_best_on_max_iter: bool = True,
     verbose: bool = True,
 ) -> dict:
     """
     Solve Laplace equation using red-black SOR.
 
     This is usually much faster than Jacobi.
+
+    ``restore_best_on_max_iter`` returns the checked iterate with the
+    smallest maximum update when the tolerance is never reached, at the cost
+    of one additional full potential array.
 
     Notes
     -----
@@ -1330,6 +1517,10 @@ def solve_laplace_red_black_sor(
     red_inner = red[1:-1, 1:-1, 1:-1]
     black_inner = black[1:-1, 1:-1, 1:-1]
 
+    best_V = np.empty_like(V) if restore_best_on_max_iter else None
+    best_delta = np.inf
+    best_iteration = 0
+
     t0 = time.perf_counter()
     last_delta = np.inf
 
@@ -1339,6 +1530,10 @@ def solve_laplace_red_black_sor(
         print(f"update voxels: {int(update.sum())}")
         print(f"fixed voxels:  {int(fixed.sum())}")
         print(f"omega:         {omega}")
+        print(
+            f"restore_best_on_max_iter: {bool(restore_best_on_max_iter)} "
+            f"(+{_checkpoint_bytes(V, restore_best_on_max_iter):.0f} MB)"
+        )
 
     for it in range(1, max_iter + 1):
         max_delta_iter = 0.0
@@ -1365,8 +1560,15 @@ def solve_laplace_red_black_sor(
                     float(np.max(np.abs(delta))),
                 )
 
-        if it % check_every == 0 or it == 1:
+        if it % check_every == 0 or it == 1 or it == max_iter:
             last_delta = max_delta_iter
+
+            if last_delta < best_delta:
+                best_delta = last_delta
+                best_iteration = it
+
+                if best_V is not None:
+                    np.copyto(best_V, V)
 
             if verbose:
                 elapsed = time.perf_counter() - t0
@@ -1378,14 +1580,36 @@ def solve_laplace_red_black_sor(
             if last_delta < tol:
                 break
 
+    final_delta = last_delta
+
+    selected_delta, selected_iteration, restored_best = _select_best_iterate(
+        V=V,
+        best_V=best_V,
+        tol=tol,
+        final_delta=final_delta,
+        best_delta=best_delta,
+        best_iteration=best_iteration,
+        final_iteration=it,
+        restore_best_on_max_iter=restore_best_on_max_iter,
+    )
+
     field["solver"] = {
         "method": "red_black_sor",
-        "iterations": it,
-        "tol": tol,
-        "last_delta": last_delta,
-        "omega": omega,
+        "iterations": int(it),
+        "tol": float(tol),
+        "omega": float(omega),
+        "check_every": int(check_every),
         "runtime_s": time.perf_counter() - t0,
-        "converged": bool(last_delta < tol),
+        **_best_tracking_metadata(
+            tol=tol,
+            final_delta=final_delta,
+            best_delta=best_delta,
+            best_iteration=best_iteration,
+            selected_delta=selected_delta,
+            selected_iteration=selected_iteration,
+            restored_best=restored_best,
+            restore_best_on_max_iter=restore_best_on_max_iter,
+        ),
     }
 
     if verbose:
@@ -1587,7 +1811,7 @@ def build_rfa_field(
     taichi_precision: str | None = None,
     taichi_check_every: int = 25,
     taichi_cpu_threads: int | None = None,
-    taichi_restore_best_on_max_iter: bool = True,
+    restore_best_on_max_iter: bool = True,
     verbose: bool = True,
 ) -> dict:
     """
@@ -1601,9 +1825,12 @@ def build_rfa_field(
     Select ``solver="taichi_sor"`` for the optional Taichi red-black SOR
     backend.  Its validation default is CPU/f64.  On macOS, request
     ``taichi_arch="metal"`` for the Apple GPU; Metal uses f32.
-    If the tolerance is not reached, ``taichi_restore_best_on_max_iter=True``
-    returns the checked iterate with the smallest maximum SOR update.  This
-    requires one additional full potential array for the checkpoint.
+
+    ``restore_best_on_max_iter`` applies to every solver: when ``max_iter``
+    is exhausted before ``tol`` is met, the returned potential is the
+    checkpointed iterate with the smallest maximum update rather than
+    whichever iterate happened to be last.  It costs one extra copy of the
+    potential array, so pass ``False`` if the build is memory-bound.
     """
 
     if voltages is None:
@@ -1681,7 +1908,7 @@ def build_rfa_field(
     set_outer_boundary_fixed(
         field,
         voltage=outer_boundary_voltage,
-        owner_name="outer_boundary",
+        owner_name="drifttube",
     )
 
     _log(verbose, f"  fixed voxels after boundary = {int(field['fixed'].sum()):,}")
@@ -1759,7 +1986,7 @@ def build_rfa_field(
             arch=taichi_arch,
             precision=taichi_precision,
             cpu_max_num_threads=taichi_cpu_threads,
-            restore_best_on_max_iter=taichi_restore_best_on_max_iter,
+            restore_best_on_max_iter=restore_best_on_max_iter,
             verbose=verbose,
         )
 
@@ -1769,6 +1996,7 @@ def build_rfa_field(
             max_iter=max_iter,
             tol=tol,
             omega=omega if omega is not None else 1.90,
+            restore_best_on_max_iter=restore_best_on_max_iter,
             verbose=verbose,
         )
 
@@ -1781,6 +2009,7 @@ def build_rfa_field(
             max_iter=max_iter,
             tol=tol,
             omega=omega,
+            restore_best_on_max_iter=restore_best_on_max_iter,
             verbose=verbose,
         )
 
@@ -1793,6 +2022,7 @@ def build_rfa_field(
             max_iter=max_iter,
             tol=tol,
             omega=omega,
+            restore_best_on_max_iter=restore_best_on_max_iter,
             verbose=verbose,
         )
 
@@ -1812,6 +2042,15 @@ def build_rfa_field(
     _log(verbose, "\nField build complete")
     _log(verbose, f"total fixed voxels = {int(field['fixed'].sum()):,}")
     _log(verbose, f"solver converged = {field.get('solver', {}).get('converged', None)}")
+    if field.get("solver", {}).get("restored_best", False):
+        _log(
+            verbose,
+            "restored best iterate "
+            f"{field['solver']['selected_iteration']} "
+            f"(max dV = {field['solver']['last_delta']:.3e} V vs "
+            f"{field['solver']['final_iteration_delta']:.3e} V on the "
+            "final iterate)",
+        )
     _log(verbose, f"total elapsed = {time.perf_counter() - t_total:.2f} s")
 
     return field
