@@ -134,6 +134,21 @@ def _reset_max_f32(value: ti.types.ndarray(dtype=ti.f32, ndim=1)):
 
 
 @ti.kernel
+def _copy_3d_f32(
+    source: ti.types.ndarray(dtype=ti.f32, ndim=3),
+    destination: ti.types.ndarray(dtype=ti.f32, ndim=3),
+):
+    """Copy one device-resident f32 potential array to another."""
+    ti.loop_config(block_dim=256)
+    for i, j, k in ti.ndrange(
+        source.shape[0],
+        source.shape[1],
+        source.shape[2],
+    ):
+        destination[i, j, k] = source[i, j, k]
+
+
+@ti.kernel
 def _red_black_step_f64(
     V: ti.types.ndarray(dtype=ti.f64, ndim=3),
     fixed: ti.types.ndarray(dtype=ti.u8, ndim=3),
@@ -262,9 +277,10 @@ def _solve_cpu_external_arrays(
     tol: float,
     omega: float,
     check_every: int,
+    restore_best_on_max_iter: bool,
     verbose: bool,
     t0: float,
-) -> tuple[np.ndarray, int, float]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     dtype = np.float64 if precision == "f64" else np.float32
     if V.dtype != dtype or not V.flags.c_contiguous:
         V_work = np.ascontiguousarray(V, dtype=dtype)
@@ -276,6 +292,9 @@ def _solve_cpu_external_arrays(
     step = _red_black_step_f64 if precision == "f64" else _red_black_step_f32
 
     last_delta = np.inf
+    best_delta = np.inf
+    best_iteration = 0
+    best_V = np.empty_like(V_work) if restore_best_on_max_iter else None
     for it in range(1, int(max_iter) + 1):
         reset(max_delta)
         step(V_work, fixed_u8, update_u8, 0, omega, max_delta)
@@ -283,6 +302,11 @@ def _solve_cpu_external_arrays(
 
         if it == 1 or it % int(check_every) == 0 or it == int(max_iter):
             last_delta = float(max_delta[0])
+            if last_delta < best_delta:
+                best_delta = last_delta
+                best_iteration = it
+                if best_V is not None:
+                    np.copyto(best_V, V_work)
             if verbose:
                 print(
                     f"iter {it:7d}: max update = {last_delta:.6e} V "
@@ -292,9 +316,31 @@ def _solve_cpu_external_arrays(
             if last_delta < tol:
                 break
 
+    final_delta = last_delta
+    selected_delta = final_delta
+    selected_iteration = it
+    restored_best = False
+    if (
+        final_delta >= tol
+        and best_V is not None
+        and best_iteration != it
+    ):
+        np.copyto(V_work, best_V)
+        selected_delta = best_delta
+        selected_iteration = best_iteration
+        restored_best = True
+
     if V_work is not V:
         V[...] = V_work.astype(V.dtype, copy=False)
-    return V, it, last_delta
+    return V, {
+        "iterations": int(it),
+        "final_delta": float(final_delta),
+        "best_delta": float(best_delta),
+        "best_iteration": int(best_iteration),
+        "selected_delta": float(selected_delta),
+        "selected_iteration": int(selected_iteration),
+        "restored_best": bool(restored_best),
+    }
 
 
 def _solve_metal_device_arrays(
@@ -305,20 +351,28 @@ def _solve_metal_device_arrays(
     tol: float,
     omega: float,
     check_every: int,
+    restore_best_on_max_iter: bool,
     verbose: bool,
     t0: float,
-) -> tuple[np.ndarray, int, float]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     shape = tuple(int(n) for n in V.shape)
     V_device = ti.ndarray(dtype=ti.f32, shape=shape)
     fixed_device = ti.ndarray(dtype=ti.u8, shape=shape)
     update_device = ti.ndarray(dtype=ti.u8, shape=shape)
     max_delta = ti.ndarray(dtype=ti.f32, shape=(1,))
+    best_device = (
+        ti.ndarray(dtype=ti.f32, shape=shape)
+        if restore_best_on_max_iter
+        else None
+    )
 
     V_device.from_numpy(np.ascontiguousarray(V, dtype=np.float32))
     fixed_device.from_numpy(fixed_u8)
     update_device.from_numpy(update_u8)
 
     last_delta = np.inf
+    best_delta = np.inf
+    best_iteration = 0
     for it in range(1, int(max_iter) + 1):
         _reset_max_f32(max_delta)
         _red_black_step_f32(
@@ -330,6 +384,11 @@ def _solve_metal_device_arrays(
 
         if it == 1 or it % int(check_every) == 0 or it == int(max_iter):
             last_delta = float(max_delta.to_numpy()[0])
+            if last_delta < best_delta:
+                best_delta = last_delta
+                best_iteration = it
+                if best_device is not None:
+                    _copy_3d_f32(V_device, best_device)
             if verbose:
                 print(
                     f"iter {it:7d}: max update = {last_delta:.6e} V "
@@ -339,9 +398,32 @@ def _solve_metal_device_arrays(
             if last_delta < tol:
                 break
 
-    V[...] = V_device.to_numpy().astype(V.dtype, copy=False)
+    final_delta = last_delta
+    selected_delta = final_delta
+    selected_iteration = it
+    restored_best = False
+    selected_device = V_device
+    if (
+        final_delta >= tol
+        and best_device is not None
+        and best_iteration != it
+    ):
+        selected_device = best_device
+        selected_delta = best_delta
+        selected_iteration = best_iteration
+        restored_best = True
+
+    V[...] = selected_device.to_numpy().astype(V.dtype, copy=False)
     ti.sync()
-    return V, it, last_delta
+    return V, {
+        "iterations": int(it),
+        "final_delta": float(final_delta),
+        "best_delta": float(best_delta),
+        "best_iteration": int(best_iteration),
+        "selected_delta": float(selected_delta),
+        "selected_iteration": int(selected_iteration),
+        "restored_best": bool(restored_best),
+    }
 
 
 def solve_red_black_sor_taichi(
@@ -356,13 +438,18 @@ def solve_red_black_sor_taichi(
     arch: str = "cpu",
     precision: str | None = None,
     cpu_max_num_threads: int | None = None,
+    restore_best_on_max_iter: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Solve a masked 3-D Laplace problem with Taichi red-black SOR.
 
     Parameters are deliberately NumPy-based so the backend stays independent
     of the RFA field dictionary and can be regression-tested on small domains.
-    CPU defaults to f64; Metal is constrained to f32.
+    CPU defaults to f64; Metal is constrained to f32.  When
+    ``restore_best_on_max_iter`` is true and the requested tolerance is not
+    reached, the returned potential is the checked iterate with the smallest
+    maximum SOR update.  Keeping that checkpoint costs one additional full
+    potential array (f64 on CPU or f32 on Metal).
     """
     arch = str(arch).lower()
     if precision is None:
@@ -404,7 +491,7 @@ def solve_red_black_sor_taichi(
 
     solve_start = time.perf_counter()
     if actual_arch == "metal":
-        V_array, iterations, last_delta = _solve_metal_device_arrays(
+        V_array, outcome = _solve_metal_device_arrays(
             V_array,
             fixed_u8,
             update_u8,
@@ -412,11 +499,12 @@ def solve_red_black_sor_taichi(
             tol,
             omega,
             check_every,
+            restore_best_on_max_iter,
             verbose,
             t0,
         )
     else:
-        V_array, iterations, last_delta = _solve_cpu_external_arrays(
+        V_array, outcome = _solve_cpu_external_arrays(
             V_array,
             fixed_u8,
             update_u8,
@@ -425,6 +513,7 @@ def solve_red_black_sor_taichi(
             tol,
             omega,
             check_every,
+            restore_best_on_max_iter,
             verbose,
             t0,
         )
@@ -434,15 +523,27 @@ def solve_red_black_sor_taichi(
         "method": "taichi_red_black_sor",
         "architecture": actual_arch,
         "precision": precision,
-        "iterations": int(iterations),
+        "iterations": int(outcome["iterations"]),
         "tol": float(tol),
-        "last_delta": float(last_delta),
+        # Compatibility: last_delta describes the potential actually returned.
+        "last_delta": float(outcome["selected_delta"]),
+        "final_iteration_delta": float(outcome["final_delta"]),
+        "best_delta": float(outcome["best_delta"]),
+        "best_iteration": int(outcome["best_iteration"]),
+        "selected_iteration": int(outcome["selected_iteration"]),
+        "restored_best": bool(outcome["restored_best"]),
+        "restore_best_on_max_iter": bool(restore_best_on_max_iter),
         "omega": float(omega),
         "check_every": int(check_every),
         "setup_s": float(setup_s),
         "solve_s": float(solve_s),
         "runtime_s": float(time.perf_counter() - t0),
-        "converged": bool(last_delta < tol),
+        "converged": bool(outcome["best_delta"] < tol),
+        "termination_reason": (
+            "tolerance"
+            if outcome["best_delta"] < tol
+            else "max_iter"
+        ),
         "taichi_version": str(getattr(ti, "__version__", "unknown")),
     }
     if cpu_max_num_threads is not None and actual_arch == "cpu":
