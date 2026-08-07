@@ -996,51 +996,256 @@ def nearest_hit(*hits):
 # Analytic sample plane
 # ============================================================
 
+def make_sample_plane_geometry(
+    sample_y_bounds,
+    sample_z_bounds,
+    theta_deg: float = 0.0,
+    x_sample: float = 0.0,
+):
+    """Build the finite rotated sample plane used by launch and tracking.
+
+    The unrotated sample front face is the plane ``x=x_sample`` with its
+    vacuum-side normal along +X.  ``theta_deg`` rotates the sample around the
+    global +Z axis through the centre of the sample face.  The original
+    y/z bounds therefore become bounds in the sample's local in-plane
+    coordinates (u, v), not axis-aligned global bounds after rotation.
+
+    This representation is continuous and independent of the electrostatic
+    voxel spacing.  The voxel grid is still used to solve the field and to
+    verify that a launch point is in vacuum, but it no longer defines where a
+    finite beam ray intersects the physical sample surface.
+    """
+    if sample_y_bounds is None or sample_z_bounds is None:
+        raise ValueError(
+            "sample_y_bounds and sample_z_bounds are required to build "
+            "rotated sample geometry"
+        )
+
+    y_lo, y_hi = map(float, sample_y_bounds)
+    z_lo, z_hi = map(float, sample_z_bounds)
+
+    y_c = 0.5 * (y_lo + y_hi)
+    z_c = 0.5 * (z_lo + z_hi)
+
+    a = np.deg2rad(float(theta_deg))
+    ca = float(np.cos(a))
+    sa = float(np.sin(a))
+
+    normal = np.array([ca, sa, 0.0], dtype=float)
+    u_axis = np.array([-sa, ca, 0.0], dtype=float)
+    v_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    return {
+        "center": np.array([float(x_sample), y_c, z_c], dtype=float),
+        "normal": normal,
+        "u_axis": u_axis,
+        "v_axis": v_axis,
+        "u_bounds": (y_lo - y_c, y_hi - y_c),
+        "v_bounds": (z_lo - z_c, z_hi - z_c),
+        "theta_deg": float(theta_deg),
+        "x_sample_unrotated": float(x_sample),
+    }
+
+
+def _validated_sample_geometry(sample_geometry):
+    """Return a normalized copy of a sample-geometry dictionary."""
+    if not isinstance(sample_geometry, dict):
+        raise TypeError("sample_geometry must be a dict")
+
+    center = np.asarray(sample_geometry["center"], dtype=float)
+    normal = np.asarray(sample_geometry["normal"], dtype=float)
+    u_axis = np.asarray(sample_geometry["u_axis"], dtype=float)
+    v_axis = np.asarray(sample_geometry["v_axis"], dtype=float)
+
+    if not all(_is_finite_vec(v) for v in (center, normal, u_axis, v_axis)):
+        raise ValueError("sample_geometry contains a non-finite 3-vector")
+
+    def _norm(v, name):
+        mag = float(np.linalg.norm(v))
+        if not np.isfinite(mag) or mag <= 0.0:
+            raise ValueError(f"sample_geometry[{name!r}] has zero/invalid norm")
+        return v / mag
+
+    normal = _norm(normal, "normal")
+    u_axis = _norm(u_axis, "u_axis")
+    v_axis = _norm(v_axis, "v_axis")
+
+    out = dict(sample_geometry)
+    out.update({
+        "center": center,
+        "normal": normal,
+        "u_axis": u_axis,
+        "v_axis": v_axis,
+    })
+    return out
+
+
+def sample_plane_coordinates(p, sample_geometry):
+    """Return signed normal distance and local (u, v) coordinates."""
+    geom = _validated_sample_geometry(sample_geometry)
+    p = np.asarray(p, dtype=float)
+    rel = p - geom["center"]
+    return (
+        float(np.dot(rel, geom["normal"])),
+        float(np.dot(rel, geom["u_axis"])),
+        float(np.dot(rel, geom["v_axis"])),
+    )
+
+
+def sample_point_is_in_bounds(location, sample_geometry, tol: float = 1.0e-12):
+    """True if a point on the sample plane lies inside the finite sample face."""
+    geom = _validated_sample_geometry(sample_geometry)
+    _, u, v = sample_plane_coordinates(location, geom)
+
+    u_bounds = geom.get("u_bounds", None)
+    v_bounds = geom.get("v_bounds", None)
+
+    if u_bounds is not None:
+        if u < float(u_bounds[0]) - tol or u > float(u_bounds[1]) + tol:
+            return False
+    if v_bounds is not None:
+        if v < float(v_bounds[0]) - tol or v > float(v_bounds[1]) + tol:
+            return False
+
+    return True
+
+
+def ray_hits_sample_plane(
+    ray_origin,
+    ray_direction,
+    sample_geometry,
+    require_in_bounds: bool = True,
+    eps: float = 1.0e-15,
+):
+    """Intersect a forward ray with the finite oriented sample plane.
+
+    ``ray_direction`` need not be normalized.  The returned ``distance`` is
+    the physical distance from ``ray_origin`` to the intersection.
+    """
+    geom = _validated_sample_geometry(sample_geometry)
+    p0 = np.asarray(ray_origin, dtype=float)
+    d = np.asarray(ray_direction, dtype=float)
+
+    if not _is_finite_vec(p0) or not _is_finite_vec(d):
+        return None
+
+    dnorm = float(np.linalg.norm(d))
+    if not np.isfinite(dnorm) or dnorm <= eps:
+        return None
+
+    dhat = d / dnorm
+    denom = float(np.dot(geom["normal"], dhat))
+    if abs(denom) <= eps:
+        return None
+
+    distance_along_ray = float(
+        np.dot(geom["normal"], geom["center"] - p0) / denom
+    )
+    if not np.isfinite(distance_along_ray) or distance_along_ray < -eps:
+        return None
+
+    distance_along_ray = max(0.0, distance_along_ray)
+    location = p0 + distance_along_ray * dhat
+
+    if require_in_bounds and not sample_point_is_in_bounds(location, geom):
+        return None
+
+    _, u, v = sample_plane_coordinates(location, geom)
+
+    hit = {
+        "kind": "sample_plane",
+        "location": location,
+        "distance": distance_along_ray,
+        "owner": "sample",
+        "normal": geom["normal"].copy(),
+        "sample_u": u,
+        "sample_v": v,
+        "sample_theta_deg": geom.get("theta_deg", np.nan),
+    }
+    return add_owner_metadata(hit, owner_name="sample")
+
+
 def segment_hits_sample_plane(
     p0,
     p1,
     x_sample: float = 0.0,
     sample_y_bounds=None,
     sample_z_bounds=None,
+    sample_geometry=None,
 ):
-    """
-    Check if segment p0 -> p1 crosses the analytic sample plane x=x_sample.
+    """Check whether segment ``p0 -> p1`` crosses the finite sample face.
 
-    Optionally require the crossing point to lie within sample y/z bounds.
+    Preferred path
+    --------------
+    Pass ``sample_geometry`` from :func:`make_sample_plane_geometry`.  This
+    supports a sample rotated around Z and checks the finite face in local
+    in-plane coordinates.
+
+    Backward-compatible path
+    ------------------------
+    If no geometry is supplied, the old ``x=x_sample`` plane is reconstructed
+    from ``sample_y_bounds`` / ``sample_z_bounds`` with ``theta_deg=0``.
     """
     p0 = np.asarray(p0, dtype=float)
     p1 = np.asarray(p1, dtype=float)
 
-    x0 = p0[0] - x_sample
-    x1 = p1[0] - x_sample
-
-    if x0 * x1 > 0:
+    if not _is_finite_vec(p0) or not _is_finite_vec(p1):
         return None
 
-    if abs(x0 - x1) < 1e-30:
+    if sample_geometry is None:
+        if sample_y_bounds is None or sample_z_bounds is None:
+            # Preserve the legacy unbounded x-plane behavior when bounds were
+            # intentionally omitted.
+            y_bounds = (-np.inf, np.inf)
+            z_bounds = (-np.inf, np.inf)
+        else:
+            y_bounds = sample_y_bounds
+            z_bounds = sample_z_bounds
+
+        sample_geometry = make_sample_plane_geometry(
+            y_bounds,
+            z_bounds,
+            theta_deg=0.0,
+            x_sample=x_sample,
+        )
+
+    geom = _validated_sample_geometry(sample_geometry)
+    n = geom["normal"]
+    C = geom["center"]
+
+    d0 = float(np.dot(p0 - C, n))
+    d1 = float(np.dot(p1 - C, n))
+
+    # Strictly same side -> no crossing.  A point exactly on the plane is
+    # allowed so a segment that lands numerically on the surface is retained.
+    if d0 * d1 > 0.0:
         return None
 
-    t = x0 / (x0 - x1)
+    denom = d0 - d1
+    if abs(denom) < 1.0e-30:
+        return None
 
+    t = d0 / denom
     if not (0.0 <= t <= 1.0):
         return None
 
     location = p0 + t * (p1 - p0)
+    if not sample_point_is_in_bounds(location, geom):
+        return None
 
-    if sample_y_bounds is not None:
-        if not (sample_y_bounds[0] <= location[1] <= sample_y_bounds[1]):
-            return None
-
-    if sample_z_bounds is not None:
-        if not (sample_z_bounds[0] <= location[2] <= sample_z_bounds[1]):
-            return None
+    _, u, v = sample_plane_coordinates(location, geom)
 
     hit = {
         "kind": "sample_plane",
         "location": location,
-        "distance": np.linalg.norm(location - p0),
+        "distance": float(np.linalg.norm(location - p0)),
+        "t": float(t),
         "owner": "sample",
-        "normal": np.array([1.0, 0.0, 0.0]),
+        "normal": n.copy(),
+        "sample_u": u,
+        "sample_v": v,
+        "sample_theta_deg": geom.get("theta_deg", np.nan),
     }
 
     return add_owner_metadata(hit, owner_name="sample")
+
