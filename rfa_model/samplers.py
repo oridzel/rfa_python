@@ -78,18 +78,15 @@ CARBON_COATED_SURFACES = COLLECTOR_SURFACES | {
 
 # Analytic zero-thickness spheres standing in for the woven wire mesh.
 #
-# These are the ONLY surfaces excluded from the incidence-angle yield law.
-# Two independent reasons:
-#   1. The normal used for a mesh hit is the sphere's radial direction, which
-#      is not the local normal of a wire. The true incidence angle on the wire
-#      depends on where around the wire circumference the electron lands, and
-#      that information does not exist in the analytic-sphere representation.
-#   2. The grid yield curves are JMONSEL "FromWire" tables, which already
-#      average over wire geometry. Applying a secant law on top would
-#      double-count the geometric enhancement.
+# The sphere's radial normal describes the local mesh plane, not a wire
+# circumference. For a plane-derived measured yield, every mesh impact samples
+# an effective cylindrical-wire normal using the incoming trajectory and a
+# random impact parameter; the capped angular law is then applied to that event.
+# For a JMONSEL FromWire curve, the sampled cosine is ignored for yield magnitude
+# because the FromWire table already averages over wire geometry.
 #
 # Grid FRAMES are NOT in this set: they are real STL solids with genuine face
-# normals from collisions.py, so they take the angular law like any other solid.
+# normals from collisions.py and use plane-surface emission logic.
 ANALYTIC_MESH_SURFACES = {
     "g1mesh",
     "g2mesh",
@@ -108,22 +105,12 @@ GRID_FRAME_SURFACES = {
     "g3frame",
 }
 
-# Wire-geometry gain for converting a FLAT-PLANE yield curve to a WOVEN-WIRE
-# surface.
-#
-# A cylindrical wire presents a range of local incidence angles to a parallel
-# beam. Averaging the escape-depth factor 1/cos(theta) over the illuminated
-# half-cylinder, weighted by projected area (uniform impact parameter b, with
-# cos(theta) = sqrt(1 - b^2)):
-#
-#     <1/cos> = (1/2) * integral_{-1}^{1} db / sqrt(1 - b^2) = pi/2
-#
-# so a wire yields pi/2 ~ 1.571 times the flat-plane value at normal incidence
-# on the mesh plane.
-#
-# This factor must be applied when (and only when) a plane-derived curve is
-# used on the analytic mesh. The JMONSEL "FromWire" curves already contain it
-# by construction, which is why they are used with a gain of exactly 1.0.
+# Analytical reference for an uncapped secant law averaged over the
+# illuminated half of a cylindrical wire. The cascade no longer applies this
+# as one fixed multiplier. For plane-derived grid yields it samples an
+# effective local wire normal for every impact and applies the capped angular
+# law to that event. Keeping the reference value is useful for diagnostics and
+# backward-compatible imports.
 WIRE_GEOMETRY_GAIN = float(np.pi / 2.0)
 
 # Cap on the 1/cos(theta) incidence-angle yield enhancement.
@@ -352,6 +339,7 @@ def load_energy_sampler_csv(path: str | Path) -> dict:
     return {
         "E": Egrid,
         "tables": tables,
+        "source": path.name,
     }
 
 
@@ -402,6 +390,7 @@ def load_theta_sampler_csv(path: str | Path) -> dict:
     return {
         "E": Egrid,
         "tables": tables,
+        "source": path.name,
     }
 
 
@@ -436,9 +425,11 @@ def load_default_surface_models(
         grid frames, replacing the JMONSEL glassy-carbon-on-tungsten "FromWire"
         curves. The grid wires and frames are carbon sputter-coated, and the
         frames are carbon on 316 stainless -- the same system as the witness
-        coupon. Because the measured curve is a flat-plane measurement, the
-        mesh additionally receives WIRE_GEOMETRY_GAIN = pi/2; the flat frames
-        do not. Emitted energy/angle distributions stay JMONSEL FromWire.
+        coupon. Because the measured curve is a flat-plane measurement, each
+        mesh hit samples an effective local cylindrical-wire normal and applies
+        the capped angular law event by event. Grid frames use plane-carbon
+        energy/angle samplers and vacuum-hemisphere emission from their STL
+        normals; mesh energy/angle distributions remain JMONSEL FromWire.
         Requires use_measured_carbon_coating=True.
 
     Returns
@@ -488,6 +479,18 @@ def load_default_surface_models(
             "BSE": load_energy_sampler_csv(model_dir / "BSEeEFromPlaneSampler_glassyCarbon_t150000nmCuFPA.csv"),
             "SE": load_energy_sampler_csv(model_dir / "SEeEFromPlaneSampler_glassyCarbon_t150000nmCuFPA.csv"),
         },
+    }
+
+    # Grid frames are real, flat STL solids. They use the same plane-carbon
+    # energy and angular distributions as the collector family, not the woven-
+    # wire FromWire samplers used by the analytic grid meshes.
+    theta_models["gridframe"] = {
+        "BSE": theta_models["collector"]["BSE"],
+        "SE": theta_models["collector"]["SE"],
+    }
+    energy_models["gridframe"] = {
+        "BSE": energy_models["collector"]["BSE"],
+        "SE": energy_models["collector"]["SE"],
     }
 
     # MATLAB used sample energy distributions for holder/receiver.
@@ -542,8 +545,9 @@ def load_default_surface_models(
     #       is already averaged into these, so geometry="wire".
     #   use_measured_carbon_for_grids=True
     #       The measured C-on-SS curves, which are FLAT-PLANE measurements, so
-    #       geometry="plane". sample_surface_event() then applies
-    #       WIRE_GEOMETRY_GAIN on the mesh and nothing extra on the frames.
+    #       geometry="plane". Each mesh impact samples a local wire normal and
+    #       receives the capped event-specific angular gain; frames use their
+    #       real STL normals with no wire conversion.
     grid_bsey_jmonsel = load_yield_curve_csv(
         model_dir / "BSEYFromWire_glassyCarbon_t70nmWFPA.csv"
     )
@@ -754,13 +758,15 @@ def surface_family(surface_name: str) -> str:
 
 def is_fullsphere_surface(surface_name: str) -> bool:
     """
-    True for grid mesh/frame emission where MATLAB allowed full-sphere emission.
+    True only for analytic woven-wire mesh emission.
+
+    Grid frames are finite STL solids and must emit into their vacuum-side
+    hemisphere like the collector, rod, and drift tube.
     """
     s = canonical_surface_name(surface_name)
 
     return s in [
         "g1mesh", "g2mesh", "g3mesh",
-        "g1frame", "g2frame", "g3frame",
         "grid",
     ]
 
@@ -809,6 +815,17 @@ def interp_yield_model(model: dict, Einc: float) -> float:
     return float(np.interp(Einc, E, Y, left=Y[0], right=Y[-1]))
 
 
+def _surface_model_key(models: dict, surface_name: str) -> str:
+    """Return the model-dictionary key for a specific physical surface."""
+    surf = canonical_surface_name(surface_name)
+    fam = surface_family(surface_name)
+
+    if surf in GRID_FRAME_SURFACES and "gridframe" in models:
+        return "gridframe"
+
+    return fam
+
+
 def sample_surface_event(
     yield_models: dict,
     surface_name: str,
@@ -831,16 +848,8 @@ def sample_surface_event(
     Nse:
         Poisson-sampled number of secondary electrons.
     """
-    fam = surface_family(surface_name)
     surf = canonical_surface_name(surface_name)
-
-    # Grid frames may carry their own curves (carbon on 316 SS, flat hoops)
-    # distinct from the woven wire mesh. Fall back to the grid family when no
-    # separate "gridframe" entry was loaded, so older model dicts still work.
-    model_key = fam
-
-    if surf in GRID_FRAME_SURFACES and "gridframe" in yield_models:
-        model_key = "gridframe"
+    model_key = _surface_model_key(yield_models, surface_name)
 
     sey_mdl = yield_models[model_key]["SEY"]
     bsey_mdl = yield_models[model_key]["BSEY"]
@@ -851,22 +860,21 @@ def sample_surface_event(
     # Geometry gain. Three cases:
     #
     #   analytic mesh + "wire" curve   gain 1.0
-    #       JMONSEL FromWire already averages over the wire cross-section.
-    #   analytic mesh + "plane" curve  gain WIRE_GEOMETRY_GAIN = pi/2
-    #       A flat-plane measurement applied to a cylindrical wire needs the
-    #       projected-area average of 1/cos restored.
-    #   everything else                gain 1/cos(theta), capped
-    #       Real surfaces with a meaningful local normal: sample, holder,
-    #       receiver, rod, drift tube, grid frames, collector sphere.
+    #       JMONSEL FromWire already averages over wire geometry.
+    #   analytic mesh + "plane" curve  event-specific capped 1/cos(theta)
+    #       generate_surface_emissions() samples an effective local cylindrical
+    #       wire normal for this impact and passes its incidence cosine here.
+    #   every real solid surface        event-specific capped 1/cos(theta)
+    #       The STL/local spherical normal is physically meaningful.
     #
-    # The SEY and BSEY curves are checked independently so a mixed pair cannot
-    # silently pick up the wrong gain.
+    # SEY and BSEY are checked independently so a mixed pair cannot silently
+    # pick up the wrong treatment.
     def _geometry_gain(model):
         if surf in ANALYTIC_MESH_SURFACES:
             geom = "wire"
             if isinstance(model, dict):
                 geom = str(model.get("geometry", "wire"))
-            return WIRE_GEOMETRY_GAIN if geom == "plane" else 1.0
+            return angular_yield_gain(cos_theta) if geom == "plane" else 1.0
         return angular_yield_gain(cos_theta)
 
     sey_val = sey_base * _geometry_gain(sey_mdl)
@@ -876,8 +884,8 @@ def sample_surface_event(
     #
     # Every surface runs directly off its curve:
     #   sample                      JMONSEL Cu
-    #   grid mesh / grid frames     measured C-on-SS (wire gain on the mesh
-    #                               only), or JMONSEL FromWire
+    #   grid mesh / grid frames     measured C-on-SS (event-sampled wire
+    #                               incidence on mesh only), or JMONSEL FromWire
     #   collector / rod / drifttube measured C-on-SS
     #   holder / receiver           Bronstein Mo / Ti
     #
@@ -1027,10 +1035,10 @@ def sample_surface_energy(
     Einc: float,
     rng,
 ) -> float:
-    fam = surface_family(surface_name)
+    model_key = _surface_model_key(energy_models, surface_name)
     kind = kind.upper()
 
-    mdl = energy_models[fam][kind]
+    mdl = energy_models[model_key][kind]
 
     Einc = max(float(Einc), 0.01)
 
@@ -1066,10 +1074,10 @@ def sample_surface_theta(
     For cosine models:
         theta = asin(sqrt(u))
     """
-    fam = surface_family(surface_name)
+    model_key = _surface_model_key(theta_models, surface_name)
     kind = kind.upper()
 
-    mdl = theta_models[fam][kind]
+    mdl = theta_models[model_key][kind]
 
     if isinstance(mdl, str) and mdl.lower() == "cosine":
         theta_rad = np.arcsin(np.sqrt(rng.random()))
@@ -1238,26 +1246,28 @@ def generate_surface_emissions(
     r_hit = np.asarray(r_hit, dtype=float)
     v_in = np.asarray(v_in, dtype=float)
 
-    fam = surface_family(surface_name)
     surf = canonical_surface_name(surface_name)
-
-    # Orient the normal against the incoming velocity for every surface that
-    # has a real local normal. Grid FRAMES are included now: their STL face
-    # normal is already oriented by cascade.estimate_surface_normal(), so this
-    # is a no-op there, but it makes the sign of cos_theta safe by construction
-    # rather than by assumption.
-    if surf not in ANALYTIC_MESH_SURFACES:
-        n_out = orient_normal_against_incoming(n_out, v_in)
 
     vhat = unit(v_in)
 
     if surf in ANALYTIC_MESH_SURFACES:
-        # Zero-thickness analytic sphere standing in for woven wire: the radial
-        # normal is not the local wire normal, so no meaningful incidence angle
-        # exists here. Leave the yield at its normal-incidence value.
-        cos_theta = 1.0
+        # The analytic shell only provides the local mesh-plane normal. Sample
+        # a cylindrical-wire normal at this impact so a plane-derived measured
+        # curve responds to the actual incoming direction and random impact
+        # parameter. JMONSEL FromWire yield curves ignore this cosine because
+        # they already average over wire geometry, but the sampled normal is
+        # still recorded for diagnostics.
+        n_out = sample_effective_wire_normal_for_grid_hit(
+            n_grid=n_out,
+            v_in=v_in,
+            rng=rng,
+        )
     else:
-        cos_theta = max(0.05, -float(np.dot(vhat, n_out)))
+        # Real surfaces, including grid frames, use their STL/local surface
+        # normal oriented toward the incident vacuum half-space.
+        n_out = orient_normal_against_incoming(n_out, v_in)
+
+    cos_theta = max(0.05, -float(np.dot(vhat, n_out)))
 
     Einc = float(Einc)
     Phi_emit = surface_voltage(surface_name, voltages)
@@ -1334,7 +1344,7 @@ def generate_surface_emissions(
                 # Clamp to a small positive value so speed stays real.
                 E_bse_launch = max(E_bse + phi_correction, 1.0e-3)
 
-                if fam == "grid":
+                if surf in ANALYTIC_MESH_SURFACES:
                     axis_backscatter = -unit(v_in)
 
                     v_bse = launch_electron_about_axis(
@@ -1401,7 +1411,7 @@ def generate_surface_emissions(
         # Clamp to a small positive value so speed stays real.
         E_se_launch = max(E_se + phi_correction, 1.0e-3)
 
-        if fam == "grid":
+        if surf in ANALYTIC_MESH_SURFACES:
             axis_backscatter = -unit(v_in)
 
             v_se = launch_electron_about_axis(
@@ -1447,24 +1457,14 @@ def describe_surface_yields(
     verbose: bool = True,
 ):
     """
-    Audit which yield curve each surface actually uses, and what it delivers.
+    Audit curve provenance and effective sampled yields for representative
+    surfaces.
 
-    Two independent checks, because they fail in different ways:
-
-    1. CURVE PROVENANCE -- reads yield_models directly and reports the source
-       label and geometry tag of every family. Catches "the loader was called
-       without use_measured_carbon_for_grids=True".
-
-    2. EFFECTIVE YIELD -- drives the real sample_surface_event() for each
-       surface and averages the sampled BSE flag and SE count. Catches routing
-       and geometry-gain problems that inspecting the dict cannot: a frame
-       silently falling back to the mesh curve, a plane curve not receiving
-       WIRE_GEOMETRY_GAIN, a multiplier not being threaded through.
-
-    There are no yield multipliers any more, so what this prints is exactly
-    what a run will use.
-
-    Returns a list of dict rows, and prints a table when verbose.
+    For an analytic grid mesh using a plane-derived measured curve, this audit
+    follows the real cascade path: it samples a local cylindrical-wire normal
+    for every trial, computes that event's incidence cosine, and applies the
+    capped angular law. A JMONSEL FromWire curve remains at gain 1 because its
+    wire geometry is already included.
     """
     probes = [
         ("g1mesh", "grid mesh (analytic sphere, woven wire)"),
@@ -1476,13 +1476,23 @@ def describe_surface_yields(
         ("holder", "holder"),
     ]
 
+    c_macro = float(np.clip(cos_theta, 0.0, 1.0))
+    n_grid_audit = np.array([1.0, 0.0, 0.0])
+    v_in_audit = np.array([
+        -c_macro,
+        np.sqrt(max(0.0, 1.0 - c_macro * c_macro)),
+        0.0,
+    ])
+
     if verbose:
-        print("=" * 78)
+        print("=" * 82)
         print("CURVE PROVENANCE")
-        print("=" * 78)
+        print("=" * 82)
         print(f"{'family':12}{'kind':6}{'geometry':10}source")
 
-        for fam in ("sample", "grid", "gridframe", "collector", "holder", "receiver"):
+        for fam in (
+            "sample", "grid", "gridframe", "collector", "holder", "receiver"
+        ):
             if fam not in yield_models:
                 print(f"{fam:12}{'--':6}{'--':10}<MISSING from yield_models>")
                 continue
@@ -1495,13 +1505,13 @@ def describe_surface_yields(
                 )
 
         print()
-        print("=" * 78)
+        print("=" * 82)
         print(
-            f"EFFECTIVE YIELDS through sample_surface_event  "
-            f"(cos_theta={cos_theta:g}, N={n_samples:,})"
+            "EFFECTIVE YIELDS through sample_surface_event  "
+            f"(macroscopic cos_theta={c_macro:g}, N={n_samples:,})"
         )
-        print("=" * 78)
-        header = f"{'surface':11}{'gain':>8}"
+        print("=" * 82)
+        header = f"{'surface':11}{'mean gain':>11}"
         for E in energies:
             header += f"{'SEY@' + format(E, '.0f'):>12}{'BSEY':>8}"
         print(header)
@@ -1509,20 +1519,36 @@ def describe_surface_yields(
     rows = []
 
     for surf, _label in probes:
-        if surface_family(surf) not in yield_models:
+        model_key = _surface_model_key(yield_models, surf)
+        if model_key not in yield_models:
             continue
 
         canon = canonical_surface_name(surf)
+        sey_model = yield_models[model_key]["SEY"]
+        sey_geom = str(sey_model.get("geometry", "wire"))
 
-        if canon in ANALYTIC_MESH_SURFACES:
-            key = "gridframe" if canon in GRID_FRAME_SURFACES else surface_family(surf)
-            geom = str(yield_models[key].get("SEY", {}).get("geometry", "wire"))
-            gain = WIRE_GEOMETRY_GAIN if geom == "plane" else 1.0
+        gain_rng = np.random.default_rng(seed + 991)
+        if canon in ANALYTIC_MESH_SURFACES and sey_geom == "plane":
+            gains = []
+            for _ in range(n_samples):
+                n_wire = sample_effective_wire_normal_for_grid_hit(
+                    n_grid=n_grid_audit,
+                    v_in=v_in_audit,
+                    rng=gain_rng,
+                )
+                c_event = max(
+                    0.05,
+                    -float(np.dot(unit(v_in_audit), n_wire)),
+                )
+                gains.append(angular_yield_gain(c_event))
+            mean_gain = float(np.mean(gains))
+        elif canon in ANALYTIC_MESH_SURFACES:
+            mean_gain = 1.0
         else:
-            gain = angular_yield_gain(cos_theta)
+            mean_gain = angular_yield_gain(c_macro)
 
-        row = {"surface": surf, "geometry_gain": gain}
-        line = f"{surf:11}{gain:8.3f}"
+        row = {"surface": surf, "geometry_gain": mean_gain}
+        line = f"{surf:11}{mean_gain:11.3f}"
 
         for E in energies:
             rng = np.random.default_rng(seed)
@@ -1530,11 +1556,23 @@ def describe_surface_yields(
             n_se = 0
 
             for _ in range(n_samples):
+                c_event = c_macro
+                if canon in ANALYTIC_MESH_SURFACES and sey_geom == "plane":
+                    n_wire = sample_effective_wire_normal_for_grid_hit(
+                        n_grid=n_grid_audit,
+                        v_in=v_in_audit,
+                        rng=rng,
+                    )
+                    c_event = max(
+                        0.05,
+                        -float(np.dot(unit(v_in_audit), n_wire)),
+                    )
+
                 did_bse, nse = sample_surface_event(
                     yield_models=yield_models,
                     surface_name=surf,
                     Einc=float(E),
-                    cos_theta=cos_theta,
+                    cos_theta=c_event,
                     rng=rng,
                 )
                 n_bse += bool(did_bse)
@@ -1555,9 +1593,10 @@ def describe_surface_yields(
         print()
         print(
             "Expected when use_measured_carbon_for_grids=True:\n"
-            "  grid/gridframe/collector all show the measured C-on-SS source,\n"
-            "  g1mesh gain = 1.571 (pi/2), every other surface gain = 1/cos,\n"
-            "  and g1mesh SEY ~= 1.571 x g1frame SEY at the same energy."
+            "  grid/gridframe/collector show the measured C-on-SS source;\n"
+            "  g1mesh uses an event-sampled wire incidence gain rather than a\n"
+            "  fixed pi/2 multiplier; and g1frame uses plane-carbon samplers\n"
+            "  with vacuum-hemisphere emission from its STL normal."
         )
 
     return rows
