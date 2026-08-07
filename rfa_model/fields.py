@@ -39,6 +39,7 @@ OWNER_ID = {
     "g2_shell": 10,
     "g3_shell": 11,
     "collector_shell": 12,
+    "outer_boundary": 13,
 }
 
 
@@ -411,14 +412,23 @@ def mark_mesh_voxels_by_voxelized(
         & (k >= 0) & (k < len(z))
     )
 
-    n_valid = int(valid.sum())
-    n_outside = int(len(valid) - n_valid)
-
-    field.setdefault("mesh_voxel_counts", {})[owner_name] = n_valid
+    n_valid_points = int(valid.sum())
+    n_outside = int(len(valid) - n_valid_points)
 
     i = i[valid]
     j = j[valid]
     k = k[valid]
+
+    # Ray voxelization may return several points that round to the same field
+    # cell.  Deduplicate the integer indices so metadata reports actual cells,
+    # not raw point rows.
+    flat = np.ravel_multi_index((i, j, k), field["V"].shape)
+    flat = np.unique(flat)
+    i, j, k = np.unravel_index(flat, field["V"].shape)
+    n_unique = int(flat.size)
+
+    field.setdefault("mesh_voxel_counts", {})[owner_name] = n_unique
+    field.setdefault("mesh_voxel_point_counts", {})[owner_name] = n_valid_points
 
     owner_id = owner_id_from_name(owner_name)
 
@@ -428,7 +438,9 @@ def mark_mesh_voxels_by_voxelized(
 
     _log(
         verbose,
-        f"    assigned fixed voxels: {n_valid:,}; outside grid: {n_outside:,}; "
+        f"    assigned unique fixed voxels: {n_unique:,}; "
+        f"in-bounds voxel points: {n_valid_points:,}; "
+        f"outside grid: {n_outside:,}; "
         f"V = {voltage:g} V; owner_id = {owner_id}"
     )
 
@@ -945,7 +957,7 @@ def set_update_region_spherical(
 def set_outer_boundary_fixed(
     field: dict,
     voltage: float = 0.0,
-    owner_name: str = "drifttube",
+    owner_name: str = "outer_boundary",
 ) -> dict:
     """
     Fix the six outer faces of the grid domain.
@@ -1090,6 +1102,7 @@ def solve_laplace_sor_taichi(
     arch: str = "cpu",
     precision: str | None = None,
     cpu_max_num_threads: int | None = None,
+    restore_best_on_max_iter: bool = True,
     verbose: bool = True,
 ) -> dict:
     """Solve Laplace's equation with optional Taichi red-black SOR.
@@ -1123,6 +1136,7 @@ def solve_laplace_sor_taichi(
         arch=arch,
         precision=precision,
         cpu_max_num_threads=cpu_max_num_threads,
+        restore_best_on_max_iter=restore_best_on_max_iter,
         verbose=verbose,
     )
 
@@ -1573,6 +1587,7 @@ def build_rfa_field(
     taichi_precision: str | None = None,
     taichi_check_every: int = 25,
     taichi_cpu_threads: int | None = None,
+    taichi_restore_best_on_max_iter: bool = True,
     verbose: bool = True,
 ) -> dict:
     """
@@ -1586,6 +1601,9 @@ def build_rfa_field(
     Select ``solver="taichi_sor"`` for the optional Taichi red-black SOR
     backend.  Its validation default is CPU/f64.  On macOS, request
     ``taichi_arch="metal"`` for the Apple GPU; Metal uses f32.
+    If the tolerance is not reached, ``taichi_restore_best_on_max_iter=True``
+    returns the checked iterate with the smallest maximum SOR update.  This
+    requires one additional full potential array for the checkpoint.
     """
 
     if voltages is None:
@@ -1663,7 +1681,7 @@ def build_rfa_field(
     set_outer_boundary_fixed(
         field,
         voltage=outer_boundary_voltage,
-        owner_name="drifttube",
+        owner_name="outer_boundary",
     )
 
     _log(verbose, f"  fixed voxels after boundary = {int(field['fixed'].sum()):,}")
@@ -1741,6 +1759,7 @@ def build_rfa_field(
             arch=taichi_arch,
             precision=taichi_precision,
             cpu_max_num_threads=taichi_cpu_threads,
+            restore_best_on_max_iter=taichi_restore_best_on_max_iter,
             verbose=verbose,
         )
 
