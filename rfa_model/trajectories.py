@@ -22,6 +22,9 @@ from .collisions import (
     first_analytic_grid_hit,
     segment_near_any_stl_box,
     segment_hits_sample_plane,
+    ray_hits_sample_plane,
+    sample_plane_coordinates,
+    sample_point_is_in_bounds,
     classify_sphere_event,
     nearest_hit,
 )
@@ -449,6 +452,7 @@ def integrate_one_electron(
     sample_y_bounds=None,
     sample_z_bounds=None,
     min_sample_return_distance: float = 5e-7,
+    sample_geometry: dict | None = None,
 ):
     """
     Integrate one electron trajectory through the RFA.
@@ -466,7 +470,9 @@ def integrate_one_electron(
     grid_transparency:
         Dict such as {"g1_shell": 0.90, ...}.
     sample_plane_return:
-        If True, hits of the analytic sample plane x=0 are terminal.
+        If True, hits of the analytic sample face are terminal.  When
+        ``sample_geometry`` is supplied this is the finite rotated plane;
+        otherwise the legacy x=0 plane is used.
 
     Returns
     -------
@@ -514,6 +520,68 @@ def integrate_one_electron(
             if cls["status"] == "hit_fixed":
                 owner_id = cls.get("owner_id", None)
                 owner = fixed_owner_name(owner_id, field=field)
+
+                # For a rotated analytic sample, do not let the staircase
+                # fixed-voxel boundary replace the physical face or its
+                # normal.  A voxel may protrude into vacuum by O(h), so map
+                # a sample-owned voxel hit back to the continuous sample
+                # plane before returning it to the cascade logic.
+                if (
+                    sample_plane_return
+                    and owner == "sample"
+                    and sample_geometry is not None
+                ):
+                    sample_hit = ray_hits_sample_plane(
+                        p,
+                        v,
+                        sample_geometry=sample_geometry,
+                        require_in_bounds=True,
+                    )
+
+                    if sample_hit is None:
+                        C = np.asarray(sample_geometry["center"], dtype=float)
+                        n = unit(np.asarray(sample_geometry["normal"], dtype=float))
+                        signed = float(np.dot(p - C, n))
+                        location = p - signed * n
+
+                        if sample_point_is_in_bounds(location, sample_geometry):
+                            _, uu, vv = sample_plane_coordinates(
+                                location, sample_geometry
+                            )
+                            sample_hit = {
+                                "kind": "sample_voxel_projected_to_plane",
+                                "location": location,
+                                "distance": float(np.linalg.norm(location - p)),
+                                "owner": "sample",
+                                "owner_name": "sample",
+                                "owner_id": owner_id,
+                                "normal": n.copy(),
+                                "sample_u": uu,
+                                "sample_v": vv,
+                                "sample_theta_deg": sample_geometry.get(
+                                    "theta_deg", np.nan
+                                ),
+                            }
+
+                    if sample_hit is not None:
+                        sample_hit = dict(sample_hit)
+                        sample_hit["grid_classification"] = dict(cls)
+                        sample_hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
+                        sample_hit["v_in"] = v.copy()
+                        if len(traj) >= 2:
+                            sample_hit["p_before"] = np.asarray(
+                                traj[-2], dtype=float
+                            ).copy()
+
+                        return {
+                            "reason": "hit_sample",
+                            "hit_info": sample_hit,
+                            "traj": np.asarray(traj),
+                            "vel": np.asarray(vel),
+                            "steps": step,
+                            "grid_events": grid_events,
+                            "events": grid_events,
+                        }
 
                 hit_info["kind"] = "fixed_voxel"
                 hit_info["owner"] = owner
@@ -626,21 +694,23 @@ def integrate_one_electron(
                 },
             )
 
-        # Analytic sample-plane return.
+        # Analytic sample-face return.  No global-x sign test is used: the
+        # signed distance to the oriented plane is handled inside the collision
+        # helper, so this works at every sample rotation angle.
         hit_sample = None
         if sample_plane_return:
-            if p[0] > 0.0 and p_new[0] <= 0.0:
-                hit_sample = segment_hits_sample_plane(
-                    p,
-                    p_new,
-                    x_sample=0.0,
-                    sample_y_bounds=sample_y_bounds,
-                    sample_z_bounds=sample_z_bounds,
-                )
+            hit_sample = segment_hits_sample_plane(
+                p,
+                p_new,
+                x_sample=0.0,
+                sample_y_bounds=sample_y_bounds,
+                sample_z_bounds=sample_z_bounds,
+                sample_geometry=sample_geometry,
+            )
 
-                if hit_sample is not None:
-                    if np.linalg.norm(hit_sample["location"] - p0) < min_sample_return_distance:
-                        hit_sample = None
+            if hit_sample is not None:
+                if np.linalg.norm(hit_sample["location"] - p0) < min_sample_return_distance:
+                    hit_sample = None
 
         # STL hit only if broad-phase says segment is near an STL box.
         hit_stl = None
@@ -665,10 +735,13 @@ def integrate_one_electron(
 
         if hit is not None:
             if hit["kind"] == "sample_plane":
+                t_hit = float(np.clip(hit.get("t", 1.0), 0.0, 1.0))
+                v_hit = v + t_hit * (v_new - v)
                 traj.append(hit["location"].copy())
-                vel.append(v_new.copy())
-                hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
-                hit["v_in"] = np.asarray(v_new, dtype=float).copy()
+                vel.append(v_hit.copy())
+                hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_hit)
+                hit["v_in"] = np.asarray(v_hit, dtype=float).copy()
+                hit["p_before"] = np.asarray(p, dtype=float).copy()
 
                 return {
                     "reason": "hit_sample",
