@@ -1230,7 +1230,7 @@ def generate_surface_emissions(
     sample_launch_eps: float = 1.0e-6,
     U0: float = 15.0,
     Phi_interp=None,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     """
     Generate emitted electrons from one surface impact.
 
@@ -1238,8 +1238,18 @@ def generate_surface_emissions(
     -------
     emitted:
         List of dicts with p0, v0, E_emit_eV, kind, cos_theta.
+    event_info:
+        Per-impact diagnostics. For analytic grid-wire hits this records the
+        sampled local-wire incidence cosine and angular gain even when the hit
+        produces zero emitted electrons. Non-grid fields are NaN.
     """
     emitted = []
+    event_info = {
+        "sampled_wire_cos_theta": np.nan,
+        "sampled_wire_angular_gain": np.nan,
+        "wire_sey_gain_used": np.nan,
+        "wire_bsey_gain_used": np.nan,
+    }
 
     surface_name = canonical_surface_name(surface_name)
 
@@ -1268,6 +1278,27 @@ def generate_surface_emissions(
         n_out = orient_normal_against_incoming(n_out, v_in)
 
     cos_theta = max(0.05, -float(np.dot(vhat, n_out)))
+
+    if surf in ANALYTIC_MESH_SURFACES:
+        # Record the actual local-wire geometry sampled for this impact.
+        # sampled_wire_angular_gain is the geometric capped-secant factor.
+        # The *_gain_used fields make clear whether the active yield curve
+        # actually uses that factor (plane-derived measured curve) or unity
+        # (JMONSEL FromWire, which already contains wire geometry).
+        wire_gain = angular_yield_gain(cos_theta)
+        model_key = _surface_model_key(yield_models, surface_name)
+        sey_model = yield_models[model_key]["SEY"]
+        bsey_model = yield_models[model_key]["BSEY"]
+
+        sey_geom = str(sey_model.get("geometry", "wire"))
+        bsey_geom = str(bsey_model.get("geometry", "wire"))
+
+        event_info.update({
+            "sampled_wire_cos_theta": float(cos_theta),
+            "sampled_wire_angular_gain": float(wire_gain),
+            "wire_sey_gain_used": float(wire_gain if sey_geom == "plane" else 1.0),
+            "wire_bsey_gain_used": float(wire_gain if bsey_geom == "plane" else 1.0),
+        })
 
     Einc = float(Einc)
     Phi_emit = surface_voltage(surface_name, voltages)
@@ -1306,7 +1337,7 @@ def generate_surface_emissions(
                 "cos_theta": cos_theta,
             })
 
-            return emitted
+            return emitted, event_info
 
     did_bse, Nse = sample_surface_event(
         yield_models=yield_models,
@@ -1445,7 +1476,7 @@ def generate_surface_emissions(
             "cos_theta": cos_theta,
         })
 
-    return emitted
+    return emitted, event_info
 
 
 def describe_surface_yields(
