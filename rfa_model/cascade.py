@@ -46,6 +46,9 @@ from .samplers import (
     generate_surface_emissions,
     canonical_surface_name,
     surface_family,
+    angular_yield_gain,
+    ANALYTIC_MESH_SURFACES,
+    MAX_ANGULAR_YIELD_GAIN,
 )
 from .accounting import (
     terminal_owner_from_result,
@@ -672,20 +675,38 @@ def run_one_primary_with_cascade(
         vhat_term = unit(v_term)
 
         terminal_cos_theta_raw = -float(np.dot(vhat_term, n_term))
-        terminal_cos_theta_used = max(terminal_cos_theta_raw, 0.05)
+        terminal_surface_canonical = cascade_surface_name(terminal_owner)
+
+        if terminal_surface_canonical in ANALYTIC_MESH_SURFACES:
+            # The shell normal is only the mesh-plane normal. The actual yield
+            # calculation samples a local cylindrical-wire normal inside
+            # generate_surface_emissions(), so there is no single pre-sampling
+            # incidence cosine or gain to report here.
+            terminal_angle_model = "sampled_effective_wire_normal"
+            terminal_cos_theta_used = np.nan
+            terminal_angular_gain_used = np.nan
+            terminal_theta_used_deg = np.nan
+        else:
+            terminal_angle_model = "capped_secant_from_surface_normal"
+            terminal_cos_theta_used = max(
+                float(np.clip(terminal_cos_theta_raw, 0.0, 1.0)),
+                1.0 / float(MAX_ANGULAR_YIELD_GAIN),
+            )
+            terminal_angular_gain_used = angular_yield_gain(
+                terminal_cos_theta_raw
+            )
+            terminal_theta_used_deg = float(
+                np.degrees(
+                    np.arccos(
+                        np.clip(terminal_cos_theta_used, 0.0, 1.0)
+                    )
+                )
+            )
 
         terminal_theta_raw_deg = float(
             np.degrees(
                 np.arccos(
                     np.clip(terminal_cos_theta_raw, -1.0, 1.0)
-                )
-            )
-        )
-
-        terminal_theta_used_deg = float(
-            np.degrees(
-                np.arccos(
-                    np.clip(terminal_cos_theta_used, 0.0, 1.0)
                 )
             )
         )
@@ -704,6 +725,8 @@ def run_one_primary_with_cascade(
             "terminal_cos_theta_used": terminal_cos_theta_used,
             "terminal_theta_raw_deg": terminal_theta_raw_deg,
             "terminal_theta_used_deg": terminal_theta_used_deg,
+            "terminal_angular_gain_used": terminal_angular_gain_used,
+            "terminal_angle_model": terminal_angle_model,
         })
 
         child_emissions, child_launch_failures = generate_cascade_emissions_from_hit(
@@ -737,6 +760,8 @@ def run_one_primary_with_cascade(
             "terminal_cos_theta_used": terminal_cos_theta_used,
             "terminal_theta_raw_deg": terminal_theta_raw_deg,
             "terminal_theta_used_deg": terminal_theta_used_deg,
+            "terminal_angular_gain_used": terminal_angular_gain_used,
+            "terminal_angle_model": terminal_angle_model,
         })
 
         for failed in child_launch_failures:
@@ -1124,6 +1149,27 @@ def run_cascade_batch_parallel(
             else:
                 yield_model_sources[family][yield_kind] = "unknown"
 
+    emission_sampler_sources = {"energy": {}, "theta": {}}
+    for family, family_models in energy_models.items():
+        emission_sampler_sources["energy"][family] = {}
+        for kind, model in family_models.items():
+            if isinstance(model, dict):
+                emission_sampler_sources["energy"][family][kind] = model.get(
+                    "source", "legacy table"
+                )
+            else:
+                emission_sampler_sources["energy"][family][kind] = str(model)
+
+    for family, family_models in theta_models.items():
+        emission_sampler_sources["theta"][family] = {}
+        for kind, model in family_models.items():
+            if isinstance(model, dict):
+                emission_sampler_sources["theta"][family][kind] = model.get(
+                    "source", "legacy table"
+                )
+            else:
+                emission_sampler_sources["theta"][family][kind] = str(model)
+
     # Announce which curve every family actually runs on.
     #
     # A loader flag silently defaulting to False is invisible in the results:
@@ -1142,6 +1188,19 @@ def run_cascade_batch_parallel(
                 print(
                     f"    {family:11}{yield_kind:6}{geom:8}"
                     f"{yield_model_sources[family][yield_kind]}"
+                )
+
+        print("[cascade] emitted-energy / angle samplers in use:")
+        for family in sorted(set(energy_models) | set(theta_models)):
+            for kind in ("SE", "BSE"):
+                e_src = emission_sampler_sources["energy"].get(
+                    family, {}
+                ).get(kind, "<missing>")
+                t_src = emission_sampler_sources["theta"].get(
+                    family, {}
+                ).get(kind, "<missing>")
+                print(
+                    f"    {family:11}{kind:4} energy={e_src}; theta={t_src}"
                 )
 
     t0 = time.perf_counter()
@@ -1336,6 +1395,7 @@ def run_cascade_batch_parallel(
 
         "grid_transparency": grid_transparency,
         "yield_model_sources": yield_model_sources,
+        "emission_sampler_sources": emission_sampler_sources,
 
         "max_generation": max_generation,
         "max_total_electrons_per_primary": max_total_electrons_per_primary,
