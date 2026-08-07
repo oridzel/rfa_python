@@ -58,6 +58,77 @@ def main() -> None:
     if fixed_change != 0.0:
         raise SystemExit("FAIL: fixed-potential voxels changed")
 
+    # The reduction-free kernels must produce exactly the same potential as
+    # measuring the maximum update on every iteration.
+    fast_shape = (17, 16, 15)
+    fast_fixed = np.zeros(fast_shape, dtype=bool)
+    fast_fixed[[0, -1], :, :] = True
+    fast_fixed[:, [0, -1], :] = True
+    fast_fixed[:, :, [0, -1]] = True
+    fast_initial = np.zeros(fast_shape, dtype=V.dtype)
+    fast_initial[-1, :, :] = 1.0
+
+    every_V, every_metadata = solve_red_black_sor_taichi(
+        fast_initial.copy(),
+        fast_fixed,
+        np.ones_like(fast_fixed),
+        max_iter=31,
+        tol=1e-30,
+        omega=1.80,
+        check_every=1,
+        arch=args.arch,
+        precision=precision,
+        cpu_max_num_threads=args.threads if args.arch == "cpu" else None,
+        restore_best_on_max_iter=False,
+        verbose=False,
+    )
+    sparse_V, sparse_metadata = solve_red_black_sor_taichi(
+        fast_initial.copy(),
+        fast_fixed,
+        np.ones_like(fast_fixed),
+        max_iter=31,
+        tol=1e-30,
+        omega=1.80,
+        check_every=7,
+        arch=args.arch,
+        precision=precision,
+        cpu_max_num_threads=args.threads if args.arch == "cpu" else None,
+        restore_best_on_max_iter=False,
+        verbose=False,
+    )
+    if not np.array_equal(every_V, sparse_V):
+        difference = float(np.max(np.abs(every_V - sparse_V)))
+        raise SystemExit(
+            "FAIL: reduction-free iterations changed the potential; "
+            f"maximum difference={difference:.3e} V"
+        )
+    if every_metadata["fast_iterations"] != 0:
+        raise SystemExit("FAIL: check_every=1 unexpectedly used fast iterations")
+    if sparse_metadata["fast_iterations"] != 25:
+        raise SystemExit("FAIL: check_every=7 fast-iteration count is incorrect")
+
+    # A non-finite input must never be mistaken for clean convergence.
+    bad_V = fast_initial.copy()
+    bad_V[fast_shape[0] // 2, fast_shape[1] // 2, fast_shape[2] // 2] = np.nan
+    try:
+        solve_red_black_sor_taichi(
+            bad_V,
+            fast_fixed,
+            np.ones_like(fast_fixed),
+            max_iter=10,
+            tol=tolerance,
+            omega=1.80,
+            check_every=5,
+            arch=args.arch,
+            precision=precision,
+            cpu_max_num_threads=args.threads if args.arch == "cpu" else None,
+            verbose=False,
+        )
+    except FloatingPointError:
+        pass
+    else:
+        raise SystemExit("FAIL: NaN potential was not rejected")
+
     # Exercise max-iteration checkpoint restoration with a deliberately slow,
     # mildly oscillatory small problem.
     checkpoint_shape = (11, 10, 9)
@@ -94,8 +165,8 @@ def main() -> None:
         raise SystemExit("FAIL: checkpoint regression did not exercise rollback")
 
     print(
-        "PASS: Taichi convergence, boundaries, and best-checkpoint "
-        "restoration validated."
+        "PASS: Taichi convergence, boundaries, finite guard, fast kernels, "
+        "and best-checkpoint restoration validated."
     )
 
 

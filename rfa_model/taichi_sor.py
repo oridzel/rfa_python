@@ -96,6 +96,20 @@ def _initialize_taichi(
                 "the Python/Jupyter kernel and let the RFA solver initialize "
                 "Taichi with fast_math=False."
             )
+        requested_default_fp = ti.f64 if precision == "f64" else ti.f32
+        current_default_fp = getattr(cfg, "default_fp", None)
+        if (
+            current_default_fp is not None
+            and current_default_fp != requested_default_fp
+        ):
+            raise RuntimeError(
+                "Taichi is already initialized with default_fp="
+                f"{current_default_fp}, but the RFA solver requested "
+                f"{precision}. Restart the Python/Jupyter kernel before "
+                "changing taichi_precision. The current kernels use explicit "
+                "types, but rejecting the mismatch prevents future untyped "
+                "literals from silently using the wrong precision."
+            )
         if arch == "cpu" and cpu_max_num_threads is not None:
             actual_threads = int(getattr(cfg, "cpu_max_num_threads", 0))
             if actual_threads != int(cpu_max_num_threads):
@@ -131,6 +145,21 @@ def _reset_max_f64(value: ti.types.ndarray(dtype=ti.f64, ndim=1)):
 @ti.kernel
 def _reset_max_f32(value: ti.types.ndarray(dtype=ti.f32, ndim=1)):
     value[0] = 0.0
+
+
+@ti.kernel
+def _copy_3d_f32(
+    source: ti.types.ndarray(dtype=ti.f32, ndim=3),
+    destination: ti.types.ndarray(dtype=ti.f32, ndim=3),
+):
+    """Copy one device-resident f32 potential array to another."""
+    ti.loop_config(block_dim=256)
+    for i, j, k in ti.ndrange(
+        source.shape[0],
+        source.shape[1],
+        source.shape[2],
+    ):
+        destination[i, j, k] = source[i, j, k]
 
 
 @ti.kernel
@@ -211,13 +240,7 @@ def _red_black_step_fast_f64(
     parity: ti.i32,
     omega: ti.f64,
 ):
-    """Identical to _red_black_step_f64 but without the residual reduction.
-
-    The atomic_max fires once per updated voxel and costs ~60% of the sweep
-    on CPU (worse on Metal, where every thread contends for one global
-    address).  The residual is only consumed on check iterations, so every
-    other iteration runs this variant instead.
-    """
+    """Perform one checkerboard update without a global reduction."""
     ti.loop_config(block_dim=256)
     for i, j, k in ti.ndrange(
         (1, V.shape[0] - 1),
@@ -249,6 +272,7 @@ def _red_black_step_fast_f32(
     parity: ti.i32,
     omega: ti.f32,
 ):
+    """Perform one checkerboard update without a global reduction."""
     ti.loop_config(block_dim=256)
     for i, j, k in ti.ndrange(
         (1, V.shape[0] - 1),
@@ -275,12 +299,35 @@ def _red_black_step_fast_f32(
 def _u8_mask_view(mask: np.ndarray, name: str) -> np.ndarray:
     """Return a C-contiguous u8 representation, avoiding a copy when possible."""
     array = np.asarray(mask)
+    if array.ndim != 3:
+        raise ValueError(f"{name} must be a three-dimensional array.")
     if array.dtype == np.bool_ and array.flags.c_contiguous:
         return array.view(np.uint8)
     result = np.ascontiguousarray(array, dtype=np.uint8)
-    if result.ndim != 3:
-        raise ValueError(f"{name} must be a three-dimensional array.")
     return result
+
+
+def _has_non_finite(
+    array: np.ndarray,
+    *,
+    chunk_size: int = 8_000_000,
+) -> bool:
+    """Scan a large array for NaN/Inf without a full-size temporary."""
+    flat = np.ravel(np.asarray(array))
+    for start in range(0, flat.size, int(chunk_size)):
+        stop = min(start + int(chunk_size), flat.size)
+        if not bool(np.all(np.isfinite(flat[start:stop]))):
+            return True
+    return False
+
+
+def _raise_if_non_finite(array: np.ndarray, stage: str) -> None:
+    if _has_non_finite(array):
+        raise FloatingPointError(
+            f"Non-finite potential detected {stage}. The field was not "
+            "accepted because NaN/Inf values are invisible to the "
+            "atomic maximum-update reduction."
+        )
 
 
 def _count_active(update_region: np.ndarray, fixed: np.ndarray) -> int:
@@ -295,16 +342,6 @@ def _count_active(update_region: np.ndarray, fixed: np.ndarray) -> int:
         np.logical_and(update_flat[start:stop], active_chunk, out=active_chunk)
         total += int(np.count_nonzero(active_chunk))
     return total
-
-
-def _has_non_finite(array: np.ndarray, chunk_size: int = 8_000_000) -> bool:
-    """Scan for NaN/Inf without allocating a full-grid temporary."""
-    flat = np.ravel(array)
-    for start in range(0, flat.size, chunk_size):
-        chunk = flat[start:start + chunk_size]
-        if not np.isfinite(chunk).all():
-            return True
-    return False
 
 
 def _validate_inputs(
@@ -341,9 +378,11 @@ def _solve_cpu_external_arrays(
     tol: float,
     omega: float,
     check_every: int,
+    restore_best_on_max_iter: bool,
+    record_history: bool,
     verbose: bool,
     t0: float,
-) -> tuple[np.ndarray, int, float]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     dtype = np.float64 if precision == "f64" else np.float32
     if V.dtype != dtype or not V.flags.c_contiguous:
         V_work = np.ascontiguousarray(V, dtype=dtype)
@@ -353,24 +392,37 @@ def _solve_cpu_external_arrays(
     max_delta = np.zeros(1, dtype=dtype)
     reset = _reset_max_f64 if precision == "f64" else _reset_max_f32
     step = _red_black_step_f64 if precision == "f64" else _red_black_step_f32
-    step_fast = (
-        _red_black_step_fast_f64 if precision == "f64" else _red_black_step_fast_f32
+    fast_step = (
+        _red_black_step_fast_f64
+        if precision == "f64"
+        else _red_black_step_fast_f32
     )
 
     last_delta = np.inf
+    best_delta = np.inf
+    best_iteration = 0
+    best_V = np.empty_like(V_work) if restore_best_on_max_iter else None
+    checked_iterations = 0
+    history: list[dict[str, float | int]] = []
     for it in range(1, int(max_iter) + 1):
-        tracking = it == 1 or it % int(check_every) == 0 or it == int(max_iter)
-
-        if tracking:
+        checked = (
+            it == 1
+            or it % int(check_every) == 0
+            or it == int(max_iter)
+        )
+        if checked:
             reset(max_delta)
             step(V_work, fixed_u8, update_u8, 0, omega, max_delta)
             step(V_work, fixed_u8, update_u8, 1, omega, max_delta)
-        else:
-            step_fast(V_work, fixed_u8, update_u8, 0, omega)
-            step_fast(V_work, fixed_u8, update_u8, 1, omega)
-
-        if tracking:
             last_delta = float(max_delta[0])
+            checked_iterations += 1
+            if record_history:
+                history.append({"iteration": int(it), "max_delta": last_delta})
+            if last_delta < best_delta:
+                best_delta = last_delta
+                best_iteration = it
+                if best_V is not None:
+                    np.copyto(best_V, V_work)
             if verbose:
                 print(
                     f"iter {it:7d}: max update = {last_delta:.6e} V "
@@ -379,10 +431,38 @@ def _solve_cpu_external_arrays(
                 )
             if last_delta < tol:
                 break
+        else:
+            fast_step(V_work, fixed_u8, update_u8, 0, omega)
+            fast_step(V_work, fixed_u8, update_u8, 1, omega)
+
+    final_delta = last_delta
+    selected_delta = final_delta
+    selected_iteration = it
+    restored_best = False
+    if (
+        final_delta >= tol
+        and best_V is not None
+        and best_iteration != it
+    ):
+        np.copyto(V_work, best_V)
+        selected_delta = best_delta
+        selected_iteration = best_iteration
+        restored_best = True
 
     if V_work is not V:
         V[...] = V_work.astype(V.dtype, copy=False)
-    return V, it, last_delta
+    return V, {
+        "iterations": int(it),
+        "final_delta": float(final_delta),
+        "best_delta": float(best_delta),
+        "best_iteration": int(best_iteration),
+        "selected_delta": float(selected_delta),
+        "selected_iteration": int(selected_iteration),
+        "restored_best": bool(restored_best),
+        "checked_iterations": int(checked_iterations),
+        "fast_iterations": int(it - checked_iterations),
+        "history": history,
+    }
 
 
 def _solve_metal_device_arrays(
@@ -393,24 +473,38 @@ def _solve_metal_device_arrays(
     tol: float,
     omega: float,
     check_every: int,
+    restore_best_on_max_iter: bool,
+    record_history: bool,
     verbose: bool,
     t0: float,
-) -> tuple[np.ndarray, int, float]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     shape = tuple(int(n) for n in V.shape)
     V_device = ti.ndarray(dtype=ti.f32, shape=shape)
     fixed_device = ti.ndarray(dtype=ti.u8, shape=shape)
     update_device = ti.ndarray(dtype=ti.u8, shape=shape)
     max_delta = ti.ndarray(dtype=ti.f32, shape=(1,))
+    best_device = (
+        ti.ndarray(dtype=ti.f32, shape=shape)
+        if restore_best_on_max_iter
+        else None
+    )
 
     V_device.from_numpy(np.ascontiguousarray(V, dtype=np.float32))
     fixed_device.from_numpy(fixed_u8)
     update_device.from_numpy(update_u8)
 
     last_delta = np.inf
+    best_delta = np.inf
+    best_iteration = 0
+    checked_iterations = 0
+    history: list[dict[str, float | int]] = []
     for it in range(1, int(max_iter) + 1):
-        tracking = it == 1 or it % int(check_every) == 0 or it == int(max_iter)
-
-        if tracking:
+        checked = (
+            it == 1
+            or it % int(check_every) == 0
+            or it == int(max_iter)
+        )
+        if checked:
             _reset_max_f32(max_delta)
             _red_black_step_f32(
                 V_device, fixed_device, update_device, 0, omega, max_delta
@@ -418,16 +512,16 @@ def _solve_metal_device_arrays(
             _red_black_step_f32(
                 V_device, fixed_device, update_device, 1, omega, max_delta
             )
-        else:
-            _red_black_step_fast_f32(
-                V_device, fixed_device, update_device, 0, omega
-            )
-            _red_black_step_fast_f32(
-                V_device, fixed_device, update_device, 1, omega
-            )
-
-        if tracking:
+            ti.sync()
             last_delta = float(max_delta.to_numpy()[0])
+            checked_iterations += 1
+            if record_history:
+                history.append({"iteration": int(it), "max_delta": last_delta})
+            if last_delta < best_delta:
+                best_delta = last_delta
+                best_iteration = it
+                if best_device is not None:
+                    _copy_3d_f32(V_device, best_device)
             if verbose:
                 print(
                     f"iter {it:7d}: max update = {last_delta:.6e} V "
@@ -436,10 +530,43 @@ def _solve_metal_device_arrays(
                 )
             if last_delta < tol:
                 break
+        else:
+            _red_black_step_fast_f32(
+                V_device, fixed_device, update_device, 0, omega
+            )
+            _red_black_step_fast_f32(
+                V_device, fixed_device, update_device, 1, omega
+            )
+
+    final_delta = last_delta
+    selected_delta = final_delta
+    selected_iteration = it
+    restored_best = False
+    selected_device = V_device
+    if (
+        final_delta >= tol
+        and best_device is not None
+        and best_iteration != it
+    ):
+        selected_device = best_device
+        selected_delta = best_delta
+        selected_iteration = best_iteration
+        restored_best = True
 
     ti.sync()
-    V[...] = V_device.to_numpy().astype(V.dtype, copy=False)
-    return V, it, last_delta
+    V[...] = selected_device.to_numpy().astype(V.dtype, copy=False)
+    return V, {
+        "iterations": int(it),
+        "final_delta": float(final_delta),
+        "best_delta": float(best_delta),
+        "best_iteration": int(best_iteration),
+        "selected_delta": float(selected_delta),
+        "selected_iteration": int(selected_iteration),
+        "restored_best": bool(restored_best),
+        "checked_iterations": int(checked_iterations),
+        "fast_iterations": int(it - checked_iterations),
+        "history": history,
+    }
 
 
 def solve_red_black_sor_taichi(
@@ -454,13 +581,19 @@ def solve_red_black_sor_taichi(
     arch: str = "cpu",
     precision: str | None = None,
     cpu_max_num_threads: int | None = None,
+    restore_best_on_max_iter: bool = True,
+    record_history: bool = False,
     verbose: bool = True,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Solve a masked 3-D Laplace problem with Taichi red-black SOR.
 
     Parameters are deliberately NumPy-based so the backend stays independent
     of the RFA field dictionary and can be regression-tested on small domains.
-    CPU defaults to f64; Metal is constrained to f32.
+    CPU defaults to f64; Metal is constrained to f32.  When
+    ``restore_best_on_max_iter`` is true and the requested tolerance is not
+    reached, the returned potential is the checked iterate with the smallest
+    maximum SOR update.  Keeping that checkpoint costs one additional full
+    potential array (f64 on CPU or f32 on Metal).
     """
     arch = str(arch).lower()
     if precision is None:
@@ -482,6 +615,10 @@ def solve_red_black_sor_taichi(
         check_every,
     )
 
+    finite_scan_start = time.perf_counter()
+    _raise_if_non_finite(V_array, "before the Taichi solve")
+    pre_solve_finite_scan_s = time.perf_counter() - finite_scan_start
+
     fixed_u8 = _u8_mask_view(fixed_array, "fixed")
     update_u8 = _u8_mask_view(update_array, "update_region")
 
@@ -502,7 +639,7 @@ def solve_red_black_sor_taichi(
 
     solve_start = time.perf_counter()
     if actual_arch == "metal":
-        V_array, iterations, last_delta = _solve_metal_device_arrays(
+        V_array, outcome = _solve_metal_device_arrays(
             V_array,
             fixed_u8,
             update_u8,
@@ -510,11 +647,13 @@ def solve_red_black_sor_taichi(
             tol,
             omega,
             check_every,
+            restore_best_on_max_iter,
+            record_history,
             verbose,
             t0,
         )
     else:
-        V_array, iterations, last_delta = _solve_cpu_external_arrays(
+        V_array, outcome = _solve_cpu_external_arrays(
             V_array,
             fixed_u8,
             update_u8,
@@ -523,38 +662,50 @@ def solve_red_black_sor_taichi(
             tol,
             omega,
             check_every,
+            restore_best_on_max_iter,
+            record_history,
             verbose,
             t0,
         )
     solve_s = time.perf_counter() - solve_start
 
-    # A NaN inside the relaxed region is invisible to the residual: abs(NaN)
-    # never wins an atomic_max, so the solver would otherwise report a clean
-    # convergence while handing back a corrupted potential.
-    if _has_non_finite(V_array):
-        raise FloatingPointError(
-            "Taichi SOR produced a non-finite potential after "
-            f"{int(iterations)} iterations (reported max update "
-            f"{float(last_delta):.3e} V). The residual reduction cannot see "
-            "NaN/Inf, so this would otherwise be reported as converged. "
-            "Check the initial potential and the fixed-voltage values."
-        )
+    finite_scan_start = time.perf_counter()
+    _raise_if_non_finite(V_array, "after the Taichi solve")
+    post_solve_finite_scan_s = time.perf_counter() - finite_scan_start
 
     metadata: dict[str, Any] = {
         "method": "taichi_red_black_sor",
         "architecture": actual_arch,
         "precision": precision,
-        "iterations": int(iterations),
+        "iterations": int(outcome["iterations"]),
         "tol": float(tol),
-        "last_delta": float(last_delta),
+        # Compatibility: last_delta describes the potential actually returned.
+        "last_delta": float(outcome["selected_delta"]),
+        "final_iteration_delta": float(outcome["final_delta"]),
+        "best_delta": float(outcome["best_delta"]),
+        "best_iteration": int(outcome["best_iteration"]),
+        "selected_iteration": int(outcome["selected_iteration"]),
+        "restored_best": bool(outcome["restored_best"]),
+        "restore_best_on_max_iter": bool(restore_best_on_max_iter),
+        "checked_iterations": int(outcome["checked_iterations"]),
+        "fast_iterations": int(outcome["fast_iterations"]),
         "omega": float(omega),
         "check_every": int(check_every),
         "setup_s": float(setup_s),
         "solve_s": float(solve_s),
+        "pre_solve_finite_scan_s": float(pre_solve_finite_scan_s),
+        "post_solve_finite_scan_s": float(post_solve_finite_scan_s),
         "runtime_s": float(time.perf_counter() - t0),
-        "converged": bool(last_delta < tol),
+        "converged": bool(outcome["best_delta"] < tol),
+        "termination_reason": (
+            "tolerance"
+            if outcome["best_delta"] < tol
+            else "max_iter"
+        ),
         "taichi_version": str(getattr(ti, "__version__", "unknown")),
     }
+    if record_history:
+        metadata["history"] = list(outcome["history"])
     if cpu_max_num_threads is not None and actual_arch == "cpu":
         metadata["cpu_max_num_threads"] = int(cpu_max_num_threads)
 
