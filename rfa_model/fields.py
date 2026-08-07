@@ -1045,6 +1045,64 @@ def _checkpoint_bytes(V: np.ndarray, enabled: bool) -> float:
     return (V.nbytes / 1e6) if enabled else 0.0
 
 
+def _backend_accepts(function, parameter_name: str) -> bool:
+    """
+    Report whether an optional backend accepts a given keyword argument.
+
+    A backend that takes ``**kwargs`` is assumed to handle it.
+    """
+    import inspect
+
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        return False
+
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+
+    return parameter_name in signature.parameters
+
+
+def _normalize_solver_metadata(
+    metadata: dict,
+    tol: float,
+    restore_best_on_max_iter: bool,
+) -> dict:
+    """
+    Fill in best-iterate metadata keys that an older backend may not emit.
+
+    Downstream code reads the same keys regardless of which solver ran, so a
+    backend predating best-iterate tracking gets its single ``last_delta``
+    reported as both the final and the best iterate.
+    """
+    metadata = dict(metadata)
+
+    last_delta = float(metadata.get("last_delta", float("inf")))
+    iterations = int(metadata.get("iterations", 0))
+
+    metadata.setdefault("final_iteration_delta", last_delta)
+    metadata.setdefault("best_delta", last_delta)
+    metadata.setdefault("best_iteration", iterations)
+    metadata.setdefault("selected_iteration", iterations)
+    metadata.setdefault("restored_best", False)
+    metadata.setdefault(
+        "restore_best_on_max_iter",
+        bool(restore_best_on_max_iter),
+    )
+    metadata.setdefault(
+        "converged",
+        bool(min(last_delta, float(metadata["best_delta"])) < float(tol)),
+    )
+    metadata.setdefault(
+        "termination_reason",
+        "tolerance" if metadata["converged"] else "max_iter",
+    )
+
+    return metadata
+
+
 @njit
 def _solve_laplace_sor_numba(
     V,
@@ -1263,7 +1321,7 @@ def solve_laplace_sor_taichi(
     if update_region is None:
         update_region = np.ones_like(field["fixed"], dtype=bool)
 
-    V, solver_metadata = solve_red_black_sor_taichi(
+    kwargs = dict(
         V=field["V"],
         fixed=field["fixed"],
         update_region=update_region,
@@ -1274,12 +1332,42 @@ def solve_laplace_sor_taichi(
         arch=arch,
         precision=precision,
         cpu_max_num_threads=cpu_max_num_threads,
-        restore_best_on_max_iter=restore_best_on_max_iter,
         verbose=verbose,
     )
 
+    # rfa_model/taichi_sor.py is an optional, separately-versioned backend, so
+    # it can lag behind this module. Detect that here rather than letting the
+    # call fail with a bare TypeError about an unexpected keyword argument.
+    if _backend_accepts(solve_red_black_sor_taichi, "restore_best_on_max_iter"):
+        kwargs["restore_best_on_max_iter"] = restore_best_on_max_iter
+
+    elif restore_best_on_max_iter:
+        import inspect
+
+        try:
+            backend_path = inspect.getsourcefile(solve_red_black_sor_taichi)
+        except TypeError:
+            backend_path = "rfa_model/taichi_sor.py"
+
+        raise RuntimeError(
+            "The installed Taichi backend does not support "
+            "restore_best_on_max_iter:\n"
+            f"  {backend_path}\n"
+            "Update that file to the version that accepts it, then restart "
+            "the Python/Jupyter kernel -- an already-imported module is not "
+            "picked up by editing the file alone. Pass "
+            "restore_best_on_max_iter=False to run against the older backend "
+            "instead."
+        )
+
+    V, solver_metadata = solve_red_black_sor_taichi(**kwargs)
+
     field["V"] = V
-    field["solver"] = solver_metadata
+    field["solver"] = _normalize_solver_metadata(
+        solver_metadata,
+        tol=tol,
+        restore_best_on_max_iter=restore_best_on_max_iter,
+    )
     return field
 
 
