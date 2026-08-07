@@ -349,11 +349,12 @@ def generate_cascade_emissions_from_hit(
     hit_info: dict | None = None,
     launch_step_fraction_of_h: float = 0.10,
     Phi_interp=None,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], dict]:
     """
     Generate cascade emissions and place them safely in free vacuum.
 
-    Returns successful emissions and explicit failed-launch records.
+    Returns successful emissions, explicit failed-launch records, and
+    per-impact emission diagnostics (including sampled wire incidence data).
     """
     surface_name = cascade_surface_name(surface_name)
 
@@ -367,7 +368,7 @@ def generate_cascade_emissions_from_hit(
     # Use very small normal offset in generate_surface_emissions; the safe
     # launch point is found by make_emissions_safe_to_launch() using the
     # surface normal (for absorbing surfaces) or velocity (for grid shells).
-    emissions = generate_surface_emissions(
+    emissions, emission_event_info = generate_surface_emissions(
         surface_name=surface_name,
         r_hit=r_hit,
         v_in=v_in,
@@ -397,7 +398,7 @@ def generate_cascade_emissions_from_hit(
         ),
     )
 
-    return safe_emissions, failed_emissions
+    return safe_emissions, failed_emissions, emission_event_info
 
 
 # ============================================================
@@ -496,7 +497,11 @@ def run_one_primary_with_cascade(
     next_electron_id = 0
 
     # First-generation sample emission.
-    first_emissions, first_launch_failures = generate_cascade_emissions_from_hit(
+    (
+        first_emissions,
+        first_launch_failures,
+        first_emission_event_info,
+    ) = generate_cascade_emissions_from_hit(
         surface_name="sample",
         r_hit=p_hit,
         v_in=v_in,
@@ -729,7 +734,11 @@ def run_one_primary_with_cascade(
             "terminal_angle_model": terminal_angle_model,
         })
 
-        child_emissions, child_launch_failures = generate_cascade_emissions_from_hit(
+        (
+            child_emissions,
+            child_launch_failures,
+            emission_event_info,
+        ) = generate_cascade_emissions_from_hit(
             surface_name=terminal_owner,
             r_hit=r_term,
             v_in=v_term,
@@ -762,6 +771,23 @@ def run_one_primary_with_cascade(
             "terminal_theta_used_deg": terminal_theta_used_deg,
             "terminal_angular_gain_used": terminal_angular_gain_used,
             "terminal_angle_model": terminal_angle_model,
+
+            # Actual event-by-event wire geometry sampled inside samplers.py.
+            # These remain NaN for non-grid surfaces. They are logged here,
+            # rather than only on emitted electrons, so zero-emission grid hits
+            # are represented too.
+            "sampled_wire_cos_theta": emission_event_info.get(
+                "sampled_wire_cos_theta", np.nan
+            ),
+            "sampled_wire_angular_gain": emission_event_info.get(
+                "sampled_wire_angular_gain", np.nan
+            ),
+            "wire_sey_gain_used": emission_event_info.get(
+                "wire_sey_gain_used", np.nan
+            ),
+            "wire_bsey_gain_used": emission_event_info.get(
+                "wire_bsey_gain_used", np.nan
+            ),
         })
 
         for failed in child_launch_failures:
