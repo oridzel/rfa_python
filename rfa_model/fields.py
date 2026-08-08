@@ -351,40 +351,38 @@ def mark_mesh_voxels_by_voxelized(
     """
     Mark fixed-potential voxels using ``trimesh.Trimesh.voxelized``.
 
-    The aligned rod and drift-tube STLs use Trimesh's ray voxelizer.  Their
-    long, thin axial triangles can exceed the default recursive-subdivision
-    limit at the production 0.25 mm pitch.  Ray voxelization is bounded in
-    memory for these two geometries.
+    Rod and drift-tube meshes are deliberately redirected to the bounding-box
+    limited ``mesh.contains`` path.  Trimesh's voxelizer named ``"contains"``
+    is a ray-based *surface* voxelizer and produced direction-dependent gaps
+    in these long curved parts; it is not the same operation as calling
+    ``mesh.contains(points)`` to classify field-grid cell centers.
     """
     if pitch is None:
         pitch = float(field["h"])
 
-    voxel_method = "contains" if owner_name in {"rod", "drifttube"} else None
-    method_label = voxel_method or "subdivide"
+    if owner_name in {"rod", "drifttube"}:
+        _log(
+            verbose,
+            f"  Redirecting {owner_name!r} to solid mesh.contains "
+            "voxelization ...",
+        )
+        return mark_mesh_voxels_by_contains(
+            field=field,
+            mesh=mesh,
+            voltage=voltage,
+            owner_name=owner_name,
+            verbose=verbose,
+        )
 
     _log(
         verbose,
         f"  Voxelizing {owner_name!r} with pitch = {pitch:.3e} m "
-        f"(method={method_label}) ...",
+        "(method=subdivide) ...",
     )
 
     t0 = time.perf_counter()
 
-    try:
-        if voxel_method is None:
-            vox = mesh.voxelized(pitch=pitch)
-        else:
-            vox = mesh.voxelized(pitch=pitch, method=voxel_method)
-    except ModuleNotFoundError as exc:
-        if voxel_method == "contains" and exc.name == "rtree":
-            raise RuntimeError(
-                f"{owner_name!r} ray voxelization requires the 'rtree' "
-                "package. "
-                "Install it in the notebook environment with "
-                "`pip install rtree`, restart the kernel, and rebuild the "
-                "field from scratch."
-            ) from exc
-        raise
+    vox = mesh.voxelized(pitch=pitch)
     points = np.asarray(vox.points, dtype=float)
 
     _log(
@@ -419,9 +417,8 @@ def mark_mesh_voxels_by_voxelized(
     j = j[valid]
     k = k[valid]
 
-    # Ray voxelization may return several points that round to the same field
-    # cell.  Deduplicate the integer indices so metadata reports actual cells,
-    # not raw point rows.
+    # Several voxelized points may round to the same field cell. Deduplicate
+    # the integer indices so metadata reports actual cells, not raw rows.
     flat = np.ravel_multi_index((i, j, k), field["V"].shape)
     flat = np.unique(flat)
     i, j, k = np.unravel_index(flat, field["V"].shape)
@@ -429,6 +426,7 @@ def mark_mesh_voxels_by_voxelized(
 
     field.setdefault("mesh_voxel_counts", {})[owner_name] = n_unique
     field.setdefault("mesh_voxel_point_counts", {})[owner_name] = n_valid_points
+    field.setdefault("mesh_voxel_methods", {})[owner_name] = "subdivide"
 
     owner_id = owner_id_from_name(owner_name)
 
@@ -453,36 +451,214 @@ def mark_mesh_voxels_by_contains(
     voltage: float,
     owner_name: str,
     chunk_size: int = 250_000,
+    padding: float | None = None,
+    require_watertight: bool = True,
+    validate_connectivity: bool = True,
+    verbose: bool = False,
 ) -> dict:
     """
-    Mark voxels whose centers are inside an STL mesh.
+    Mark field-grid cell centers inside a watertight STL mesh.
 
-    This is slower than analytic surfaces, but useful for sample holder,
-    receiver, rod, drift tube, and frame parts.
+    Only points within the mesh bounding box (plus a small padding) are
+    generated, and they are classified in chunks.  This avoids the three full
+    coordinate arrays previously created for the entire field domain.  The
+    local boolean mask is completed before the field is mutated, so a failed
+    contains query cannot leave a partly assigned conductor.
 
-    Requires trimesh contains support, usually with rtree installed.
+    This is the production path for the rod and drift-tube STLs.  It calls
+    ``mesh.contains(points)`` directly; it does *not* call the ray-based
+    ``mesh.voxelized(method="contains")`` surface voxelizer.
+
+    Parameters
+    ----------
+    chunk_size:
+        Maximum number of candidate cell centers in one contains query.
+    padding:
+        Bounding-box expansion used to select candidate grid centers. The
+        default is half a field voxel. It does not enlarge the geometry;
+        ``mesh.contains`` still decides which centers are inside.
+    require_watertight:
+        Refuse classification when Trimesh reports a non-watertight mesh.
+        Point containment is not reliable for an open surface.
+    validate_connectivity:
+        Record 26-neighbour connected-component diagnostics for rod and drift
+        tube masks. Fragmentation is reported as a warning rather than raised,
+        because legitimate ownership overlaps are applied later.
+
+    Notes
+    -----
+    Requires Trimesh containment support, normally provided by ``rtree``.
     """
-    X, Y, Z = meshgrid_coordinates(field)
+    if int(chunk_size) < 1:
+        raise ValueError("chunk_size must be at least 1")
+    chunk_size = int(chunk_size)
 
-    points = np.column_stack([
-        X.ravel(),
-        Y.ravel(),
-        Z.ravel(),
-    ])
+    h = float(field["h"])
+    if padding is None:
+        padding = 0.5 * h
+    padding = float(padding)
+    if padding < 0.0:
+        raise ValueError("padding must be non-negative")
 
-    inside = np.zeros(len(points), dtype=bool)
+    bounds = np.asarray(mesh.bounds, dtype=float)
+    if bounds.shape != (2, 3) or not np.all(np.isfinite(bounds)):
+        raise ValueError(
+            f"Mesh {owner_name!r} has invalid bounds: {bounds!r}"
+        )
 
-    for start in range(0, len(points), chunk_size):
-        stop = min(start + chunk_size, len(points))
-        inside[start:stop] = mesh.contains(points[start:stop])
+    is_watertight = bool(getattr(mesh, "is_watertight", False))
+    field.setdefault("mesh_watertight", {})[owner_name] = is_watertight
 
-    mask = inside.reshape(field["V"].shape)
+    if require_watertight and not is_watertight:
+        raise ValueError(
+            f"Mesh {owner_name!r} is not watertight; mesh.contains cannot "
+            "reliably define its metal volume. Repair or reload the STL "
+            "with processing enabled before rebuilding the field."
+        )
+
+    x = np.asarray(field["x"])
+    y = np.asarray(field["y"])
+    z = np.asarray(field["z"])
+
+    axes = (x, y, z)
+    local_indices = []
+    for axis_number, axis in enumerate(axes):
+        lo = bounds[0, axis_number] - padding
+        hi = bounds[1, axis_number] + padding
+        local_indices.append(np.flatnonzero((axis >= lo) & (axis <= hi)))
+
+    ix, iy, iz = local_indices
+
+    if len(ix) == 0 or len(iy) == 0 or len(iz) == 0:
+        _log(
+            verbose,
+            f"    WARNING: {owner_name!r} bounding box does not intersect "
+            "the field grid",
+        )
+        field.setdefault("mesh_voxel_methods", {})[owner_name] = "contains"
+        field.setdefault("mesh_voxel_counts", {})[owner_name] = 0
+        field.setdefault("mesh_voxel_point_counts", {})[owner_name] = 0
+        field.setdefault("mesh_contains_candidate_counts", {})[owner_name] = 0
+        return field
+
+    local_shape = (len(ix), len(iy), len(iz))
+    n_candidates = int(np.prod(local_shape, dtype=np.int64))
+    local_mask = np.zeros(local_shape, dtype=bool)
+
+    _log(
+        verbose,
+        f"  Voxelizing {owner_name!r} by solid mesh.contains: "
+        f"local shape={local_shape}, candidates={n_candidates:,}, "
+        f"chunk_size={chunk_size:,} ...",
+    )
+
+    t0 = time.perf_counter()
+    nyz = len(iy) * len(iz)
+    nz = len(iz)
+
+    for start in range(0, n_candidates, chunk_size):
+        stop = min(start + chunk_size, n_candidates)
+        flat_local = np.arange(start, stop, dtype=np.int64)
+
+        local_i = flat_local // nyz
+        remainder = flat_local - local_i * nyz
+        local_j = remainder // nz
+        local_k = remainder - local_j * nz
+
+        points = np.column_stack((
+            x[ix[local_i]],
+            y[iy[local_j]],
+            z[iz[local_k]],
+        ))
+
+        try:
+            inside = np.asarray(mesh.contains(points), dtype=bool).reshape(-1)
+        except ModuleNotFoundError as exc:
+            if exc.name == "rtree":
+                raise RuntimeError(
+                    f"Solid mesh.contains voxelization for {owner_name!r} "
+                    "requires the 'rtree' package. Install it in the notebook "
+                    "environment with `pip install rtree`, restart the "
+                    "kernel, and rebuild the field from scratch."
+                ) from exc
+            raise
+
+        if inside.size != stop - start:
+            raise RuntimeError(
+                f"mesh.contains returned {inside.size} classifications for "
+                f"{stop - start} points of {owner_name!r}"
+            )
+
+        if np.any(inside):
+            local_mask[
+                local_i[inside],
+                local_j[inside],
+                local_k[inside],
+            ] = True
+
+    n_inside = int(np.count_nonzero(local_mask))
+
+    field.setdefault("mesh_voxel_methods", {})[owner_name] = "contains"
+    field.setdefault("mesh_voxel_counts", {})[owner_name] = n_inside
+    field.setdefault("mesh_voxel_point_counts", {})[owner_name] = n_inside
+    field.setdefault("mesh_contains_candidate_counts", {})[
+        owner_name
+    ] = n_candidates
+
+    if n_inside == 0:
+        raise RuntimeError(
+            f"Solid mesh.contains voxelization produced no field voxels for "
+            f"{owner_name!r}. The conductor may be thinner than the field "
+            "spacing or its mesh may not enclose the expected volume."
+        )
+
+    local_i, local_j, local_k = np.nonzero(local_mask)
+    global_i = ix[local_i]
+    global_j = iy[local_j]
+    global_k = iz[local_k]
 
     owner_id = owner_id_from_name(owner_name)
 
-    field["V"][mask] = voltage
-    field["fixed"][mask] = True
-    field["owner"][mask] = owner_id
+    field["V"][global_i, global_j, global_k] = voltage
+    field["fixed"][global_i, global_j, global_k] = True
+    field["owner"][global_i, global_j, global_k] = owner_id
+
+    _log(
+        verbose,
+        f"    assigned solid fixed voxels: {n_inside:,}; "
+        f"elapsed={time.perf_counter() - t0:.2f} s; "
+        f"V={voltage:g} V; owner_id={owner_id}; "
+        f"watertight={is_watertight}",
+    )
+
+    if validate_connectivity and owner_name in {"rod", "drifttube"}:
+        from scipy.ndimage import generate_binary_structure, label
+
+        structure = generate_binary_structure(3, 3)
+        labels, n_components = label(local_mask, structure=structure)
+        sizes = np.bincount(labels.ravel())[1:]
+        largest = int(sizes.max()) if sizes.size else 0
+        largest_fraction = largest / n_inside if n_inside else 0.0
+
+        field.setdefault("mesh_connectivity", {})[owner_name] = {
+            "components_26_neighbor": int(n_components),
+            "largest_component_voxels": largest,
+            "largest_component_fraction": float(largest_fraction),
+        }
+
+        _log(
+            verbose,
+            f"    connectivity: components={n_components:,}, "
+            f"largest_fraction={largest_fraction:.6f}",
+        )
+
+        if n_components != 1:
+            _log(
+                verbose,
+                f"    WARNING: {owner_name!r} contains mask has "
+                f"{n_components} connected components before ownership "
+                "overlaps are applied",
+            )
 
     return field
 
@@ -535,7 +711,10 @@ def mark_named_meshes(
     name_to_voltage_key:
         Optional mapping from mesh name to voltage key.
     method:
-        "contains" or "bounds".
+        ``"voxelized"`` uses Trimesh subdivision for ordinary STL parts and
+        automatically uses solid, bounding-box-limited ``mesh.contains`` for
+        rod and drift tube. ``"contains"`` forces solid containment for every
+        named mesh. ``"bounds"`` is only a debugging approximation.
     """
     if name_to_voltage_key is None:
         name_to_voltage_key = {
@@ -584,6 +763,7 @@ def mark_named_meshes(
                 mesh=mesh,
                 voltage=voltage,
                 owner_name=name,
+                verbose=verbose,
             )
         
         elif method == "bounds":
