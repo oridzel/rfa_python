@@ -359,7 +359,7 @@ def mark_mesh_voxels_by_voxelized(
     if pitch is None:
         pitch = float(field["h"])
 
-    voxel_method = "ray" if owner_name in {"rod", "drifttube"} else None
+    voxel_method = "contains" if owner_name in {"rod", "drifttube"} else None
     method_label = voxel_method or "subdivide"
 
     _log(
@@ -376,7 +376,7 @@ def mark_mesh_voxels_by_voxelized(
         else:
             vox = mesh.voxelized(pitch=pitch, method=voxel_method)
     except ModuleNotFoundError as exc:
-        if voxel_method == "ray" and exc.name == "rtree":
+        if voxel_method == "contains" and exc.name == "rtree":
             raise RuntimeError(
                 f"{owner_name!r} ray voxelization requires the 'rtree' "
                 "package. "
