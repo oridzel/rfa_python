@@ -31,9 +31,7 @@ from .collisions import (
     first_segment_hit,
     segment_near_any_stl_box,
     segment_hits_sample_plane,
-    ray_hits_sample_plane,
     sample_plane_coordinates,
-    sample_point_is_in_bounds,
     nearest_hit,
 )
 
@@ -41,6 +39,7 @@ from .trajectories import (
     unit,
     classify_grid_point,
     classify_effective_vacuum_point,
+    advance_through_sample_voxel_artifact,
     choose_adaptive_dt_with_surfaces,
     integrate_one_electron,
 )
@@ -67,6 +66,7 @@ def make_primary_beam_near_sample(
     rng=None,
     sample_geometry: dict | None = None,
     primary_launch_clearance_h: float = 2.0,
+    primary_launch_distance_m: float | None = None,
     primary_launch_retreat_step_h: float = 0.25,
     primary_launch_max_tries: int = 80,
     min_incidence_cos: float = 1.0e-3,
@@ -78,8 +78,10 @@ def make_primary_beam_near_sample(
 
         1. Sample a finite beam coordinate (y, z) and direction.
         2. Intersect that individual beam line with the rotated sample plane.
-        3. Move upstream along the same ray until the normal clearance from
-           the sample is ``primary_launch_clearance_h * field['h']``.
+        3. Move upstream along the same ray.  By default the normal clearance
+           is ``primary_launch_clearance_h * field['h']``.  If
+           ``primary_launch_distance_m`` is supplied, that explicit along-ray
+           distance is used instead (useful for beam-steering studies).
         4. If voxelization still classifies the point as solid, retreat a
            little farther upstream along that same ray until free vacuum is
            found.
@@ -98,6 +100,8 @@ def make_primary_beam_near_sample(
         raise ValueError("N must be positive")
     if primary_launch_clearance_h <= 0.0:
         raise ValueError("primary_launch_clearance_h must be positive")
+    if primary_launch_distance_m is not None and primary_launch_distance_m <= 0.0:
+        raise ValueError("primary_launch_distance_m must be positive when supplied")
     if primary_launch_retreat_step_h <= 0.0:
         raise ValueError("primary_launch_retreat_step_h must be positive")
     if primary_launch_max_tries <= 0:
@@ -134,6 +138,10 @@ def make_primary_beam_near_sample(
         n = unit(np.asarray(sample_geometry["normal"], dtype=float))
         normal_clearance = float(primary_launch_clearance_h) * h
         normal_retreat_step = float(primary_launch_retreat_step_h) * h
+        explicit_ray_distance = (
+            None if primary_launch_distance_m is None
+            else float(primary_launch_distance_m)
+        )
 
     for i in range(N):
         d = unit(dirs[i])
@@ -162,14 +170,23 @@ def make_primary_beam_near_sample(
             s_hit = float(np.dot(n, C - p_ref) / denom)
             p_hit_geom = p_ref + s_hit * d
 
-            # Move upstream along the *same electron ray*.  Dividing by mu
-            # makes the perpendicular (surface-normal) clearance independent
-            # of incidence angle.
-            p = p_hit_geom - (normal_clearance / mu) * d
+            # Move upstream along the *same electron ray*.  By default the
+            # requested clearance is measured normal to the sample plane, so
+            # dividing by mu makes that normal clearance independent of angle.
+            # For beam-steering studies an explicit along-ray launch distance
+            # can instead be supplied, allowing the primary to start much
+            # farther upstream while retaining backward-compatible defaults.
+            if explicit_ray_distance is None:
+                launch_ray_distance = normal_clearance / mu
+                ds_ray = normal_retreat_step / mu
+            else:
+                launch_ray_distance = explicit_ray_distance
+                ds_ray = normal_retreat_step
+
+            p = p_hit_geom - launch_ray_distance * d
 
             cls = classify_effective_vacuum_point(p, field)
             if cls["status"] != "free":
-                ds_ray = normal_retreat_step / mu
                 p_base = p.copy()
                 found = False
 
@@ -351,66 +368,110 @@ def fly_primary_to_sample(
         cls = classify_grid_point(p, field)
 
         if cls["status"] != "free":
-            if cls["status"] == "hit_fixed" and cls.get("owner_id", None) == sample_owner_id:
-                # The voxelized electrostatic boundary can protrude by a
-                # fraction of h into vacuum.  Report the continuous physical
-                # plane location rather than the staircase voxel coordinate.
-                hit = None
+            if (
+                cls["status"] == "hit_fixed"
+                and cls.get("owner_id", None) == sample_owner_id
+                and sample_geometry is not None
+            ):
+                # The fixed sample voxels exist to impose the electrostatic
+                # boundary.  At grazing incidence their staircase can protrude
+                # into physical vacuum, so it must not become the collision
+                # surface.  Traverse only that local artifact while continuing
+                # to test the continuous finite sample plane.
+                bypass = advance_through_sample_voxel_artifact(
+                    p=p,
+                    v=v,
+                    field=field,
+                    sample_geometry=sample_geometry,
+                    sample_owner_id=sample_owner_id,
+                )
 
-                if sample_geometry is not None:
-                    hit = ray_hits_sample_plane(
+                bypass_end = np.asarray(bypass["point"], dtype=float)
+                hit_sample_bypass = bypass.get("hit_info", None)
+                hit_stl_bypass = None
+
+                if (
+                    stl_boxes is None
+                    or segment_near_any_stl_box(p, bypass_end, stl_boxes)
+                ):
+                    hit_stl_bypass = first_segment_hit(
                         p,
-                        v,
-                        sample_geometry=sample_geometry,
-                        require_in_bounds=True,
+                        bypass_end,
+                        intersector,
+                        face_owner,
+                        collision_mesh,
                     )
 
-                    if hit is None:
-                        # If numerical stepping has already moved a fraction
-                        # of a voxel through the plane, orthogonally project the
-                        # current sample-owned voxel back to the physical face.
-                        C = np.asarray(sample_geometry["center"], dtype=float)
-                        n = unit(np.asarray(sample_geometry["normal"], dtype=float))
-                        signed = float(np.dot(p - C, n))
-                        location = p - signed * n
+                hit = hit_stl_bypass if hit_stl_bypass is not None else hit_sample_bypass
 
-                        if sample_point_is_in_bounds(location, sample_geometry):
-                            _, uu, vv = sample_plane_coordinates(
-                                location, sample_geometry
-                            )
-                            hit = {
-                                "kind": "sample_voxel_projected_to_plane",
-                                "location": location,
-                                "distance": float(np.linalg.norm(location - p)),
-                                "owner": "sample",
-                                "owner_name": "sample",
-                                "owner_id": sample_owner_id,
-                                "normal": n.copy(),
-                                "sample_u": uu,
-                                "sample_v": vv,
-                                "sample_theta_deg": sample_geometry.get(
-                                    "theta_deg", np.nan
-                                ),
-                            }
+                if hit is not None:
+                    hit = dict(hit)
+                    hit["sample_voxel_artifact_traversal"] = True
+                    hit["sample_voxel_artifact_attempts"] = bypass["attempts"]
+                    hit["sample_voxel_artifact_distance_m"] = bypass["distance_m"]
+                    hit["grid_classification"] = dict(cls)
+                    hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
+                    hit["v_in"] = v.copy()
+                    hit["p_before"] = p.copy()
 
-                if hit is None:
-                    # Backward-compatible normal-incidence fallback.
-                    hit = {
-                        "kind": "sample_voxel",
-                        "location": p.copy(),
-                        "distance": 0.0,
-                        "owner": "sample",
-                        "owner_name": "sample",
-                        "owner_id": sample_owner_id,
-                        "normal": np.array([1.0, 0.0, 0.0]),
+                    append_track(hit["location"], v, force=True)
+                    traj_out, vel_out = packed_track()
+                    return {
+                        "reason": (
+                            "hit_sample" if hit.get("kind") == "sample_plane"
+                            else "hit_stl"
+                        ),
+                        "hit_info": hit,
+                        "traj": traj_out,
+                        "vel": vel_out,
+                        "steps": step,
                     }
 
-                hit["grid_classification"] = cls
-                hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
-                hit["v_in"] = v.copy()
+                if bypass["status"] == "cleared":
+                    p_previous = p.copy()
+                    p = bypass_end
+                    append_track(p, v, force=True)
+                    continue
+
+                # Reaching this branch means the local staircase could not be
+                # cleared within the conservative search window.  Keep it
+                # explicit rather than silently turning a voxel artifact into a
+                # physical sample hit.
+                fail_info = dict(cls)
+                fail_info.update({
+                    "kind": "sample_voxel_artifact",
+                    "owner": "sample",
+                    "owner_name": "sample",
+                    "location": p.copy(),
+                    "sample_voxel_artifact_attempts": bypass["attempts"],
+                    "sample_voxel_artifact_distance_m": bypass["distance_m"],
+                })
+                append_track(p, v, force=True)
+                traj_out, vel_out = packed_track()
+                return {
+                    "reason": "sample_voxel_artifact_failed",
+                    "hit_info": fail_info,
+                    "traj": traj_out,
+                    "vel": vel_out,
+                    "steps": step,
+                }
+
+            if cls["status"] == "hit_fixed" and cls.get("owner_id", None) == sample_owner_id:
+                # Legacy behavior when no continuous sample geometry is supplied.
+                hit = {
+                    "kind": "sample_voxel",
+                    "location": p.copy(),
+                    "distance": 0.0,
+                    "owner": "sample",
+                    "owner_name": "sample",
+                    "owner_id": sample_owner_id,
+                    "normal": np.array([1.0, 0.0, 0.0]),
+                    "grid_classification": dict(cls),
+                    "KE_hit_eV": kinetic_energy_eV_from_velocity(v),
+                    "v_in": v.copy(),
+                }
                 if p_previous is not None:
                     hit["p_before"] = p_previous.copy()
-
                 append_track(hit["location"], v, force=True)
                 traj_out, vel_out = packed_track()
                 return {

@@ -873,6 +873,197 @@ def plot_potential_slice(
     return fig, ax
 
 
+def load_tracked_trajectories_npz(path):
+    """Load trajectories written by ``save_tracked_trajectories_npz``.
+
+    Returns a dictionary containing compact ``primary_results`` and
+    ``cascade_results_all`` lists (tracked records only), plus matching
+    dataframes that can be passed directly to the trajectory plotting helpers.
+    Loading is pickle-free.
+    """
+    data = np.load(path, allow_pickle=False)
+
+    def unpack(kind):
+        points = np.asarray(data[f"{kind}_points"], dtype=float)
+        velocities = np.asarray(data[f"{kind}_velocities"], dtype=float)
+        offsets = np.asarray(data[f"{kind}_offsets"], dtype=np.int64)
+        records = []
+        for i in range(max(0, len(offsets) - 1)):
+            a = int(offsets[i])
+            b = int(offsets[i + 1])
+            records.append({
+                "traj": points[a:b].copy(),
+                "vel": velocities[a:b].copy(),
+            })
+        return records
+
+    primary = unpack("primary")
+    cascade = unpack("cascade")
+
+    pidx = np.asarray(data["primary_primary_index"], dtype=np.int64)
+    preason = np.asarray(data["primary_reason"]).astype(str)
+    pkind = np.asarray(data["primary_kind"]).astype(str)
+
+    for i, res in enumerate(primary):
+        res["primary_index"] = int(pidx[i])
+        res["reason"] = preason[i] or None
+        res["hit_info"] = {"kind": pkind[i] or None}
+
+    c_primary = np.asarray(data["cascade_primary_index"], dtype=np.int64)
+    c_eid = np.asarray(data["cascade_electron_id"], dtype=np.int64)
+    c_pid = np.asarray(data["cascade_parent_id"], dtype=np.int64)
+    c_gen = np.asarray(data["cascade_generation"], dtype=np.int64)
+    c_reason = np.asarray(data["cascade_reason"]).astype(str)
+    c_source_owner = np.asarray(data["cascade_source_owner"]).astype(str)
+    c_source_electrode = np.asarray(data["cascade_source_electrode"]).astype(str)
+    c_terminal_owner = np.asarray(data["cascade_terminal_owner"]).astype(str)
+    c_terminal_electrode = np.asarray(data["cascade_terminal_electrode"]).astype(str)
+    c_kind = np.asarray(data["cascade_emission_kind"]).astype(str)
+
+    for i, res in enumerate(cascade):
+        res.update({
+            "primary_index": int(c_primary[i]),
+            "electron_id": int(c_eid[i]),
+            "parent_id": int(c_pid[i]),
+            "generation": int(c_gen[i]),
+            "reason": c_reason[i] or None,
+            "source_owner": c_source_owner[i] or None,
+            "source_electrode": c_source_electrode[i] or None,
+            "terminal_owner": c_terminal_owner[i] or None,
+            "terminal_electrode": c_terminal_electrode[i] or None,
+            "emission_kind": c_kind[i] or None,
+        })
+
+    df_primary = pd.DataFrame({
+        "primary_index": pidx,
+        "reason": preason,
+        "kind": pkind,
+    })
+    df_cascade = pd.DataFrame({
+        "primary_index": c_primary,
+        "electron_id": c_eid,
+        "parent_id": c_pid,
+        "generation": c_gen,
+        "reason": c_reason,
+        "source_owner": c_source_owner,
+        "source_electrode": c_source_electrode,
+        "terminal_owner": c_terminal_owner,
+        "terminal_electrode": c_terminal_electrode,
+        "emission_kind": c_kind,
+    })
+
+    return {
+        "primary_results": primary,
+        "cascade_results_all": cascade,
+        "df_primary": df_primary,
+        "df_cascade": df_cascade,
+        "format_version": int(np.asarray(data["format_version"])[0]),
+        "track_stride": int(np.asarray(data["track_stride"])[0]),
+        "sample_theta_deg": float(np.asarray(data["sample_theta_deg"])[0]),
+        "E0_eV": float(np.asarray(data["E0_eV"])[0]),
+    }
+
+
+def _select_primary_result_indices(primary_results, indices=None, n=20, seed=1):
+    available = [i for i, res in enumerate(primary_results) if _get_traj(res) is not None]
+    if indices is not None:
+        wanted = set(int(i) for i in indices)
+        return [i for i in available if i in wanted]
+    if len(available) <= n:
+        return available
+    rng = np.random.default_rng(seed)
+    return list(rng.choice(np.asarray(available), size=n, replace=False))
+
+
+def plot_primary_trajectory_projections(
+    primary_results: list[dict],
+    indices=None,
+    n: int = 20,
+    seed: int = 1,
+    show_hits: bool = True,
+    title: str | None = None,
+):
+    """Plot x-y, x-z, and y-z projections of tracked primary trajectories."""
+    indices = _select_primary_result_indices(
+        primary_results, indices=indices, n=n, seed=seed
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    panels = [
+        (0, 1, "x (mm)", "y (mm)", "x-y"),
+        (0, 2, "x (mm)", "z (mm)", "x-z"),
+        (1, 2, "y (mm)", "z (mm)", "y-z"),
+    ]
+
+    plotted = 0
+    for idx in indices:
+        traj = _get_traj(primary_results[idx])
+        if traj is None:
+            continue
+        tr = _to_mm(traj)
+        for ax, (ii, jj, xlabel, ylabel, panel_title) in zip(axes, panels):
+            ax.plot(tr[:, ii], tr[:, jj], linewidth=0.9, alpha=0.8)
+            if show_hits:
+                ax.scatter(tr[0, ii], tr[0, jj], marker="o", s=14, alpha=0.8)
+                ax.scatter(tr[-1, ii], tr[-1, jj], marker="x", s=24, alpha=0.9)
+        plotted += 1
+
+    for ax, (_, _, xlabel, ylabel, panel_title) in zip(axes, panels):
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(panel_title)
+        ax.set_aspect("equal", adjustable="box")
+
+    if title is None:
+        title = f"Primary-electron trajectory projections, N = {plotted}"
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig, axes
+
+
+def plot_primary_trajectories_3d(
+    primary_results: list[dict],
+    indices=None,
+    n: int = 20,
+    seed: int = 1,
+    show_hits: bool = True,
+    title: str | None = None,
+    ax=None,
+):
+    """Plot tracked primary trajectories in 3D."""
+    indices = _select_primary_result_indices(
+        primary_results, indices=indices, n=n, seed=seed
+    )
+
+    if ax is None:
+        fig = plt.figure(figsize=(8, 7))
+        ax = fig.add_subplot(111, projection="3d")
+    else:
+        fig = ax.figure
+
+    plotted = 0
+    for idx in indices:
+        traj = _get_traj(primary_results[idx])
+        if traj is None:
+            continue
+        tr = _to_mm(traj)
+        ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], linewidth=0.9, alpha=0.8)
+        if show_hits:
+            ax.scatter(tr[0, 0], tr[0, 1], tr[0, 2], marker="o", s=16, alpha=0.8)
+            ax.scatter(tr[-1, 0], tr[-1, 1], tr[-1, 2], marker="x", s=26, alpha=0.9)
+        plotted += 1
+
+    ax.set_xlabel("x (mm)")
+    ax.set_ylabel("y (mm)")
+    ax.set_zlabel("z (mm)")
+    if title is None:
+        title = f"Primary-electron trajectories, N = {plotted}"
+    ax.set_title(title)
+    if plotted:
+        _set_axes_equal_3d(ax)
+    return fig, ax
+
+
 def collect_tracked_trajectories(primary_results, cascade_results_all):
     tracked = {
         "primary": [],

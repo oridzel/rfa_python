@@ -22,9 +22,6 @@ from .collisions import (
     first_analytic_grid_hit,
     segment_near_any_stl_box,
     segment_hits_sample_plane,
-    ray_hits_sample_plane,
-    sample_plane_coordinates,
-    sample_point_is_in_bounds,
     classify_sphere_event,
     nearest_hit,
 )
@@ -154,6 +151,102 @@ def classify_grid_point(p, field):
     }
 
 
+
+
+def advance_through_sample_voxel_artifact(
+    p,
+    v,
+    field,
+    sample_geometry,
+    sample_owner_id: int = 1,
+    max_tries: int = 240,
+    step_fraction_of_h: float = 0.05,
+):
+    """Traverse the voxelized sample staircase without treating it as solid.
+
+    The rotated sample is voxelized for the electrostatic boundary condition,
+    but the *continuous finite sample plane* is the physical collision surface.
+    At grazing incidence a fixed sample voxel may protrude into physical vacuum.
+    Starting from such a voxel, advance locally along the current electron
+    direction until the continuous sample plane is crossed or the sample-owned
+    voxel staircase is cleared.
+
+    Motion inside the staircase artifact is ballistic because the field inside
+    the fixed sample voxels is itself a discretization artifact.  Callers should
+    still test the returned bypass segment for STL collisions.
+    """
+    if sample_geometry is None:
+        raise ValueError("sample_geometry is required")
+    if max_tries <= 0:
+        raise ValueError("max_tries must be positive")
+    if step_fraction_of_h <= 0.0:
+        raise ValueError("step_fraction_of_h must be positive")
+
+    p0 = np.asarray(p, dtype=float).copy()
+    direction = unit(np.asarray(v, dtype=float))
+    h = float(field["h"])
+    ds = float(step_fraction_of_h) * h
+
+    p_prev = p0.copy()
+    last_cls = dict(classify_grid_point(p0, field))
+
+    for attempt in range(1, int(max_tries) + 1):
+        candidate = p0 + attempt * ds * direction
+
+        sample_hit = segment_hits_sample_plane(
+            p_prev,
+            candidate,
+            x_sample=0.0,
+            sample_y_bounds=None,
+            sample_z_bounds=None,
+            sample_geometry=sample_geometry,
+        )
+
+        if sample_hit is not None:
+            hit = dict(sample_hit)
+            hit["sample_voxel_artifact_traversal"] = True
+            hit["sample_voxel_artifact_attempts"] = attempt
+            hit["sample_voxel_artifact_distance_m"] = float(
+                np.linalg.norm(hit["location"] - p0)
+            )
+            return {
+                "status": "hit_sample",
+                "point": np.asarray(hit["location"], dtype=float).copy(),
+                "hit_info": hit,
+                "classification": dict(last_cls),
+                "attempts": attempt,
+                "distance_m": float(np.linalg.norm(hit["location"] - p0)),
+            }
+
+        cls = dict(classify_grid_point(candidate, field))
+        last_cls = cls
+        owner_id = cls.get("owner_id", None)
+        is_sample_voxel = (
+            cls.get("status") == "hit_fixed"
+            and owner_id is not None
+            and int(owner_id) == int(sample_owner_id)
+        )
+
+        if not is_sample_voxel:
+            return {
+                "status": "cleared",
+                "point": candidate.copy(),
+                "hit_info": None,
+                "classification": cls,
+                "attempts": attempt,
+                "distance_m": float(np.linalg.norm(candidate - p0)),
+            }
+
+        p_prev = candidate
+
+    return {
+        "status": "failed",
+        "point": p_prev.copy(),
+        "hit_info": None,
+        "classification": last_cls,
+        "attempts": int(max_tries),
+        "distance_m": float(np.linalg.norm(p_prev - p0)),
+    }
 
 
 def is_drifttube_escape_candidate(p, v, field, aperture_radius=None):
@@ -536,57 +629,87 @@ def integrate_one_electron(
                     and owner == "sample"
                     and sample_geometry is not None
                 ):
-                    sample_hit = ray_hits_sample_plane(
-                        p,
-                        v,
+                    # The fixed sample voxels are electrostatic boundary
+                    # conditions, not the physical collision surface.  At
+                    # grazing incidence bypass the local staircase artifact
+                    # while retaining the continuous finite sample plane as
+                    # the true surface.
+                    bypass = advance_through_sample_voxel_artifact(
+                        p=p,
+                        v=v,
+                        field=field,
                         sample_geometry=sample_geometry,
-                        require_in_bounds=True,
+                        sample_owner_id=owner_id,
                     )
+                    bypass_end = np.asarray(bypass["point"], dtype=float)
+                    sample_hit = bypass.get("hit_info", None)
+                    stl_hit = None
 
-                    if sample_hit is None:
-                        C = np.asarray(sample_geometry["center"], dtype=float)
-                        n = unit(np.asarray(sample_geometry["normal"], dtype=float))
-                        signed = float(np.dot(p - C, n))
-                        location = p - signed * n
+                    if (
+                        stl_boxes is None
+                        or segment_near_any_stl_box(p, bypass_end, stl_boxes)
+                    ):
+                        stl_hit = first_segment_hit(
+                            p,
+                            bypass_end,
+                            intersector,
+                            face_owner,
+                            collision_mesh,
+                        )
 
-                        if sample_point_is_in_bounds(location, sample_geometry):
-                            _, uu, vv = sample_plane_coordinates(
-                                location, sample_geometry
-                            )
-                            sample_hit = {
-                                "kind": "sample_voxel_projected_to_plane",
-                                "location": location,
-                                "distance": float(np.linalg.norm(location - p)),
-                                "owner": "sample",
-                                "owner_name": "sample",
-                                "owner_id": owner_id,
-                                "normal": n.copy(),
-                                "sample_u": uu,
-                                "sample_v": vv,
-                                "sample_theta_deg": sample_geometry.get(
-                                    "theta_deg", np.nan
-                                ),
-                            }
+                    hit = stl_hit if stl_hit is not None else sample_hit
 
-                    if sample_hit is not None:
-                        sample_hit = dict(sample_hit)
-                        sample_hit["grid_classification"] = dict(cls)
-                        sample_hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
-                        sample_hit["v_in"] = v.copy()
-                        if p_previous is not None:
-                            sample_hit["p_before"] = p_previous.copy()
+                    if hit is not None:
+                        hit = dict(hit)
+                        hit["sample_voxel_artifact_traversal"] = True
+                        hit["sample_voxel_artifact_attempts"] = bypass["attempts"]
+                        hit["sample_voxel_artifact_distance_m"] = bypass["distance_m"]
+                        hit["grid_classification"] = dict(cls)
+                        hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
+                        hit["v_in"] = v.copy()
+                        hit["p_before"] = p.copy()
 
-                        append_track(sample_hit["location"], v, force=True)
+                        append_track(hit["location"], v, force=True)
                         traj_out, vel_out = packed_track()
                         return {
-                            "reason": "hit_sample",
-                            "hit_info": sample_hit,
+                            "reason": (
+                                "hit_sample"
+                                if hit.get("kind") == "sample_plane"
+                                else "hit_stl"
+                            ),
+                            "hit_info": hit,
                             "traj": traj_out,
                             "vel": vel_out,
                             "steps": step,
                             "grid_events": grid_events,
                             "events": grid_events,
                         }
+
+                    if bypass["status"] == "cleared":
+                        p_previous = p.copy()
+                        p = bypass_end
+                        append_track(p, v, force=True)
+                        continue
+
+                    hit_info.update({
+                        "kind": "sample_voxel_artifact",
+                        "owner": "sample",
+                        "owner_name": "sample",
+                        "location": p.copy(),
+                        "sample_voxel_artifact_attempts": bypass["attempts"],
+                        "sample_voxel_artifact_distance_m": bypass["distance_m"],
+                    })
+                    append_track(p, v, force=True)
+                    traj_out, vel_out = packed_track()
+                    return {
+                        "reason": "sample_voxel_artifact_failed",
+                        "hit_info": hit_info,
+                        "traj": traj_out,
+                        "vel": vel_out,
+                        "steps": step,
+                        "grid_events": grid_events,
+                        "events": grid_events,
+                    }
 
                 hit_info["kind"] = "fixed_voxel"
                 hit_info["owner"] = owner

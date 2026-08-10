@@ -1107,25 +1107,50 @@ def _run_cascade_chunk(
     }
 
 
-def primary_results_to_dataframe(primary_results: list[dict]) -> pd.DataFrame:
-    """
-    Convert primary trajectory results into a compact dataframe.
+def primary_results_to_dataframe(
+    primary_results: list[dict],
+    p0s=None,
+    v0s=None,
+    sample_geometry: dict | None = None,
+) -> pd.DataFrame:
+    """Convert primary results into a compact beam-steering dataframe.
+
+    When launch arrays are supplied, the CSV also records launch position and
+    velocity, impact velocity, direction-change angle, path displacement, and
+    actual incidence angle on the continuous sample plane.  These diagnostics
+    remain available even when point-by-point trajectory storage is disabled.
     """
     rows = []
 
+    p0s_arr = None if p0s is None else np.asarray(p0s, dtype=float)
+    v0s_arr = None if v0s is None else np.asarray(v0s, dtype=float)
+    sample_normal = None
+    if sample_geometry is not None:
+        n = np.asarray(sample_geometry.get("normal", [np.nan] * 3), dtype=float)
+        if n.shape == (3,) and np.all(np.isfinite(n)) and np.linalg.norm(n) > 0:
+            sample_normal = n / np.linalg.norm(n)
+
     for i, res in enumerate(primary_results):
         hit_info = res.get("hit_info", None)
+        primary_index = int(res.get("primary_index", i))
 
-        primary_index = res.get("primary_index", i)
+        p0 = np.full(3, np.nan)
+        v0 = np.full(3, np.nan)
+        if p0s_arr is not None and 0 <= primary_index < len(p0s_arr):
+            p0 = np.asarray(p0s_arr[primary_index], dtype=float)
+        if v0s_arr is not None and 0 <= primary_index < len(v0s_arr):
+            v0 = np.asarray(v0s_arr[primary_index], dtype=float)
 
         if hit_info is None:
             KE_hit_eV = np.nan
-            location = np.array([np.nan, np.nan, np.nan])
+            location = np.full(3, np.nan)
+            v_hit = np.full(3, np.nan)
             reason = res.get("reason", None)
             kind = None
         else:
             KE_hit_eV = hit_info.get("KE_hit_eV", np.nan)
             location = hit_info.get("location", None)
+            v_hit = hit_info.get("v_in", None)
             reason = res.get("reason", None)
             kind = hit_info.get("kind", None)
 
@@ -1134,9 +1159,42 @@ def primary_results_to_dataframe(primary_results: list[dict]) -> pd.DataFrame:
                 if traj is not None and len(traj) > 0:
                     location = np.asarray(traj)[-1]
                 else:
-                    location = np.array([np.nan, np.nan, np.nan])
+                    location = np.full(3, np.nan)
+            if v_hit is None:
+                vel = res.get("vel", None)
+                if vel is not None and len(vel) > 0:
+                    v_hit = np.asarray(vel)[-1]
+                else:
+                    v_hit = np.full(3, np.nan)
 
         location = np.asarray(location, dtype=float)
+        v_hit = np.asarray(v_hit, dtype=float)
+
+        launch_to_hit_distance_m = np.nan
+        if np.all(np.isfinite(p0)) and np.all(np.isfinite(location)):
+            launch_to_hit_distance_m = float(np.linalg.norm(location - p0))
+
+        direction_change_deg = np.nan
+        if (
+            np.all(np.isfinite(v0))
+            and np.all(np.isfinite(v_hit))
+            and np.linalg.norm(v0) > 0
+            and np.linalg.norm(v_hit) > 0
+        ):
+            c = float(np.dot(v0, v_hit) / (np.linalg.norm(v0) * np.linalg.norm(v_hit)))
+            direction_change_deg = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+        incidence_angle_deg = np.nan
+        incidence_cos = np.nan
+        if (
+            sample_normal is not None
+            and np.all(np.isfinite(v_hit))
+            and np.linalg.norm(v_hit) > 0
+            and reason == "hit_sample"
+        ):
+            vhat = v_hit / np.linalg.norm(v_hit)
+            incidence_cos = float(np.clip(-np.dot(vhat, sample_normal), -1.0, 1.0))
+            incidence_angle_deg = float(np.degrees(np.arccos(incidence_cos)))
 
         rows.append({
             "primary_index": primary_index,
@@ -1144,9 +1202,30 @@ def primary_results_to_dataframe(primary_results: list[dict]) -> pd.DataFrame:
             "kind": kind,
             "KE_hit_eV": KE_hit_eV,
             "steps": res.get("steps", np.nan),
+            "x0": p0[0],
+            "y0": p0[1],
+            "z0": p0[2],
+            "vx0": v0[0],
+            "vy0": v0[1],
+            "vz0": v0[2],
             "x_hit": location[0],
             "y_hit": location[1],
             "z_hit": location[2],
+            "vx_hit": v_hit[0],
+            "vy_hit": v_hit[1],
+            "vz_hit": v_hit[2],
+            "launch_to_hit_distance_m": launch_to_hit_distance_m,
+            "direction_change_deg": direction_change_deg,
+            "incidence_cos": incidence_cos,
+            "incidence_angle_deg": incidence_angle_deg,
+            "sample_voxel_artifact_traversal": (
+                False if hit_info is None
+                else bool(hit_info.get("sample_voxel_artifact_traversal", False))
+            ),
+            "sample_voxel_artifact_distance_m": (
+                np.nan if hit_info is None
+                else hit_info.get("sample_voxel_artifact_distance_m", np.nan)
+            ),
         })
 
     return pd.DataFrame(rows)
@@ -1203,6 +1282,7 @@ def run_cascade_batch_parallel(
     verbose: int = 10,
     sample_theta_deg: float | None = None,
     primary_launch_clearance_h: float = 2.0,
+    primary_launch_distance_m: float | None = None,
     primary_launch_retreat_step_h: float = 0.25,
     primary_launch_max_tries: int = 80,
     track_points: bool = False,
@@ -1325,8 +1405,12 @@ def run_cascade_batch_parallel(
             "[cascade] sample geometry: "
             f"theta={float(sample_theta_deg):.3f} deg, "
             f"normal={sample_geometry['normal']}, "
-            f"primary normal-clearance="
-            f"{float(primary_launch_clearance_h):.2f} h"
+            f"primary launch="
+            + (
+                f"{1e3 * float(primary_launch_distance_m):.3f} mm along ray"
+                if primary_launch_distance_m is not None
+                else f"{float(primary_launch_clearance_h):.2f} h normal-clearance"
+            )
         )
 
     p0s, v0s, K0s, Phi0s = make_primary_beam_near_sample(
@@ -1344,6 +1428,7 @@ def run_cascade_batch_parallel(
         rng=rng,
         sample_geometry=sample_geometry,
         primary_launch_clearance_h=primary_launch_clearance_h,
+        primary_launch_distance_m=primary_launch_distance_m,
         primary_launch_retreat_step_h=primary_launch_retreat_step_h,
         primary_launch_max_tries=primary_launch_max_tries,
     )
@@ -1439,7 +1524,12 @@ def run_cascade_batch_parallel(
 
     owner_name_map = field.get("owner_name_map", None)
 
-    df_primary = primary_results_to_dataframe(primary_results)
+    df_primary = primary_results_to_dataframe(
+        primary_results,
+        p0s=p0s,
+        v0s=v0s,
+        sample_geometry=sample_geometry,
+    )
 
     df_cascade = cascade_results_to_dataframe(
         cascade_results_all,
@@ -1532,6 +1622,10 @@ def run_cascade_batch_parallel(
         "sample_theta_deg": float(sample_theta_deg),
         "sample_geometry": sample_geometry,
         "primary_launch_clearance_h": float(primary_launch_clearance_h),
+        "primary_launch_distance_m": (
+            None if primary_launch_distance_m is None
+            else float(primary_launch_distance_m)
+        ),
         "primary_launch_retreat_step_h": float(primary_launch_retreat_step_h),
         "primary_launch_max_tries": int(primary_launch_max_tries),
 
@@ -1599,9 +1693,160 @@ def print_cascade_batch_summary(result: dict):
     print(result["current_counts"]["net_count"].sum())
 
 
-def save_cascade_batch_tables(result: dict, out_dir, prefix: str = "cascade"):
+def save_tracked_trajectories_npz(result: dict, path):
+    """Save variable-length tracked trajectories in a compact pickle-free NPZ.
+
+    Only records whose ``traj`` is not None are written.  Points and velocities
+    are concatenated into flat arrays with offsets, so loading does not require
+    ``allow_pickle=True``.  Metadata is stored alongside the trajectories.
     """
-    Save cascade batch result tables to CSV.
+    from pathlib import Path
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    primary_results = result.get("primary_results", [])
+    cascade_results = result.get("cascade_results_all", [])
+    df_cascade = result.get("df_cascade", pd.DataFrame())
+
+    def text(value):
+        return "" if value is None else str(value)
+
+    def pack(records, kind):
+        points = []
+        velocities = []
+        offsets = [0]
+        kept_indices = []
+        valid_records = []
+
+        for idx, res in enumerate(records):
+            traj = res.get("traj", None)
+            if traj is None:
+                continue
+            traj = np.asarray(traj, dtype=float)
+            if traj.ndim != 2 or traj.shape[1] != 3 or len(traj) == 0:
+                continue
+
+            vel = res.get("vel", None)
+            if vel is None:
+                vel = np.full_like(traj, np.nan)
+            else:
+                vel = np.asarray(vel, dtype=float)
+                if vel.shape != traj.shape:
+                    vel_fixed = np.full_like(traj, np.nan)
+                    ncopy = min(len(vel_fixed), len(vel)) if vel.ndim == 2 else 0
+                    if ncopy and vel.shape[1] == 3:
+                        vel_fixed[:ncopy] = vel[:ncopy]
+                    vel = vel_fixed
+
+            points.append(traj)
+            velocities.append(vel)
+            offsets.append(offsets[-1] + len(traj))
+            kept_indices.append(idx)
+            valid_records.append(res)
+
+        points_arr = (
+            np.concatenate(points, axis=0) if points
+            else np.empty((0, 3), dtype=float)
+        )
+        vel_arr = (
+            np.concatenate(velocities, axis=0) if velocities
+            else np.empty((0, 3), dtype=float)
+        )
+
+        payload = {
+            f"{kind}_points": points_arr,
+            f"{kind}_velocities": vel_arr,
+            f"{kind}_offsets": np.asarray(offsets, dtype=np.int64),
+            f"{kind}_result_index": np.asarray(kept_indices, dtype=np.int64),
+        }
+        return payload, valid_records, kept_indices
+
+    payload = {
+        "format_version": np.asarray([1], dtype=np.int64),
+        "track_stride": np.asarray([int(result.get("track_stride", 1))], dtype=np.int64),
+        "sample_theta_deg": np.asarray([float(result.get("sample_theta_deg", np.nan))]),
+        "E0_eV": np.asarray([float(result.get("E0_eV", np.nan))]),
+    }
+
+    p_payload, p_records, p_indices = pack(primary_results, "primary")
+    c_payload, c_records, c_indices = pack(cascade_results, "cascade")
+    payload.update(p_payload)
+    payload.update(c_payload)
+
+    payload.update({
+        "primary_primary_index": np.asarray([
+            int(r.get("primary_index", -1)) for r in p_records
+        ], dtype=np.int64),
+        "primary_reason": np.asarray([text(r.get("reason")) for r in p_records]),
+        "primary_kind": np.asarray([
+            text((r.get("hit_info") or {}).get("kind")) for r in p_records
+        ]),
+    })
+
+    c_meta_rows = []
+    for result_idx, res in zip(c_indices, c_records):
+        if isinstance(df_cascade, pd.DataFrame) and result_idx < len(df_cascade):
+            row = df_cascade.iloc[result_idx]
+        else:
+            row = None
+        c_meta_rows.append((res, row))
+
+    def meta_value(res, row, key, default=None):
+        if key in res and res.get(key) is not None:
+            return res.get(key)
+        if row is not None and key in row.index and pd.notna(row[key]):
+            return row[key]
+        return default
+
+    payload.update({
+        "cascade_primary_index": np.asarray([
+            int(meta_value(r, row, "primary_index", -1)) for r, row in c_meta_rows
+        ], dtype=np.int64),
+        "cascade_electron_id": np.asarray([
+            int(meta_value(r, row, "electron_id", -1)) for r, row in c_meta_rows
+        ], dtype=np.int64),
+        "cascade_parent_id": np.asarray([
+            int(meta_value(r, row, "parent_id", -1)) for r, row in c_meta_rows
+        ], dtype=np.int64),
+        "cascade_generation": np.asarray([
+            int(meta_value(r, row, "generation", -1)) for r, row in c_meta_rows
+        ], dtype=np.int64),
+        "cascade_reason": np.asarray([
+            text(meta_value(r, row, "reason")) for r, row in c_meta_rows
+        ]),
+        "cascade_source_owner": np.asarray([
+            text(meta_value(r, row, "source_owner")) for r, row in c_meta_rows
+        ]),
+        "cascade_source_electrode": np.asarray([
+            text(meta_value(r, row, "source_electrode")) for r, row in c_meta_rows
+        ]),
+        "cascade_terminal_owner": np.asarray([
+            text(meta_value(r, row, "terminal_owner")) for r, row in c_meta_rows
+        ]),
+        "cascade_terminal_electrode": np.asarray([
+            text(meta_value(r, row, "terminal_electrode")) for r, row in c_meta_rows
+        ]),
+        "cascade_emission_kind": np.asarray([
+            text(meta_value(r, row, "emission_kind")) for r, row in c_meta_rows
+        ]),
+    })
+
+    np.savez_compressed(path, **payload)
+    return path
+
+
+def save_cascade_batch_tables(
+    result: dict,
+    out_dir,
+    prefix: str = "cascade",
+    save_trajectories: bool = True,
+):
+    """Save cascade tables and, when present, tracked trajectories.
+
+    CSVs remain compact tabular summaries.  Point-by-point trajectories are
+    saved separately as ``<prefix>_trajectories.npz`` so they can be reloaded
+    losslessly without embedding arrays inside CSV cells.
     """
     from pathlib import Path
 
@@ -1624,5 +1869,18 @@ def save_cascade_batch_tables(result: dict, out_dir, prefix: str = "cascade"):
     result["current_counts"].to_csv(paths["current_counts"])
 
     pd.DataFrame([result["summary"]]).to_csv(paths["summary"], index=False)
+
+    if save_trajectories:
+        has_primary_tracks = any(
+            r.get("traj", None) is not None
+            for r in result.get("primary_results", [])
+        )
+        has_cascade_tracks = any(
+            r.get("traj", None) is not None
+            for r in result.get("cascade_results_all", [])
+        )
+        if has_primary_tracks or has_cascade_tracks:
+            paths["trajectories"] = out_dir / f"{prefix}_trajectories.npz"
+            save_tracked_trajectories_npz(result, paths["trajectories"])
 
     return paths
