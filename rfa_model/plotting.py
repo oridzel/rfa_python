@@ -1303,6 +1303,7 @@ def plot_stl_trajectories_plotly(
     energy_range_eV: tuple[float, float] | None = None,
     energy_floor_eV: float = 1.0e-3,
     show_energy_colorbar: bool = True,
+    show_trajectory_legend: bool = False,
     show_hits: bool = True,
     show_edges: bool = False,
     part_colors: dict | None = None,
@@ -1324,6 +1325,10 @@ def plot_stl_trajectories_plotly(
     instantaneous kinetic energy computed from the saved velocity array.  A
     logarithmic energy scale is the default because one figure can contain
     sub-eV returning secondaries together with ~keV primary/BSE trajectories.
+
+    The trajectory-category legend is hidden by default because energy-colored
+    trajectories are already explained by the kinetic-energy colorbar. Set
+    ``show_trajectory_legend=True`` only when a categorical legend is useful.
 
     ``n_primary=None`` and ``n_cascade=None`` mean draw every tracked
     trajectory. ``n_cascade=0`` suppresses cascade trajectories.
@@ -1516,7 +1521,7 @@ def plot_stl_trajectories_plotly(
                 customdata=customdata,
                 name="Primary electrons" if first_primary else f"primary {idx}",
                 legendgroup="primaries",
-                showlegend=first_primary,
+                showlegend=bool(show_trajectory_legend and first_primary),
                 hovertemplate=hovertemplate,
             )
         )
@@ -1618,7 +1623,7 @@ def plot_stl_trajectories_plotly(
                 customdata=customdata,
                 name=label,
                 legendgroup=category,
-                showlegend=show_this_legend,
+                showlegend=bool(show_trajectory_legend and show_this_legend),
                 hovertemplate=hovertemplate,
             )
         )
@@ -1639,6 +1644,7 @@ def plot_stl_trajectories_plotly(
         width=int(width),
         height=int(height),
         scene=scene,
+        showlegend=bool(show_trajectory_legend),
         legend=dict(x=0.01, y=0.99),
         margin=dict(l=0, r=0, t=45, b=0),
     )
