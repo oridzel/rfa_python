@@ -1115,22 +1115,24 @@ def plot_presentation_cutaway(
     coordinate: float = 0.0,
     title: str | None = None,
     potential_limits: tuple[float, float] | None = None,
-    zoom_limits_mm: tuple[float, float, float, float] | None = None,
     equipotential_count: int = 10,
     min_stream_field_v_per_mm: float = 1e-3,
     stream_density: float = 1.05,
-    cmap: str = "viridis",
+    cmap: str = "turbo",
     exterior_color: str = "#ECEFF1",
     show: bool = True,
 ):
-    """Create a presentation-ready RFA electrostatic cutaway.
+    """Create one presentation-ready RFA electrostatic cutaway plot.
 
     The broad, unsolved exterior of the computational box is masked.  The main
-    panel shows potential, labeled equipotentials, conductor silhouettes, and
-    field lines.  A built-in inset enlarges the sample/grid/drift-tube region.
+    (and only) plot shows potential, labeled equipotentials, conductor
+    silhouettes, and field lines across the full analyzer.  No inset or zoom
+    panel is created.
 
     ``min_stream_field_v_per_mm`` suppresses numerical-noise streamlines.  The
-    default is 1 V/m = 1e-3 V/mm.
+    default is 1 V/m = 1e-3 V/mm.  ``turbo`` is used by default because it gives
+    a vivid presentation palette while preserving potential gradients more
+    uniformly than ``jet``; pass ``cmap=...`` to select another Matplotlib map.
     """
     import matplotlib.pyplot as plt
 
@@ -1150,10 +1152,9 @@ def plot_presentation_cutaway(
         sum(_take_plane(field[name], spec) ** 2 for name in ("Ex", "Ey", "Ez"))
     )
     vmin, vmax = _presentation_potential_limits(potential, domain, potential_limits)
-    zoom = _presentation_zoom_limits_mm(
-        field, spec, horizontal_mm, vertical_mm, zoom_limits_mm
-    )
 
+    # Deliberately create one data axes only.  The colorbar is attached to this
+    # axes; there is no active-region inset or zoom connector.
     fig, ax = plt.subplots(figsize=(10.8, 8.4))
     fig.subplots_adjust(left=0.08, right=0.88, bottom=0.14, top=0.90)
     image = _draw_presentation_potential(
@@ -1187,43 +1188,6 @@ def plot_presentation_cutaway(
     ax.set_xlim(float(horizontal_mm[0]), float(horizontal_mm[-1]))
     ax.set_ylim(float(vertical_mm[0]), float(vertical_mm[-1]))
 
-    inset = ax.inset_axes([0.56, 0.53, 0.41, 0.41])
-    _draw_presentation_potential(
-        inset,
-        horizontal_mm=horizontal_mm,
-        vertical_mm=vertical_mm,
-        potential=potential,
-        domain=domain,
-        vmin=vmin,
-        vmax=vmax,
-        cmap=cmap,
-        equipotential_count=max(5, equipotential_count),
-        label_equipotentials=False,
-    )
-    _draw_presentation_streamlines(
-        inset,
-        horizontal_mm=horizontal_mm,
-        vertical_mm=vertical_mm,
-        e_horizontal=e_horizontal,
-        e_vertical=e_vertical,
-        e_magnitude_v_per_mm=e_magnitude_v_per_mm,
-        vacuum=vacuum,
-        min_field_v_per_mm=min_stream_field_v_per_mm,
-        density=max(1.20, stream_density),
-        max_points_per_axis=220,
-    )
-    _draw_presentation_geometry(
-        inset, field, spec, horizontal_mm, vertical_mm, owner, fixed
-    )
-    _style_presentation_axis(inset, spec=spec, exterior_color=exterior_color)
-    inset.set_xlabel("")
-    inset.set_ylabel("")
-    inset.set_xlim(zoom[0], zoom[1])
-    inset.set_ylim(zoom[2], zoom[3])
-    inset.set_title("Active region", fontsize=9, pad=3)
-    inset.tick_params(labelsize=7)
-    ax.indicate_inset_zoom(inset, edgecolor="#303030", alpha=0.55, linewidth=0.7)
-
     colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.035)
     colorbar.set_label("Potential (V)")
 
@@ -1245,7 +1209,7 @@ def plot_presentation_cutaway(
 
     if show:
         plt.show()
-    return fig, ax, inset
+    return fig, ax
 
 
 def plot_presentation_potential_and_field(
