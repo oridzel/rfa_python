@@ -286,6 +286,40 @@ def impact_cos_theta(
     return max(cos_min, float(cos_theta))
 
 
+
+def _stl_owner_is_sample(hit: dict | None) -> bool:
+    if not isinstance(hit, dict):
+        return False
+    owner = hit.get("owner_name", hit.get("owner", None))
+    if owner is None:
+        return False
+    return str(owner).strip().lower() == "sample"
+
+
+def _finalize_sample_stl_hit(hit: dict, v_hit, p_before, sample_geometry=None) -> dict:
+    """Mark a sample-owned STL hit as the physical sample impact."""
+    h = dict(hit)
+    h["sample_stl_hit"] = True
+    h["physical_surface"] = "sample"
+    h["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_hit)
+    h["v_in"] = np.asarray(v_hit, dtype=float).copy()
+    h["p_before"] = np.asarray(p_before, dtype=float).copy()
+
+    n = h.get("normal", None)
+    if n is not None:
+        n = unit(np.asarray(n, dtype=float))
+        # For the exposed face, prefer the known analytic outward orientation.
+        if sample_geometry is not None:
+            n_ref = unit(np.asarray(sample_geometry["normal"], dtype=float))
+            if np.dot(n, n_ref) < 0:
+                n = -n
+        elif np.dot(n, v_hit) > 0:
+            n = -n
+        h["normal"] = n
+
+    return h
+
+
 # ============================================================
 # Primary trajectory to sample
 # ============================================================
@@ -410,17 +444,24 @@ def fly_primary_to_sample(
                     hit["sample_voxel_artifact_attempts"] = bypass["attempts"]
                     hit["sample_voxel_artifact_distance_m"] = bypass["distance_m"]
                     hit["grid_classification"] = dict(cls)
-                    hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
-                    hit["v_in"] = v.copy()
-                    hit["p_before"] = p.copy()
+                    if hit.get("kind") == "stl" and _stl_owner_is_sample(hit):
+                        hit = _finalize_sample_stl_hit(
+                            hit, v_hit=v, p_before=p, sample_geometry=sample_geometry
+                        )
+                        reason = "hit_sample"
+                    else:
+                        hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
+                        hit["v_in"] = v.copy()
+                        hit["p_before"] = p.copy()
+                        reason = (
+                            "hit_sample" if hit.get("kind") == "sample_plane"
+                            else "hit_stl"
+                        )
 
                     append_track(hit["location"], v, force=True)
                     traj_out, vel_out = packed_track()
                     return {
-                        "reason": (
-                            "hit_sample" if hit.get("kind") == "sample_plane"
-                            else "hit_stl"
-                        ),
+                        "reason": reason,
                         "hit_info": hit,
                         "traj": traj_out,
                         "vel": vel_out,
@@ -558,13 +599,20 @@ def fly_primary_to_sample(
                 }
 
             if hit["kind"] == "stl":
-                hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_hit)
-                hit["v_in"] = v_hit.copy()
-                hit["p_before"] = p.copy()
+                if _stl_owner_is_sample(hit):
+                    hit = _finalize_sample_stl_hit(
+                        hit, v_hit=v_hit, p_before=p, sample_geometry=sample_geometry
+                    )
+                    reason = "hit_sample"
+                else:
+                    hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_hit)
+                    hit["v_in"] = v_hit.copy()
+                    hit["p_before"] = p.copy()
+                    reason = "hit_stl"
 
                 traj_out, vel_out = packed_track()
                 return {
-                    "reason": "hit_stl",
+                    "reason": reason,
                     "hit_info": hit,
                     "traj": traj_out,
                     "vel": vel_out,

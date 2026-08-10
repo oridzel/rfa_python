@@ -41,7 +41,6 @@ from .trajectories import (
 from .primary import (
     fly_primary_to_sample,
     make_primary_beam_near_sample,
-    sample_center_from_bounds
 )
 from .samplers import (
     generate_surface_emissions,
@@ -60,6 +59,197 @@ from .accounting import (
 )
 
 
+
+
+
+# ============================================================
+# Sample front-face analytic geometry
+# ============================================================
+
+def _patch_sample_geometry_extents(
+    geometry: dict,
+    center,
+    normal,
+    u_axis,
+    v_axis,
+    u_bounds,
+    v_bounds,
+    *,
+    theta_deg: float,
+    source: str,
+) -> dict:
+    """Patch/augment a sample-geometry dictionary without assuming key names.
+
+    ``make_sample_plane_geometry`` remains the compatibility constructor for
+    the collision helpers.  This function replaces the quantities that must be
+    tied to the *physical front face*, and also writes common aliases for local
+    finite-face bounds.  Unknown extra keys are harmless.
+    """
+    g = dict(geometry)
+    center = np.asarray(center, dtype=float)
+    normal = unit(np.asarray(normal, dtype=float))
+    u_axis = unit(np.asarray(u_axis, dtype=float))
+    v_axis = unit(np.asarray(v_axis, dtype=float))
+    u_bounds = tuple(float(x) for x in u_bounds)
+    v_bounds = tuple(float(x) for x in v_bounds)
+
+    g.update({
+        "center": center,
+        "normal": normal,
+        "u_axis": u_axis,
+        "v_axis": v_axis,
+        "tangent_u": u_axis,
+        "tangent_v": v_axis,
+        "u_hat": u_axis,
+        "v_hat": v_axis,
+        "u_bounds": u_bounds,
+        "v_bounds": v_bounds,
+        "sample_u_bounds": u_bounds,
+        "sample_v_bounds": v_bounds,
+        "half_width_u": 0.5 * (u_bounds[1] - u_bounds[0]),
+        "half_width_v": 0.5 * (v_bounds[1] - v_bounds[0]),
+        "half_width": 0.5 * (u_bounds[1] - u_bounds[0]),
+        "half_height": 0.5 * (v_bounds[1] - v_bounds[0]),
+        "theta_deg": float(theta_deg),
+        "geometry_source": str(source),
+        "plane_offset_m": float(np.dot(normal, center)),
+    })
+    return g
+
+
+def infer_sample_front_face_geometry_from_stl(
+    collision_mesh,
+    face_owner,
+    theta_deg: float,
+    sample_y_bounds,
+    sample_z_bounds,
+    *,
+    x_sample: float = 0.0,
+    normal_alignment_min: float = 0.95,
+    plane_tolerance_m: float = 2.0e-6,
+    fallback_center=None,
+) -> dict:
+    """Build the analytic finite sample face from the actual sample STL.
+
+    The sample solid has finite thickness, so the midpoint of its *rotated
+    axis-aligned bounding box* is not the front-face centre at grazing angle.
+    Instead, identify sample-owned triangles whose normals are parallel to the
+    expected rotated front-face normal and select the outermost plane along
+    that normal.  The local U/V extents are then measured directly from those
+    front-face triangles.
+
+    If STL inference is impossible, fall back to a plane through the known
+    rotation-pivot/front-face position (x_sample, y=0, z=mid-z), never to the
+    rotated Y-AABB midpoint that caused the grazing-angle offset.
+    """
+    a = np.deg2rad(float(theta_deg))
+    n_expected = unit(np.array([np.cos(a), np.sin(a), 0.0], dtype=float))
+    u_axis = unit(np.array([-np.sin(a), np.cos(a), 0.0], dtype=float))
+    v_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    # Start from the existing constructor solely so all collision-helper keys
+    # expected by the user's collisions.py remain present.
+    base = make_sample_plane_geometry(
+        sample_y_bounds=sample_y_bounds,
+        sample_z_bounds=sample_z_bounds,
+        theta_deg=float(theta_deg),
+        x_sample=float(x_sample),
+    )
+
+    try:
+        owners = np.asarray(face_owner, dtype=object)
+        sample_face_ids = np.array([
+            i for i, owner in enumerate(owners)
+            if canonical_surface_name(owner) == "sample"
+        ], dtype=int)
+
+        if sample_face_ids.size == 0:
+            raise ValueError("no sample-owned faces in primary collision mesh")
+
+        faces = np.asarray(collision_mesh.faces, dtype=int)
+        vertices = np.asarray(collision_mesh.vertices, dtype=float)
+        normals = np.asarray(collision_mesh.face_normals, dtype=float)
+
+        tri = vertices[faces[sample_face_ids]]
+        centroids = tri.mean(axis=1)
+        face_normals = normals[sample_face_ids]
+        face_normals = face_normals / np.linalg.norm(face_normals, axis=1)[:, None]
+
+        alignment = np.abs(face_normals @ n_expected)
+        planar = alignment >= float(normal_alignment_min)
+        if not np.any(planar):
+            raise ValueError("no sample faces parallel to expected front-face normal")
+
+        ids_planar = sample_face_ids[planar]
+        cent_planar = centroids[planar]
+        s_planar = cent_planar @ n_expected
+
+        # The sample body extends behind the exposed face, so the vacuum/front
+        # face is the maximum coordinate along the outward normal.
+        s_front = float(np.max(s_planar))
+        front_sel = np.abs(s_planar - s_front) <= float(plane_tolerance_m)
+        front_face_ids = ids_planar[front_sel]
+        if front_face_ids.size == 0:
+            raise ValueError("front-face plane cluster is empty")
+
+        front_vertices = vertices[faces[front_face_ids]].reshape(-1, 3)
+        d = float(np.median(front_vertices @ n_expected))
+        u_abs = front_vertices @ u_axis
+        v_abs = front_vertices @ v_axis
+
+        u_min_abs, u_max_abs = float(np.min(u_abs)), float(np.max(u_abs))
+        v_min_abs, v_max_abs = float(np.min(v_abs)), float(np.max(v_abs))
+        u_center = 0.5 * (u_min_abs + u_max_abs)
+        v_center = 0.5 * (v_min_abs + v_max_abs)
+
+        center = d * n_expected + u_center * u_axis + v_center * v_axis
+        u_bounds = (u_min_abs - u_center, u_max_abs - u_center)
+        v_bounds = (v_min_abs - v_center, v_max_abs - v_center)
+
+        g = _patch_sample_geometry_extents(
+            base,
+            center=center,
+            normal=n_expected,
+            u_axis=u_axis,
+            v_axis=v_axis,
+            u_bounds=u_bounds,
+            v_bounds=v_bounds,
+            theta_deg=float(theta_deg),
+            source="sample_stl_front_face",
+        )
+        g.update({
+            "front_face_triangle_count": int(front_face_ids.size),
+            "front_face_ids": front_face_ids,
+            "normal_alignment_min": float(normal_alignment_min),
+            "front_plane_tolerance_m": float(plane_tolerance_m),
+        })
+        return g
+
+    except Exception as exc:
+        if fallback_center is None:
+            z0 = 0.5 * (float(sample_z_bounds[0]) + float(sample_z_bounds[1]))
+            center = np.array([float(x_sample), 0.0, z0], dtype=float)
+        else:
+            center = np.asarray(fallback_center, dtype=float)
+
+        # Preserve generous finite bounds on fallback.  The key correction is
+        # that the plane itself passes through the pivot/front-face location,
+        # not through the rotated solid's AABB centre.
+        span_y = abs(float(sample_y_bounds[1]) - float(sample_y_bounds[0]))
+        span_z = abs(float(sample_z_bounds[1]) - float(sample_z_bounds[0]))
+        g = _patch_sample_geometry_extents(
+            base,
+            center=center,
+            normal=n_expected,
+            u_axis=u_axis,
+            v_axis=v_axis,
+            u_bounds=(-0.5 * span_y, 0.5 * span_y),
+            v_bounds=(-0.5 * span_z, 0.5 * span_z),
+            theta_deg=float(theta_deg),
+            source="rotation_pivot_fallback",
+        )
+        g["stl_geometry_inference_error"] = f"{type(exc).__name__}: {exc}"
+        return g
 
 
 # ============================================================
@@ -1382,29 +1572,36 @@ def run_cascade_batch_parallel(
 
     rng = np.random.default_rng(seed)
 
-    y0, z0 = sample_center_from_bounds(
-        sample_y_bounds,
-        sample_z_bounds,
-    )
-
     # Prefer an explicitly supplied angle.  If absent, allow the field setup
     # to carry it; otherwise normal incidence remains the backward-compatible
-    # default.  Rotation is around +Z through the sample-face centre.
+    # default.
     if sample_theta_deg is None:
         sample_theta_deg = float(field.get("sample_theta_deg", 0.0))
 
-    sample_geometry = make_sample_plane_geometry(
+    explicit_face_center = field.get("sample_face_center", None)
+    sample_geometry = infer_sample_front_face_geometry_from_stl(
+        collision_mesh=collision_mesh_primary,
+        face_owner=face_owner_primary,
+        theta_deg=float(sample_theta_deg),
         sample_y_bounds=sample_y_bounds,
         sample_z_bounds=sample_z_bounds,
-        theta_deg=float(sample_theta_deg),
         x_sample=float(field.get("sample_x", 0.0)),
+        fallback_center=explicit_face_center,
     )
+
+    # Beam transverse coordinates must be centred on the *front face*, not on
+    # the midpoint of the rotated solid's axis-aligned Y bounds.
+    y0 = float(np.asarray(sample_geometry["center"], dtype=float)[1])
+    z0 = float(np.asarray(sample_geometry["center"], dtype=float)[2])
 
     if verbose:
         print(
             "[cascade] sample geometry: "
             f"theta={float(sample_theta_deg):.3f} deg, "
             f"normal={sample_geometry['normal']}, "
+            f"center={sample_geometry['center']}, "
+            f"source={sample_geometry.get('geometry_source', '?')}, "
+            f"plane_offset={1e6 * sample_geometry.get('plane_offset_m', np.nan):.3f} um, "
             f"primary launch="
             + (
                 f"{1e3 * float(primary_launch_distance_m):.3f} mm along ray"

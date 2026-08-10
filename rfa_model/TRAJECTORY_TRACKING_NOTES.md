@@ -60,3 +60,23 @@ fig, axes = plot_primary_trajectory_projections(
 ```
 
 For a controlled 0 V versus +50 V steering comparison, use the same sample angle, seed, beam size, and launch distance in both runs.
+
+
+## Sample geometry v3
+
+The analytic sample face is no longer centred from the post-rotation axis-aligned
+sample bounds. `run_cascade_batch_parallel()` now infers the exposed front face
+from sample-owned triangles in the primary collision STL and uses that face for:
+
+- analytic launch-plane centre and normal,
+- beam centring,
+- finite analytic sample return geometry.
+
+A sample-owned STL collision is now classified as `reason="hit_sample"` while
+retaining `kind="stl"` and adding `sample_stl_hit=True`. Thus the primary STL is
+the authoritative physical sample surface, while the analytic face is a matching
+continuous geometry used for launch and return logic.
+
+At startup, verbose output reports the analytic face `center`, `normal`, geometry
+`source`, and plane offset. For a sample whose exposed face pivots through the
+origin, `plane_offset` should be approximately zero at every angle.
