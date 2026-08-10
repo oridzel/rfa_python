@@ -23,6 +23,60 @@ def _get_traj(res):
     return traj
 
 
+def _get_vel(res):
+    """Return a validated point-by-point velocity array, or None."""
+    vel = res.get("vel", None)
+    if vel is None:
+        return None
+
+    vel = np.asarray(vel, dtype=float)
+    traj = _get_traj(res)
+    if (
+        vel.ndim != 2
+        or vel.shape[1] != 3
+        or traj is None
+        or len(vel) != len(traj)
+    ):
+        return None
+    return vel
+
+
+def _kinetic_energy_eV_from_velocity(vel):
+    """Non-relativistic electron kinetic energy at every saved point."""
+    vel = np.asarray(vel, dtype=float)
+    m_e = 9.1093837139e-31
+    e_C = 1.602176634e-19
+    return 0.5 * m_e * np.sum(vel * vel, axis=1) / e_C
+
+
+def _visual_part_style_maps(parts):
+    """Convert SimpleNamespace/dict part descriptors into color/opacity maps."""
+    colors = {}
+    opacities = {}
+    if parts is None:
+        return colors, opacities
+
+    for part in parts:
+        if isinstance(part, dict):
+            name = part.get("name", None)
+            color = part.get("color", None)
+            opacity = part.get("opacity", None)
+        else:
+            name = getattr(part, "name", None)
+            color = getattr(part, "color", None)
+            opacity = getattr(part, "opacity", None)
+
+        if name is None:
+            continue
+        name = str(name)
+        if color is not None:
+            colors[name] = color
+        if opacity is not None:
+            opacities[name] = float(opacity)
+
+    return colors, opacities
+
+
 def _tracked_result_indices(cascade_results_all):
     """Return list indices for cascade results that actually store a trajectory."""
     return [
@@ -1229,6 +1283,8 @@ def plot_stl_trajectories_plotly(
     meshes: dict,
     frame_meshes: dict | None = None,
     *,
+    visual_meshes: dict | None = None,
+    visual_parts=None,
     primary_results: list[dict] | None = None,
     cascade_results_all: list[dict] | None = None,
     primary_indices=None,
@@ -1237,9 +1293,16 @@ def plot_stl_trajectories_plotly(
     n_cascade: int | None = 0,
     seed: int = 1,
     geometry_opacity: float = 0.22,
+    part_opacities: dict | None = None,
     trajectory_width: float = 4.0,
     cascade_width: float = 2.0,
     color_cascade_by_kind: bool = True,
+    trajectory_color_by: str = "kind",
+    energy_scale: str = "log",
+    energy_colorscale: str = "Turbo",
+    energy_range_eV: tuple[float, float] | None = None,
+    energy_floor_eV: float = 1.0e-3,
+    show_energy_colorbar: bool = True,
     show_hits: bool = True,
     show_edges: bool = False,
     part_colors: dict | None = None,
@@ -1249,108 +1312,88 @@ def plot_stl_trajectories_plotly(
     height: int = 850,
     camera: dict | None = None,
 ):
-    """Interactive Plotly view of tracked trajectories over REAL aligned STLs.
+    """Interactive Plotly view of tracked trajectories over real aligned STLs.
 
-    Unlike ``plot_meshes_3d`` (Matplotlib), this renders each Trimesh object as
-    a filled, lit ``go.Mesh3d`` surface, matching the solid-part appearance used
-    in the original ``simelec`` notebook.
+    ``visual_meshes`` can contain presentation-only CAD such as the collector
+    top/bottom and outer shield top/bottom.  ``visual_parts`` accepts the same
+    SimpleNamespace objects used by the simelec notebook, e.g. objects with
+    ``name``, ``color`` and ``opacity`` attributes.  Per-part styles override
+    the global ``geometry_opacity``.
 
-    Parameters
-    ----------
-    meshes, frame_meshes:
-        Already-aligned ``trimesh.Trimesh`` dictionaries used by the simulation.
-        The sample assembly should be loaded with the same ``alpha_deg`` as the
-        trajectory run. Any additional real STL such as ``drifttube`` can simply
-        be included in either dictionary and will be rendered too.
-    primary_results, cascade_results_all:
-        Trajectory records, e.g. from ``load_tracked_trajectories_npz``.
-    n_primary, n_cascade:
-        Maximum number to draw. ``None`` means all tracked trajectories;
-        ``n_cascade=0`` draws no cascade trajectories.
-    scale:
-        Coordinate scale for display. Default 1e3 converts metres to mm.
+    Set ``trajectory_color_by='energy'`` to color every saved line point by its
+    instantaneous kinetic energy computed from the saved velocity array.  A
+    logarithmic energy scale is the default because one figure can contain
+    sub-eV returning secondaries together with ~keV primary/BSE trajectories.
+
+    ``n_primary=None`` and ``n_cascade=None`` mean draw every tracked
+    trajectory. ``n_cascade=0`` suppresses cascade trajectories.
     """
     import plotly.graph_objects as go
 
+    trajectory_color_by = str(trajectory_color_by).lower()
+    if trajectory_color_by not in {"kind", "energy"}:
+        raise ValueError("trajectory_color_by must be 'kind' or 'energy'")
+
+    energy_scale = str(energy_scale).lower()
+    if energy_scale not in {"linear", "log"}:
+        raise ValueError("energy_scale must be 'linear' or 'log'")
+
     fig = go.Figure()
     part_colors = {} if part_colors is None else dict(part_colors)
+    part_opacities = {} if part_opacities is None else dict(part_opacities)
+
+    visual_colors, visual_opacities = _visual_part_style_maps(visual_parts)
+    part_colors.update(visual_colors)
+    part_opacities.update(visual_opacities)
 
     all_meshes = {}
     if meshes is not None:
         all_meshes.update(meshes)
     if frame_meshes is not None:
         all_meshes.update(frame_meshes)
+    if visual_meshes is not None:
+        all_meshes.update(visual_meshes)
 
-    all_vertices = []
     for name, mesh in all_meshes.items():
         if mesh is None:
             continue
         verts = np.asarray(mesh.vertices, dtype=float)
         if verts.size == 0:
             continue
-        all_vertices.append(verts * float(scale))
         _add_solid_stl_plotly(
             fig,
             mesh,
             name,
             color=part_colors.get(name),
-            opacity=geometry_opacity,
+            opacity=part_opacities.get(name, geometry_opacity),
             scale=scale,
             show_edges=show_edges,
         )
 
     rng = np.random.default_rng(seed)
 
-    # -------- primary trajectories --------
+    # Select trajectories before drawing so energy-colored primary and cascade
+    # traces can share one physically meaningful color range.
+    chosen_primary = []
     if primary_results:
-        available = [i for i, res in enumerate(primary_results) if _get_traj(res) is not None]
+        available = [
+            i for i, res in enumerate(primary_results)
+            if _get_traj(res) is not None
+        ]
         if primary_indices is None:
             if n_primary is None:
                 chosen_primary = available
             elif len(available) > int(n_primary):
-                chosen_primary = list(rng.choice(available, size=int(n_primary), replace=False))
+                chosen_primary = list(
+                    rng.choice(available, size=int(n_primary), replace=False)
+                )
             else:
                 chosen_primary = available
         else:
             wanted = set(int(i) for i in primary_indices)
             chosen_primary = [i for i in available if i in wanted]
 
-        first_primary = True
-        for idx in chosen_primary:
-            tr = _get_traj(primary_results[idx]) * float(scale)
-            fig.add_trace(
-                go.Scatter3d(
-                    x=tr[:, 0], y=tr[:, 1], z=tr[:, 2],
-                    mode="lines",
-                    line=dict(width=float(trajectory_width), color="crimson"),
-                    name="Primary electrons" if first_primary else f"primary {idx}",
-                    legendgroup="primaries",
-                    showlegend=first_primary,
-                    hovertemplate=(
-                        f"primary {primary_results[idx].get('primary_index', idx)}"
-                        "<extra></extra>"
-                    ),
-                )
-            )
-            if show_hits:
-                fig.add_trace(
-                    go.Scatter3d(
-                        x=[tr[-1, 0]], y=[tr[-1, 1]], z=[tr[-1, 2]],
-                        mode="markers",
-                        marker=dict(size=3.5, color="crimson", symbol="circle"),
-                        legendgroup="primaries",
-                        showlegend=False,
-                        hovertemplate=(
-                            f"primary {primary_results[idx].get('primary_index', idx)} hit"
-                            "<extra></extra>"
-                        ),
-                    )
-                )
-            first_primary = False
-
-    # -------- cascade trajectories --------
-    # n_cascade=None means ALL tracked cascade trajectories.  n_cascade=0
-    # preserves the old "do not draw cascade" behavior.
+    chosen_cascade = []
     if cascade_results_all and n_cascade != 0:
         available = [
             i for i, res in enumerate(cascade_results_all)
@@ -1369,65 +1412,217 @@ def plot_stl_trajectories_plotly(
             wanted = set(int(i) for i in cascade_indices)
             chosen_cascade = [i for i in available if i in wanted]
 
-        # Stable presentation colors.  Sub-barrier electrons get their own
-        # high-contrast category because their biased return to the sample is
-        # the mechanism this figure is intended to demonstrate.
-        category_style = {
-            "subbarrier": ("Sub-barrier return", "magenta"),
-            "SE": ("Secondary electrons", "deepskyblue"),
-            "BSE": ("Backscattered electrons", "darkorange"),
-            "quantum_reflection": ("Quantum reflection", "mediumseagreen"),
-            "other": ("Other cascade electrons", "royalblue"),
-        }
-        legend_seen = set()
-
+    # Shared energy transform/range for every selected trajectory.
+    energy_cmin = energy_cmax = None
+    colorbar_ticks = None
+    colorbar_ticktext = None
+    if trajectory_color_by == "energy":
+        energies = []
+        for idx in chosen_primary:
+            vel = _get_vel(primary_results[idx])
+            if vel is not None:
+                energies.append(_kinetic_energy_eV_from_velocity(vel))
         for idx in chosen_cascade:
-            res = cascade_results_all[idx]
-            tr = _get_traj(res) * float(scale)
-            term = res.get("terminal_electrode", None)
-            kind = str(res.get("emission_kind", "") or "")
-            subbarrier = bool(res.get("sub_barrier", False))
+            vel = _get_vel(cascade_results_all[idx])
+            if vel is not None:
+                energies.append(_kinetic_energy_eV_from_velocity(vel))
 
-            if subbarrier:
-                category = "subbarrier"
-            elif kind == "SE":
-                category = "SE"
-            elif kind == "BSE":
-                category = "BSE"
-            elif kind == "quantum_reflection":
-                category = "quantum_reflection"
+        if energies:
+            positive = np.concatenate(energies)
+            positive = positive[np.isfinite(positive) & (positive >= 0.0)]
+        else:
+            positive = np.asarray([], dtype=float)
+
+        if energy_range_eV is None:
+            if positive.size:
+                emin = max(float(energy_floor_eV), float(np.min(positive)))
+                emax = max(emin * 1.001, float(np.max(positive)))
             else:
-                category = "other"
+                emin, emax = float(energy_floor_eV), 1.0
+        else:
+            emin, emax = map(float, energy_range_eV)
+            emin = max(float(energy_floor_eV), emin)
+            if not (emax > emin):
+                raise ValueError("energy_range_eV must satisfy max > min")
 
-            if color_cascade_by_kind:
-                label, color = category_style[category]
-            else:
-                label, color = ("Cascade electrons", "royalblue")
-                category = "cascade"
+        if energy_scale == "log":
+            energy_cmin = np.log10(emin)
+            energy_cmax = np.log10(emax)
+            decade_min = int(np.floor(energy_cmin))
+            decade_max = int(np.ceil(energy_cmax))
+            tick_e = np.power(10.0, np.arange(decade_min, decade_max + 1))
+            tick_e = tick_e[(tick_e >= emin / 1.001) & (tick_e <= emax * 1.001)]
+            colorbar_ticks = np.log10(tick_e)
+            colorbar_ticktext = [f"{v:g}" for v in tick_e]
+        else:
+            energy_cmin = emin
+            energy_cmax = emax
 
-            show_this_legend = category not in legend_seen
-            legend_seen.add(category)
+    energy_scale_shown = False
 
-            fig.add_trace(
-                go.Scatter3d(
-                    x=tr[:, 0], y=tr[:, 1], z=tr[:, 2],
-                    mode="lines",
-                    line=dict(width=float(cascade_width), color=color),
-                    name=label,
-                    legendgroup=category,
-                    showlegend=show_this_legend,
-                    hovertemplate=(
-                        f"cascade {idx}"
-                        f"<br>generation={res.get('generation', None)}"
-                        f"<br>kind={kind or None}"
-                        f"<br>E_emit={res.get('E_emit_eV', None)} eV"
-                        f"<br>sub-barrier={subbarrier}"
-                        f"<br>terminal={term}<extra></extra>"
-                    ),
-                )
+    def energy_line_dict(E_eV, width):
+        nonlocal energy_scale_shown
+        E_eV = np.asarray(E_eV, dtype=float)
+        E_plot = np.maximum(E_eV, float(energy_floor_eV))
+        if energy_scale == "log":
+            color_values = np.log10(E_plot)
+        else:
+            color_values = E_plot
+
+        line = dict(
+            width=float(width),
+            color=color_values,
+            colorscale=energy_colorscale,
+            cmin=energy_cmin,
+            cmax=energy_cmax,
+            showscale=bool(show_energy_colorbar and not energy_scale_shown),
+        )
+        if line["showscale"]:
+            cb = dict(title="Kinetic energy (eV)")
+            if colorbar_ticks is not None:
+                cb["tickvals"] = colorbar_ticks
+                cb["ticktext"] = colorbar_ticktext
+            line["colorbar"] = cb
+            energy_scale_shown = True
+        return line
+
+    # -------- primary trajectories --------
+    first_primary = True
+    for idx in chosen_primary:
+        res = primary_results[idx]
+        tr = _get_traj(res) * float(scale)
+        vel = _get_vel(res)
+
+        if trajectory_color_by == "energy" and vel is not None:
+            E_eV = _kinetic_energy_eV_from_velocity(vel)
+            line = energy_line_dict(E_eV, trajectory_width)
+            customdata = E_eV
+            hovertemplate = (
+                f"primary {res.get('primary_index', idx)}"
+                "<br>KE=%{customdata:.3g} eV<extra></extra>"
+            )
+        else:
+            line = dict(width=float(trajectory_width), color="crimson")
+            customdata = None
+            hovertemplate = (
+                f"primary {res.get('primary_index', idx)}<extra></extra>"
             )
 
-    # Keep true 3-D proportions while giving the whole assembly a useful view.
+        fig.add_trace(
+            go.Scatter3d(
+                x=tr[:, 0], y=tr[:, 1], z=tr[:, 2],
+                mode="lines",
+                line=line,
+                customdata=customdata,
+                name="Primary electrons" if first_primary else f"primary {idx}",
+                legendgroup="primaries",
+                showlegend=first_primary,
+                hovertemplate=hovertemplate,
+            )
+        )
+
+        if show_hits:
+            if trajectory_color_by == "energy" and vel is not None:
+                marker_color = [float(line["color"][-1])]
+                marker = dict(
+                    size=3.5,
+                    color=marker_color,
+                    colorscale=energy_colorscale,
+                    cmin=energy_cmin,
+                    cmax=energy_cmax,
+                    showscale=False,
+                    symbol="circle",
+                )
+            else:
+                marker = dict(size=3.5, color="crimson", symbol="circle")
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[tr[-1, 0]], y=[tr[-1, 1]], z=[tr[-1, 2]],
+                    mode="markers",
+                    marker=marker,
+                    legendgroup="primaries",
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+        first_primary = False
+
+    # -------- cascade trajectories --------
+    category_style = {
+        "subbarrier": ("Sub-barrier return", "magenta"),
+        "SE": ("Secondary electrons", "deepskyblue"),
+        "BSE": ("Backscattered electrons", "darkorange"),
+        "quantum_reflection": ("Quantum reflection", "mediumseagreen"),
+        "other": ("Other cascade electrons", "royalblue"),
+    }
+    legend_seen = set()
+
+    for idx in chosen_cascade:
+        res = cascade_results_all[idx]
+        tr = _get_traj(res) * float(scale)
+        vel = _get_vel(res)
+        term = res.get("terminal_electrode", None)
+        kind = str(res.get("emission_kind", "") or "")
+        subbarrier = bool(res.get("sub_barrier", False))
+
+        if subbarrier:
+            category = "subbarrier"
+        elif kind == "SE":
+            category = "SE"
+        elif kind == "BSE":
+            category = "BSE"
+        elif kind == "quantum_reflection":
+            category = "quantum_reflection"
+        else:
+            category = "other"
+
+        label, categorical_color = category_style[category]
+        if not color_cascade_by_kind:
+            label, categorical_color = ("Cascade electrons", "royalblue")
+            category = "cascade"
+
+        if trajectory_color_by == "energy" and vel is not None:
+            E_eV = _kinetic_energy_eV_from_velocity(vel)
+            line = energy_line_dict(E_eV, cascade_width)
+            customdata = E_eV
+            # Keep legend semantics in the name even though the line color is KE.
+            show_this_legend = category not in legend_seen
+            legend_seen.add(category)
+            hovertemplate = (
+                f"{label}"
+                f"<br>generation={res.get('generation', None)}"
+                "<br>KE=%{customdata:.3g} eV"
+                f"<br>E_emit={res.get('E_emit_eV', None)} eV"
+                f"<br>sub-barrier={subbarrier}"
+                f"<br>terminal={term}<extra></extra>"
+            )
+        else:
+            line = dict(width=float(cascade_width), color=categorical_color)
+            customdata = None
+            show_this_legend = category not in legend_seen
+            legend_seen.add(category)
+            hovertemplate = (
+                f"{label}"
+                f"<br>generation={res.get('generation', None)}"
+                f"<br>kind={kind or None}"
+                f"<br>E_emit={res.get('E_emit_eV', None)} eV"
+                f"<br>sub-barrier={subbarrier}"
+                f"<br>terminal={term}<extra></extra>"
+            )
+
+        fig.add_trace(
+            go.Scatter3d(
+                x=tr[:, 0], y=tr[:, 1], z=tr[:, 2],
+                mode="lines",
+                line=line,
+                customdata=customdata,
+                name=label,
+                legendgroup=category,
+                showlegend=show_this_legend,
+                hovertemplate=hovertemplate,
+            )
+        )
+
     if camera is None:
         camera = dict(eye=dict(x=1.65, y=1.45, z=1.15))
 
