@@ -1209,6 +1209,7 @@ def _cascade_matches_filter(res: dict, cascade_filter: str) -> bool:
     filt = str(cascade_filter).strip().lower()
     returned = _is_returned_to_sample(res)
     subbarrier = bool(res.get("sub_barrier", False))
+    visualization_only = bool(res.get("visualization_only", False))
 
     if filt == "all":
         return True
@@ -1218,9 +1219,11 @@ def _cascade_matches_filter(res: dict, cascade_filter: str) -> bool:
         return not returned
     if filt in {"sub_barrier_return", "subbarrier_return", "sub_barrier_returned_to_sample"}:
         return returned and subbarrier
+    if filt in {"sub_barrier", "subbarrier", "all_sub_barrier", "visualization_only"}:
+        return subbarrier or visualization_only
     raise ValueError(
         "cascade_filter must be one of: 'all', 'returned_to_sample', "
-        "'sub_barrier_return', 'not_returned_to_sample'"
+        "'sub_barrier_return', 'sub_barrier', 'not_returned_to_sample'"
     )
 
 
@@ -1372,9 +1375,11 @@ def plot_stl_trajectories_plotly(
         - ``'all'``
         - ``'returned_to_sample'``
         - ``'sub_barrier_return'``
+        - ``'sub_barrier'``
         - ``'not_returned_to_sample'``
     This is especially useful in sample-bias mode when you want to show only
-    the electrons that curve back and land on the positively biased sample.
+    the electrons that curve back into the nearby sample/holder/receiver
+    assembly because they are below the sample-bias barrier.
     """
     import plotly.graph_objects as go
 
