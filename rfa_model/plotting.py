@@ -1093,3 +1093,286 @@ def collect_tracked_trajectories(primary_results, cascade_results_all):
             })
 
     return tracked
+
+# ============================================================
+# Plotly solid-STL + trajectory visualization
+# ============================================================
+
+def _default_stl_plotly_color(name: str) -> str:
+    """Presentation-friendly default colors for aligned RFA STL parts."""
+    colors = {
+        "sample": "gold",
+        "holder": "lightgray",
+        "receiver": "lightblue",
+        "rod": "lightgreen",
+        "drifttube": "silver",
+        "g1_low_frame": "lightskyblue",
+        "g1_upper_frame": "deepskyblue",
+        "g2_low_frame": "lightgreen",
+        "g2_upper_frame": "limegreen",
+        "g3_low_frame": "plum",
+        "g3_upper_frame": "purple",
+    }
+    return colors.get(str(name), "lightgray")
+
+
+def _add_solid_stl_plotly(
+    fig,
+    mesh,
+    name: str,
+    *,
+    color: str | None = None,
+    opacity: float = 0.25,
+    scale: float = 1e3,
+    show_edges: bool = False,
+):
+    """Add one real triangular STL surface as a shaded Plotly Mesh3d."""
+    import plotly.graph_objects as go
+
+    vertices = np.asarray(mesh.vertices, dtype=float) * float(scale)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+
+    if color is None:
+        color = _default_stl_plotly_color(name)
+
+    fig.add_trace(
+        go.Mesh3d(
+            x=vertices[:, 0],
+            y=vertices[:, 1],
+            z=vertices[:, 2],
+            i=faces[:, 0],
+            j=faces[:, 1],
+            k=faces[:, 2],
+            name=str(name),
+            color=color,
+            opacity=float(opacity),
+            flatshading=False,
+            lighting=dict(
+                ambient=0.45,
+                diffuse=0.8,
+                specular=0.15,
+                roughness=0.6,
+                fresnel=0.05,
+            ),
+            lightposition=dict(x=100, y=200, z=300),
+            showscale=False,
+            hovertemplate=f"{name}<extra></extra>",
+        )
+    )
+
+    if show_edges:
+        edges = np.asarray(mesh.edges_unique, dtype=np.int64)
+        xyz = vertices
+        x_edges, y_edges, z_edges = [], [], []
+        for e0, e1 in edges:
+            p0 = xyz[e0]
+            p1 = xyz[e1]
+            x_edges.extend([p0[0], p1[0], None])
+            y_edges.extend([p0[1], p1[1], None])
+            z_edges.extend([p0[2], p1[2], None])
+        fig.add_trace(
+            go.Scatter3d(
+                x=x_edges,
+                y=y_edges,
+                z=z_edges,
+                mode="lines",
+                line=dict(width=1, color="rgba(30,30,30,0.20)"),
+                name=f"{name} edges",
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    return fig
+
+
+def plot_stl_trajectories_plotly(
+    meshes: dict,
+    frame_meshes: dict | None = None,
+    *,
+    primary_results: list[dict] | None = None,
+    cascade_results_all: list[dict] | None = None,
+    primary_indices=None,
+    cascade_indices=None,
+    n_primary: int = 60,
+    n_cascade: int = 0,
+    seed: int = 1,
+    geometry_opacity: float = 0.22,
+    trajectory_width: float = 4.0,
+    cascade_width: float = 2.0,
+    show_hits: bool = True,
+    show_edges: bool = False,
+    part_colors: dict | None = None,
+    scale: float = 1e3,
+    title: str = "RFA trajectories with aligned STL geometry",
+    width: int = 1050,
+    height: int = 850,
+    camera: dict | None = None,
+):
+    """Interactive Plotly view of tracked trajectories over REAL aligned STLs.
+
+    Unlike ``plot_meshes_3d`` (Matplotlib), this renders each Trimesh object as
+    a filled, lit ``go.Mesh3d`` surface, matching the solid-part appearance used
+    in the original ``simelec`` notebook.
+
+    Parameters
+    ----------
+    meshes, frame_meshes:
+        Already-aligned ``trimesh.Trimesh`` dictionaries used by the simulation.
+        The sample assembly should be loaded with the same ``alpha_deg`` as the
+        trajectory run. Any additional real STL such as ``drifttube`` can simply
+        be included in either dictionary and will be rendered too.
+    primary_results, cascade_results_all:
+        Trajectory records, e.g. from ``load_tracked_trajectories_npz``.
+    scale:
+        Coordinate scale for display. Default 1e3 converts metres to mm.
+    """
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    part_colors = {} if part_colors is None else dict(part_colors)
+
+    all_meshes = {}
+    if meshes is not None:
+        all_meshes.update(meshes)
+    if frame_meshes is not None:
+        all_meshes.update(frame_meshes)
+
+    all_vertices = []
+    for name, mesh in all_meshes.items():
+        if mesh is None:
+            continue
+        verts = np.asarray(mesh.vertices, dtype=float)
+        if verts.size == 0:
+            continue
+        all_vertices.append(verts * float(scale))
+        _add_solid_stl_plotly(
+            fig,
+            mesh,
+            name,
+            color=part_colors.get(name),
+            opacity=geometry_opacity,
+            scale=scale,
+            show_edges=show_edges,
+        )
+
+    rng = np.random.default_rng(seed)
+
+    # -------- primary trajectories --------
+    if primary_results:
+        available = [i for i, res in enumerate(primary_results) if _get_traj(res) is not None]
+        if primary_indices is None:
+            if len(available) > int(n_primary):
+                chosen_primary = list(rng.choice(available, size=int(n_primary), replace=False))
+            else:
+                chosen_primary = available
+        else:
+            wanted = set(int(i) for i in primary_indices)
+            chosen_primary = [i for i in available if i in wanted]
+
+        first_primary = True
+        for idx in chosen_primary:
+            tr = _get_traj(primary_results[idx]) * float(scale)
+            fig.add_trace(
+                go.Scatter3d(
+                    x=tr[:, 0], y=tr[:, 1], z=tr[:, 2],
+                    mode="lines",
+                    line=dict(width=float(trajectory_width), color="crimson"),
+                    name="Primary electrons" if first_primary else f"primary {idx}",
+                    legendgroup="primaries",
+                    showlegend=first_primary,
+                    hovertemplate=(
+                        f"primary {primary_results[idx].get('primary_index', idx)}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+            if show_hits:
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=[tr[-1, 0]], y=[tr[-1, 1]], z=[tr[-1, 2]],
+                        mode="markers",
+                        marker=dict(size=3.5, color="crimson", symbol="circle"),
+                        legendgroup="primaries",
+                        showlegend=False,
+                        hovertemplate=(
+                            f"primary {primary_results[idx].get('primary_index', idx)} hit"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+            first_primary = False
+
+    # -------- cascade trajectories --------
+    if cascade_results_all and int(n_cascade) != 0:
+        available = [i for i, res in enumerate(cascade_results_all) if _get_traj(res) is not None]
+        if cascade_indices is None:
+            if int(n_cascade) > 0 and len(available) > int(n_cascade):
+                chosen_cascade = list(rng.choice(available, size=int(n_cascade), replace=False))
+            else:
+                chosen_cascade = available
+        else:
+            wanted = set(int(i) for i in cascade_indices)
+            chosen_cascade = [i for i in available if i in wanted]
+
+        first_cascade = True
+        for idx in chosen_cascade:
+            res = cascade_results_all[idx]
+            tr = _get_traj(res) * float(scale)
+            term = res.get("terminal_electrode", None)
+            label = "Cascade electrons" if first_cascade else f"cascade {idx}"
+            fig.add_trace(
+                go.Scatter3d(
+                    x=tr[:, 0], y=tr[:, 1], z=tr[:, 2],
+                    mode="lines",
+                    line=dict(width=float(cascade_width), color="royalblue"),
+                    name=label,
+                    legendgroup="cascade",
+                    showlegend=first_cascade,
+                    hovertemplate=(
+                        f"cascade {idx}<br>generation={res.get('generation', None)}"
+                        f"<br>terminal={term}<extra></extra>"
+                    ),
+                )
+            )
+            first_cascade = False
+
+    # Keep true 3-D proportions while giving the whole assembly a useful view.
+    if camera is None:
+        camera = dict(eye=dict(x=1.65, y=1.45, z=1.15))
+
+    scene = dict(
+        xaxis=dict(title="x (mm)" if scale == 1e3 else "x"),
+        yaxis=dict(title="y (mm)" if scale == 1e3 else "y"),
+        zaxis=dict(title="z (mm)" if scale == 1e3 else "z"),
+        aspectmode="data",
+        camera=camera,
+    )
+
+    fig.update_layout(
+        title=title,
+        width=int(width),
+        height=int(height),
+        scene=scene,
+        legend=dict(x=0.01, y=0.99),
+        margin=dict(l=0, r=0, t=45, b=0),
+    )
+
+    return fig
+
+
+def plot_saved_trajectories_with_stls_plotly(
+    trajectory_npz,
+    meshes: dict,
+    frame_meshes: dict | None = None,
+    **kwargs,
+):
+    """Convenience wrapper: load saved NPZ then render trajectories on solid STLs."""
+    tracked = load_tracked_trajectories_npz(trajectory_npz)
+    return plot_stl_trajectories_plotly(
+        meshes=meshes,
+        frame_meshes=frame_meshes,
+        primary_results=tracked["primary_results"],
+        cascade_results_all=tracked["cascade_results_all"],
+        **kwargs,
+    )
