@@ -45,6 +45,17 @@ OWNER_ID = {
 
 OWNER_NAME = {v: k for k, v in OWNER_ID.items()}
 
+SOLID_CONTAINS_PARTS = {
+    "rod",
+    "drifttube",
+    "g1_low_frame",
+    "g1_upper_frame",
+    "g2_low_frame",
+    "g2_upper_frame",
+    "g3_low_frame",
+    "g3_upper_frame",
+}
+
 
 def attach_default_owner_name_map(field: dict) -> dict:
     """
@@ -360,12 +371,12 @@ def mark_mesh_voxels_by_voxelized(
     if pitch is None:
         pitch = float(field["h"])
 
-    if owner_name in {"rod", "drifttube"}:
+    if owner_name in SOLID_CONTAINS_PARTS:
         _log(
-            verbose,
-            f"  Redirecting {owner_name!r} to solid mesh.contains "
-            "voxelization ...",
-        )
+                    verbose,
+                    f"  Redirecting {owner_name!r} to solid mesh.contains "
+                    "voxelization ...",
+                )
         return mark_mesh_voxels_by_contains(
             field=field,
             mesh=mesh,
