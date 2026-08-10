@@ -229,33 +229,6 @@ def fixed_boundary_error_stats(
     }
 
 
-def _interior_owner_count(
-    field: dict,
-    owner_name: str,
-    *,
-    chunk_x: int = 8,
-) -> int | None:
-    """Count physical owner cells while excluding the numerical box faces."""
-    if "owner" not in field:
-        return None
-    owner_id_map = field.get("owner_id_map", {})
-    if owner_name not in owner_id_map:
-        return None
-
-    owner = np.asarray(field["owner"])
-    if owner.ndim != 3 or any(size < 3 for size in owner.shape):
-        return None
-
-    owner_id = int(owner_id_map[owner_name])
-    count = 0
-    for i0 in range(1, owner.shape[0] - 1, int(chunk_x)):
-        i1 = min(i0 + int(chunk_x), owner.shape[0] - 1)
-        count += int(
-            np.count_nonzero(owner[i0:i1, 1:-1, 1:-1] == owner_id)
-        )
-    return count
-
-
 def validate_field_numerics(
     field: dict,
     *,
@@ -269,25 +242,12 @@ def validate_field_numerics(
     fixed = fixed_boundary_error_stats(field)
     residual = laplace_residual_stats(field, chunk_x=residual_chunk_x)
 
-    stored_mesh_voxels = field.get("mesh_voxel_counts", {}).get("drifttube")
-    raw_mesh_points = field.get("mesh_voxel_point_counts", {}).get("drifttube")
-    physical_dt_voxels = _interior_owner_count(
-        field,
-        "drifttube",
-        chunk_x=residual_chunk_x,
-    )
     geometry = {
         "shape": tuple(int(value) for value in np.asarray(field["V"]).shape),
         "h_m": float(field["h"]),
         "drifttube_geometry": field.get("drifttube_geometry"),
         "drifttube_nose_x_m": field.get("drifttube_nose_x_m"),
-        "drifttube_voxels": (
-            physical_dt_voxels
-            if physical_dt_voxels is not None
-            else stored_mesh_voxels
-        ),
-        "drifttube_unique_voxels_at_assignment": stored_mesh_voxels,
-        "drifttube_raw_voxel_points": raw_mesh_points,
+        "drifttube_voxels": field.get("mesh_voxel_counts", {}).get("drifttube"),
         "legacy_drift_bc_voxels": (
             int(np.count_nonzero(field["drift_bc"]))
             if "drift_bc" in field else None
@@ -296,30 +256,23 @@ def validate_field_numerics(
 
     tolerance = solver.get("tol")
     residual_limit = None if tolerance is None else 5.0 * float(tolerance)
-    strict_convergence = bool(solver.get("converged", False))
-    residual_acceptable = (
-        None
-        if residual_limit is None
-        else residual["max_abs_neighbor_mean_residual_V"] <= residual_limit
-    )
-    required_checks = {
+    checks = {
+        "solver_converged": bool(solver.get("converged", False)),
         "potential_is_finite": potential["nan_count"] == 0 and potential["inf_count"] == 0,
         "electric_field_is_finite": all(
             stats["nan_count"] == 0 and stats["inf_count"] == 0
             for stats in electric.values()
         ),
         "fixed_voxels_unchanged": fixed["max_abs_fixed_error_V"] in (0.0, None),
-        "residual_within_5x_solver_tolerance": residual_acceptable,
+        "residual_within_5x_solver_tolerance": (
+            None
+            if residual_limit is None
+            else residual["max_abs_neighbor_mean_residual_V"] <= residual_limit
+        ),
     }
-    solution_acceptable = all(
-        value for value in required_checks.values() if value is not None
+    checks["all_available_checks_pass"] = all(
+        value for value in checks.values() if value is not None
     )
-    checks = {
-        "solver_tolerance_reached": strict_convergence,
-        **required_checks,
-        "solution_acceptable": solution_acceptable,
-        "all_required_checks_pass": solution_acceptable,
-    }
 
     return {
         "solver": solver,
@@ -347,13 +300,6 @@ def print_validation_report(report: dict[str, Any]) -> None:
         f"iterations={solver.get('iterations')} | "
         f"last_delta={solver.get('last_delta')}"
     )
-    if solver.get("best_iteration") is not None:
-        print(
-            f"best checked iterate: {solver.get('best_iteration')} | "
-            f"best_delta={solver.get('best_delta')} | "
-            f"selected={solver.get('selected_iteration')} | "
-            f"restored_best={solver.get('restored_best')}"
-        )
     print(f"shape: {geometry['shape']} | h={1e3 * geometry['h_m']:.3f} mm")
     print(
         "fixed boundary max error: "
@@ -367,23 +313,10 @@ def print_validation_report(report: dict[str, Any]) -> None:
     print(
         f"drift tube: {geometry['drifttube_geometry']}, "
         f"nose={geometry['drifttube_nose_x_m']}, "
-        f"physical voxels={geometry['drifttube_voxels']}, "
-        "unique at assignment="
-        f"{geometry['drifttube_unique_voxels_at_assignment']}, "
-        f"raw points={geometry['drifttube_raw_voxel_points']}"
+        f"voxels={geometry['drifttube_voxels']}"
     )
     for name, passed in report["checks"].items():
-        if passed is None:
-            status = "N/A"
-        elif passed:
-            status = "PASS"
-        elif (
-            name == "solver_tolerance_reached"
-            and report["checks"].get("solution_acceptable", False)
-        ):
-            status = "WARN"
-        else:
-            status = "FAIL"
+        status = "N/A" if passed is None else ("PASS" if passed else "FAIL")
         print(f"{status:4s}  {name}")
 
 
@@ -794,4 +727,634 @@ def plot_field_comparison(
                 ax.set_aspect("equal", adjustable="box")
             ax.grid(False)
 
+    return fig, axes
+
+
+# ---------------------------------------------------------------------------
+# Presentation figures
+# ---------------------------------------------------------------------------
+
+_PRESENTATION_GEOMETRY_GROUPS = (
+    (
+        "Collector",
+        ("collector_shell",),
+        "#7A7A7A",
+    ),
+    (
+        "Grids and frames",
+        (
+            "g1_shell", "g2_shell", "g3_shell",
+            "g1frame", "g2frame", "g3frame",
+        ),
+        "#4C78A8",
+    ),
+    (
+        "Drift tube",
+        ("drifttube",),
+        "#009E73",
+    ),
+    (
+        "Sample support",
+        ("holder", "receiver", "rod"),
+        "#8C6D4F",
+    ),
+    (
+        "Sample",
+        ("sample",),
+        "#E69F00",
+    ),
+)
+
+
+def _presentation_domain_plane(field: dict, spec: dict[str, Any]) -> np.ndarray:
+    """Return the solved/displayable domain for one plane."""
+    if "inside" in field:
+        domain = _take_plane(field["inside"], spec).astype(bool)
+        if domain.shape == _take_plane(field["V"], spec).shape:
+            return domain
+
+    # Older fields may not retain ``inside``.  Reconstruct the spherical
+    # collector domain when possible instead of showing the frozen box.
+    if field.get("R_col") is not None:
+        horizontal = np.asarray(field[spec["horizontal_name"]], dtype=float)
+        vertical = np.asarray(field[spec["vertical_name"]], dtype=float)
+        normal = float(spec["coordinate_actual_m"])
+        H = horizontal[:, None]
+        W = vertical[None, :]
+        radius = np.sqrt(H**2 + W**2 + normal**2)
+        return radius <= float(field["R_col"]) + 2.0 * float(field["h"])
+
+    return np.ones_like(_take_plane(field["V"], spec), dtype=bool)
+
+
+def _presentation_owner_plane(
+    field: dict,
+    spec: dict[str, Any],
+) -> np.ndarray | None:
+    if "owner" not in field:
+        return None
+    owner = _take_plane(field["owner"], spec)
+    if owner.shape != _take_plane(field["V"], spec).shape:
+        return None
+    return owner
+
+
+def _presentation_potential_limits(
+    potential: np.ndarray,
+    domain: np.ndarray,
+    limits: tuple[float, float] | None,
+) -> tuple[float, float]:
+    if limits is not None:
+        vmin, vmax = map(float, limits)
+    else:
+        values = np.asarray(potential)[domain & np.isfinite(potential)]
+        if not values.size:
+            raise ValueError("No finite potential values exist inside the display domain")
+        vmin = float(np.min(values))
+        vmax = float(np.max(values))
+
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin > vmax:
+        raise ValueError("potential_limits must be finite and increasing")
+    if vmin == vmax:
+        padding = max(1.0, abs(vmin) * 0.01)
+        vmin -= padding
+        vmax += padding
+    return vmin, vmax
+
+
+def _presentation_field_limits(
+    field_v_per_mm: np.ndarray,
+    vacuum: np.ndarray,
+    limits: tuple[float, float] | None,
+) -> tuple[float, float]:
+    if limits is not None:
+        lower, upper = map(float, limits)
+    else:
+        values = np.asarray(field_v_per_mm)[
+            vacuum & np.isfinite(field_v_per_mm) & (field_v_per_mm > 0.0)
+        ]
+        if not values.size:
+            return 1e-15, 1e-14
+        upper = float(np.percentile(values, 99.8))
+        lower = float(np.percentile(values, 2.0))
+        lower = max(lower, upper * 1e-7, 1e-15)
+
+    if (
+        not np.isfinite(lower)
+        or not np.isfinite(upper)
+        or lower <= 0.0
+        or lower >= upper
+    ):
+        raise ValueError(
+            "field_limits_v_per_mm must contain two positive increasing values"
+        )
+    return lower, upper
+
+
+def _presentation_zoom_limits_mm(
+    field: dict,
+    spec: dict[str, Any],
+    horizontal_mm: np.ndarray,
+    vertical_mm: np.ndarray,
+    zoom_limits_mm: tuple[float, float, float, float] | None,
+) -> tuple[float, float, float, float]:
+    if zoom_limits_mm is not None:
+        if len(zoom_limits_mm) != 4:
+            raise ValueError("zoom_limits_mm must be (left, right, bottom, top)")
+        left, right, bottom, top = map(float, zoom_limits_mm)
+        if not (left < right and bottom < top):
+            raise ValueError("zoom_limits_mm must be increasing")
+        return left, right, bottom, top
+
+    if spec["horizontal_name"] == "x" and field.get("R_col") is not None:
+        radius_mm = 1e3 * float(field["R_col"])
+        return (
+            -0.45 * radius_mm,
+            1.05 * radius_mm,
+            -0.55 * radius_mm,
+            0.55 * radius_mm,
+        )
+
+    return (
+        float(horizontal_mm[0]),
+        float(horizontal_mm[-1]),
+        float(vertical_mm[0]),
+        float(vertical_mm[-1]),
+    )
+
+
+def _draw_presentation_geometry(
+    ax,
+    field: dict,
+    spec: dict[str, Any],
+    horizontal_mm: np.ndarray,
+    vertical_mm: np.ndarray,
+    owner_plane: np.ndarray | None,
+    fixed_plane: np.ndarray,
+):
+    """Overlay conductor silhouettes and return legend handles."""
+    from matplotlib.patches import Patch
+
+    handles = []
+    owner_ids = field.get("owner_id_map", {})
+
+    if owner_plane is not None and owner_ids:
+        for label, names, color in _PRESENTATION_GEOMETRY_GROUPS:
+            ids = [int(owner_ids[name]) for name in names if name in owner_ids]
+            if not ids:
+                continue
+            mask = np.isin(owner_plane, ids)
+            if not np.any(mask):
+                continue
+
+            display = np.ma.masked_where(~mask.T, np.ones(mask.T.shape))
+            ax.contourf(
+                horizontal_mm,
+                vertical_mm,
+                display,
+                levels=[0.5, 1.5],
+                colors=[color],
+                alpha=0.94,
+                antialiased=False,
+                zorder=6,
+            )
+            if np.any(~mask):
+                ax.contour(
+                    horizontal_mm,
+                    vertical_mm,
+                    mask.T.astype(float),
+                    levels=[0.5],
+                    colors="#202020",
+                    linewidths=0.55,
+                    zorder=7,
+                )
+            handles.append(
+                Patch(
+                    facecolor=color,
+                    edgecolor="#202020",
+                    linewidth=0.55,
+                    label=label,
+                )
+            )
+        return handles
+
+    # Compatibility fallback for fields saved without ownership metadata.
+    if np.any(fixed_plane):
+        mask = fixed_plane.astype(bool)
+        display = np.ma.masked_where(~mask.T, np.ones(mask.T.shape))
+        ax.contourf(
+            horizontal_mm,
+            vertical_mm,
+            display,
+            levels=[0.5, 1.5],
+            colors=["#777777"],
+            alpha=0.92,
+            antialiased=False,
+            zorder=6,
+        )
+        if np.any(~mask):
+            ax.contour(
+                horizontal_mm,
+                vertical_mm,
+                mask.T.astype(float),
+                levels=[0.5],
+                colors="#202020",
+                linewidths=0.55,
+                zorder=7,
+            )
+        handles.append(
+            Patch(
+                facecolor="#777777",
+                edgecolor="#202020",
+                linewidth=0.55,
+                label="Fixed conductors",
+            )
+        )
+    return handles
+
+
+def _draw_presentation_potential(
+    ax,
+    *,
+    horizontal_mm: np.ndarray,
+    vertical_mm: np.ndarray,
+    potential: np.ndarray,
+    domain: np.ndarray,
+    vmin: float,
+    vmax: float,
+    cmap: str,
+    equipotential_count: int,
+    label_equipotentials: bool,
+):
+    from matplotlib.ticker import MaxNLocator
+
+    display = np.ma.masked_where(~domain.T, potential.T)
+    filled_levels = np.linspace(vmin, vmax, 96)
+    image = ax.contourf(
+        horizontal_mm,
+        vertical_mm,
+        display,
+        levels=filled_levels,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=cmap,
+        extend="both",
+        antialiased=True,
+        zorder=1,
+    )
+
+    contour_set = None
+    if equipotential_count >= 2:
+        contour_levels = MaxNLocator(nbins=int(equipotential_count)).tick_values(
+            vmin, vmax
+        )
+        contour_levels = contour_levels[
+            (contour_levels > vmin) & (contour_levels < vmax)
+        ]
+        contour_set = ax.contour(
+            horizontal_mm,
+            vertical_mm,
+            display,
+            levels=contour_levels,
+            colors="white",
+            linewidths=0.55,
+            alpha=0.70,
+            zorder=3,
+        )
+        if label_equipotentials and len(contour_set.levels):
+            ax.clabel(
+                contour_set,
+                contour_set.levels[::2],
+                inline=True,
+                fontsize=7,
+                fmt=lambda value: f"{value:g} V",
+            )
+    return image
+
+
+def _draw_presentation_streamlines(
+    ax,
+    *,
+    horizontal_mm: np.ndarray,
+    vertical_mm: np.ndarray,
+    e_horizontal: np.ndarray,
+    e_vertical: np.ndarray,
+    e_magnitude_v_per_mm: np.ndarray,
+    vacuum: np.ndarray,
+    min_field_v_per_mm: float,
+    density: float,
+    max_points_per_axis: int,
+) -> bool:
+    if min_field_v_per_mm < 0.0:
+        raise ValueError("min_stream_field_v_per_mm must be non-negative")
+
+    step_h = max(1, int(np.ceil(len(horizontal_mm) / max_points_per_axis)))
+    step_v = max(1, int(np.ceil(len(vertical_mm) / max_points_per_axis)))
+
+    x_plot = horizontal_mm[::step_h]
+    y_plot = vertical_mm[::step_v]
+    u = np.asarray(e_horizontal)[::step_h, ::step_v]
+    v = np.asarray(e_vertical)[::step_h, ::step_v]
+    magnitude = np.asarray(e_magnitude_v_per_mm)[::step_h, ::step_v]
+    valid = (
+        np.asarray(vacuum)[::step_h, ::step_v]
+        & np.isfinite(u)
+        & np.isfinite(v)
+        & np.isfinite(magnitude)
+        & (magnitude >= float(min_field_v_per_mm))
+    )
+    if np.count_nonzero(valid) < 4 or len(x_plot) < 2 or len(y_plot) < 2:
+        return False
+
+    u_plot = np.ma.masked_where(~valid.T, u.T)
+    v_plot = np.ma.masked_where(~valid.T, v.T)
+    magnitude_plot = magnitude.T
+    reference = float(np.percentile(magnitude[valid], 95.0))
+    if reference <= 0.0:
+        return False
+    linewidth = 0.45 + 1.25 * np.sqrt(
+        np.clip(magnitude_plot / reference, 0.0, 1.0)
+    )
+
+    ax.streamplot(
+        x_plot,
+        y_plot,
+        u_plot,
+        v_plot,
+        density=float(density),
+        color="white",
+        linewidth=linewidth,
+        arrowsize=0.75,
+        arrowstyle="-|>",
+        minlength=0.18,
+        integration_direction="both",
+        broken_streamlines=True,
+        zorder=4,
+    )
+    return True
+
+
+def _style_presentation_axis(
+    ax,
+    *,
+    spec: dict[str, Any],
+    exterior_color: str,
+) -> None:
+    ax.set_facecolor(exterior_color)
+    ax.set_xlabel(f"{spec['horizontal_name']} (mm)")
+    ax.set_ylabel(f"{spec['vertical_name']} (mm)")
+    ax.set_aspect("equal", adjustable="box")
+    ax.tick_params(direction="out", length=3)
+    ax.grid(False)
+
+
+def plot_presentation_cutaway(
+    field: dict,
+    *,
+    plane: str = "xy",
+    coordinate: float = 0.0,
+    title: str | None = None,
+    potential_limits: tuple[float, float] | None = None,
+    zoom_limits_mm: tuple[float, float, float, float] | None = None,
+    equipotential_count: int = 10,
+    min_stream_field_v_per_mm: float = 1e-3,
+    stream_density: float = 1.05,
+    cmap: str = "viridis",
+    exterior_color: str = "#ECEFF1",
+    show: bool = True,
+):
+    """Create a presentation-ready RFA electrostatic cutaway.
+
+    The broad, unsolved exterior of the computational box is masked.  The main
+    panel shows potential, labeled equipotentials, conductor silhouettes, and
+    field lines.  A built-in inset enlarges the sample/grid/drift-tube region.
+
+    ``min_stream_field_v_per_mm`` suppresses numerical-noise streamlines.  The
+    default is 1 V/m = 1e-3 V/mm.
+    """
+    import matplotlib.pyplot as plt
+
+    _require_field(field, electric=True)
+    spec = _plane_spec(field, plane, coordinate)
+    horizontal_mm = 1e3 * np.asarray(field[spec["horizontal_name"]], dtype=float)
+    vertical_mm = 1e3 * np.asarray(field[spec["vertical_name"]], dtype=float)
+    potential = _take_plane(field["V"], spec)
+    fixed = _take_plane(field["fixed"], spec).astype(bool)
+    domain = _presentation_domain_plane(field, spec)
+    owner = _presentation_owner_plane(field, spec)
+    vacuum = domain & (~fixed if owner is None else owner == 0)
+
+    e_horizontal = _take_plane(field[spec["component_names"][0]], spec)
+    e_vertical = _take_plane(field[spec["component_names"][1]], spec)
+    e_magnitude_v_per_mm = 1e-3 * np.sqrt(
+        sum(_take_plane(field[name], spec) ** 2 for name in ("Ex", "Ey", "Ez"))
+    )
+    vmin, vmax = _presentation_potential_limits(potential, domain, potential_limits)
+    zoom = _presentation_zoom_limits_mm(
+        field, spec, horizontal_mm, vertical_mm, zoom_limits_mm
+    )
+
+    fig, ax = plt.subplots(figsize=(10.8, 8.4))
+    fig.subplots_adjust(left=0.08, right=0.88, bottom=0.14, top=0.90)
+    image = _draw_presentation_potential(
+        ax,
+        horizontal_mm=horizontal_mm,
+        vertical_mm=vertical_mm,
+        potential=potential,
+        domain=domain,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=cmap,
+        equipotential_count=equipotential_count,
+        label_equipotentials=True,
+    )
+    _draw_presentation_streamlines(
+        ax,
+        horizontal_mm=horizontal_mm,
+        vertical_mm=vertical_mm,
+        e_horizontal=e_horizontal,
+        e_vertical=e_vertical,
+        e_magnitude_v_per_mm=e_magnitude_v_per_mm,
+        vacuum=vacuum,
+        min_field_v_per_mm=min_stream_field_v_per_mm,
+        density=stream_density,
+        max_points_per_axis=240,
+    )
+    handles = _draw_presentation_geometry(
+        ax, field, spec, horizontal_mm, vertical_mm, owner, fixed
+    )
+    _style_presentation_axis(ax, spec=spec, exterior_color=exterior_color)
+    ax.set_xlim(float(horizontal_mm[0]), float(horizontal_mm[-1]))
+    ax.set_ylim(float(vertical_mm[0]), float(vertical_mm[-1]))
+
+    inset = ax.inset_axes([0.56, 0.53, 0.41, 0.41])
+    _draw_presentation_potential(
+        inset,
+        horizontal_mm=horizontal_mm,
+        vertical_mm=vertical_mm,
+        potential=potential,
+        domain=domain,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=cmap,
+        equipotential_count=max(5, equipotential_count),
+        label_equipotentials=False,
+    )
+    _draw_presentation_streamlines(
+        inset,
+        horizontal_mm=horizontal_mm,
+        vertical_mm=vertical_mm,
+        e_horizontal=e_horizontal,
+        e_vertical=e_vertical,
+        e_magnitude_v_per_mm=e_magnitude_v_per_mm,
+        vacuum=vacuum,
+        min_field_v_per_mm=min_stream_field_v_per_mm,
+        density=max(1.20, stream_density),
+        max_points_per_axis=220,
+    )
+    _draw_presentation_geometry(
+        inset, field, spec, horizontal_mm, vertical_mm, owner, fixed
+    )
+    _style_presentation_axis(inset, spec=spec, exterior_color=exterior_color)
+    inset.set_xlabel("")
+    inset.set_ylabel("")
+    inset.set_xlim(zoom[0], zoom[1])
+    inset.set_ylim(zoom[2], zoom[3])
+    inset.set_title("Active region", fontsize=9, pad=3)
+    inset.tick_params(labelsize=7)
+    ax.indicate_inset_zoom(inset, edgecolor="#303030", alpha=0.55, linewidth=0.7)
+
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.035)
+    colorbar.set_label("Potential (V)")
+
+    if title is None:
+        title = (
+            f"RFA electrostatic cutaway — {spec['plane'].upper()} slice at "
+            f"{spec['normal_name']}={1e3 * spec['coordinate_actual_m']:.2f} mm"
+        )
+    fig.suptitle(title, fontsize=15, y=0.965)
+    if handles:
+        fig.legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.47, 0.025),
+            ncol=min(5, len(handles)),
+            frameon=False,
+            fontsize=9,
+        )
+
+    if show:
+        plt.show()
+    return fig, ax, inset
+
+
+def plot_presentation_potential_and_field(
+    field: dict,
+    *,
+    plane: str = "xy",
+    coordinate: float = 0.0,
+    title: str | None = None,
+    potential_limits: tuple[float, float] | None = None,
+    field_limits_v_per_mm: tuple[float, float] | None = None,
+    zoom_limits_mm: tuple[float, float, float, float] | None = None,
+    equipotential_count: int = 10,
+    potential_cmap: str = "viridis",
+    field_cmap: str = "inferno",
+    exterior_color: str = "#ECEFF1",
+    show: bool = True,
+):
+    """Plot full-analyzer potential beside zoomed log10 field strength.
+
+    Field strength is calculated from the full 3-D vector magnitude and shown
+    in V/mm.  The unsolved computational-box exterior and conductor interiors
+    are masked in the field-strength panel.
+    """
+    import matplotlib.pyplot as plt
+
+    _require_field(field, electric=True)
+    spec = _plane_spec(field, plane, coordinate)
+    horizontal_mm = 1e3 * np.asarray(field[spec["horizontal_name"]], dtype=float)
+    vertical_mm = 1e3 * np.asarray(field[spec["vertical_name"]], dtype=float)
+    potential = _take_plane(field["V"], spec)
+    fixed = _take_plane(field["fixed"], spec).astype(bool)
+    domain = _presentation_domain_plane(field, spec)
+    owner = _presentation_owner_plane(field, spec)
+    vacuum = domain & (~fixed if owner is None else owner == 0)
+    e_magnitude_v_per_mm = 1e-3 * np.sqrt(
+        sum(_take_plane(field[name], spec) ** 2 for name in ("Ex", "Ey", "Ez"))
+    )
+
+    vmin, vmax = _presentation_potential_limits(potential, domain, potential_limits)
+    field_min, field_max = _presentation_field_limits(
+        e_magnitude_v_per_mm, vacuum, field_limits_v_per_mm
+    )
+    zoom = _presentation_zoom_limits_mm(
+        field, spec, horizontal_mm, vertical_mm, zoom_limits_mm
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(15.4, 6.4))
+    fig.subplots_adjust(left=0.055, right=0.935, bottom=0.17, top=0.86, wspace=0.28)
+
+    image_v = _draw_presentation_potential(
+        axes[0],
+        horizontal_mm=horizontal_mm,
+        vertical_mm=vertical_mm,
+        potential=potential,
+        domain=domain,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=potential_cmap,
+        equipotential_count=equipotential_count,
+        label_equipotentials=True,
+    )
+    handles = _draw_presentation_geometry(
+        axes[0], field, spec, horizontal_mm, vertical_mm, owner, fixed
+    )
+    _style_presentation_axis(axes[0], spec=spec, exterior_color=exterior_color)
+    axes[0].set_xlim(float(horizontal_mm[0]), float(horizontal_mm[-1]))
+    axes[0].set_ylim(float(vertical_mm[0]), float(vertical_mm[-1]))
+    axes[0].set_title("Electrostatic potential")
+    cbar_v = fig.colorbar(image_v, ax=axes[0], fraction=0.047, pad=0.03)
+    cbar_v.set_label("Potential (V)")
+
+    log_field = np.log10(np.clip(e_magnitude_v_per_mm, field_min, field_max))
+    log_display = np.ma.masked_where(~vacuum.T, log_field.T)
+    image_e = axes[1].pcolormesh(
+        horizontal_mm,
+        vertical_mm,
+        log_display,
+        shading="auto",
+        vmin=np.log10(field_min),
+        vmax=np.log10(field_max),
+        cmap=field_cmap,
+        zorder=1,
+    )
+    _draw_presentation_geometry(
+        axes[1], field, spec, horizontal_mm, vertical_mm, owner, fixed
+    )
+    _style_presentation_axis(axes[1], spec=spec, exterior_color=exterior_color)
+    axes[1].set_xlim(zoom[0], zoom[1])
+    axes[1].set_ylim(zoom[2], zoom[3])
+    axes[1].set_title("Field concentration in the active region")
+    cbar_e = fig.colorbar(image_e, ax=axes[1], fraction=0.047, pad=0.03)
+    cbar_e.set_label(r"$\log_{10}|E|$  (V/mm)")
+
+    if title is None:
+        title = (
+            f"RFA potential and field strength — {spec['plane'].upper()} slice at "
+            f"{spec['normal_name']}={1e3 * spec['coordinate_actual_m']:.2f} mm"
+        )
+    fig.suptitle(title, fontsize=15, y=0.955)
+    if handles:
+        fig.legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.03),
+            ncol=min(5, len(handles)),
+            frameon=False,
+            fontsize=9,
+        )
+
+    if show:
+        plt.show()
     return fig, axes

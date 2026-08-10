@@ -459,6 +459,10 @@ def run_one_primary_with_cascade(
     surface_skip_eps: float = 1.0e-6,
     integrator: str = "verlet",
     sample_geometry: dict | None = None,
+    track_points: bool = False,
+    track_stride: int = 1,
+    track_primary_only: bool = False,
+    track_this_primary: bool = False,
 ):
     """
     Run one primary electron with full cascade emission.
@@ -474,6 +478,9 @@ def run_one_primary_with_cascade(
     cascade_log:
         Lightweight list of generated-emission records.
     """
+
+    track_primary_points = bool(track_points and track_this_primary)
+
     primary_result = fly_primary_to_sample(
         p0=p_primary,
         v0=v_primary,
@@ -493,6 +500,8 @@ def run_one_primary_with_cascade(
         dt_min=1.0e-13,
         dt_max=2.0e-11,
         max_step_fraction_of_h=0.10,
+        track_points=track_primary_points,
+        track_stride=track_stride,
     )
 
     cascade_results = []
@@ -589,6 +598,12 @@ def run_one_primary_with_cascade(
 
         e = item["emission"]
 
+        track_emitted_points = bool(
+            track_points
+            and track_this_primary
+            and (not track_primary_only)
+        )
+
         res = integrate_one_electron(
             p0=e["p0"],
             v0=e["v0"],
@@ -616,6 +631,8 @@ def run_one_primary_with_cascade(
             sample_z_bounds=sample_z_bounds,
             min_sample_return_distance=5.0e-7,
             sample_geometry=sample_geometry,
+            track_points=track_emitted_points,
+            track_stride=track_stride,
         )
 
         # Attach cascade metadata.
@@ -997,6 +1014,11 @@ def _run_cascade_chunk(
     
     integrator: str = "verlet",
     sample_geometry: dict | None = None,
+
+    track_points: bool = False,
+    track_stride: int = 1,
+    track_primary_only: bool = False,
+    tracked_primary_indices=None,
 ):
     """
     Worker function for one cascade chunk.
@@ -1009,6 +1031,14 @@ def _run_cascade_chunk(
 
     for i in range(len(p0s_chunk)):
         primary_index = primary_index_offset + i
+
+        track_this_primary = (
+            track_points
+            and (
+                tracked_primary_indices is None
+                or primary_index in tracked_primary_indices
+            )
+        )
 
         primary_res_i, cas_i, log_i = run_one_primary_with_cascade(
             p_primary=p0s_chunk[i],
@@ -1051,6 +1081,10 @@ def _run_cascade_chunk(
             launch_step_fraction_of_h=launch_step_fraction_of_h,
             integrator=integrator,
             sample_geometry=sample_geometry,
+            track_points=track_points,
+            track_stride=track_stride,
+            track_primary_only=track_primary_only,
+            track_this_primary=track_this_primary,
         )
 
         primary_res_i["primary_index"] = primary_index
@@ -1171,6 +1205,10 @@ def run_cascade_batch_parallel(
     primary_launch_clearance_h: float = 2.0,
     primary_launch_retreat_step_h: float = 0.25,
     primary_launch_max_tries: int = 80,
+    track_points: bool = False,
+    track_stride: int = 1,
+    track_primary_only: bool = False,
+    tracked_primary_indices: set[int] | None = None,
 ):
     """
     Parallel cascade batch runner.
@@ -1189,6 +1227,11 @@ def run_cascade_batch_parallel(
 
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
+
+    if track_stride <= 0:
+        raise ValueError("track_stride must be positive")
+
+    # Point storage is opt-in; per-primary selection is resolved in each worker.
 
     yield_model_sources = {}
     for family, family_models in yield_models.items():
@@ -1374,6 +1417,11 @@ def run_cascade_batch_parallel(
             launch_step_fraction_of_h=launch_step_fraction_of_h,
             integrator=integrator,
             sample_geometry=sample_geometry,
+
+            track_points=track_points,
+            track_stride=track_stride,
+            track_primary_only=track_primary_only,
+            tracked_primary_indices=tracked_primary_indices,
         )
         for ic, (start, stop) in enumerate(chunks)
     )
@@ -1489,6 +1537,14 @@ def run_cascade_batch_parallel(
 
         "n_jobs": n_jobs,
         "chunk_size": chunk_size,
+
+        "track_points": track_points,
+        "track_stride": track_stride,
+        "track_primary_only": track_primary_only,
+        "tracked_primary_indices": (
+            None if tracked_primary_indices is None
+            else sorted(tracked_primary_indices)
+        ),
     }
 
     return result

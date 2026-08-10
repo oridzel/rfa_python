@@ -296,18 +296,54 @@ def fly_primary_to_sample(
     max_step_fraction_of_h: float = 0.10,
     sample_owner_id: int = 1,
     sample_geometry: dict | None = None,
+    track_points: bool = False,
+    track_stride: int = 1,
 ):
     """Track one primary until it hits the finite oriented sample or an STL.
 
     ``sample_geometry`` is the preferred path.  The segment/plane test is then
     fully orientation independent; there is no global-x crossing condition.
     The old x=0 behavior remains available when no geometry is supplied.
+
+    Point-by-point trajectory storage is optional.  With ``track_points=False``
+    (the default), only the state needed by the integrator/collision logic is
+    retained.  With tracking enabled, the launch point, every ``track_stride``
+    accepted integration steps, and exact terminal hit locations are stored.
     """
+    if track_stride <= 0:
+        raise ValueError("track_stride must be positive")
+
     p = np.asarray(p0, dtype=float).copy()
     v = np.asarray(v0, dtype=float).copy()
 
-    traj = [p.copy()]
-    vel = [v.copy()]
+    if track_points:
+        traj = [p.copy()]
+        vel = [v.copy()]
+    else:
+        traj = None
+        vel = None
+
+    # Physics/collision logic occasionally needs the immediately preceding
+    # vacuum point.  Keep it independently of optional trajectory storage.
+    p_previous = None
+
+    def append_track(position, velocity, *, force=False, accepted_step=None):
+        if not track_points:
+            return
+        if not force:
+            if accepted_step is None or (accepted_step % track_stride) != 0:
+                return
+        position = np.asarray(position, dtype=float)
+        velocity = np.asarray(velocity, dtype=float)
+        if len(traj) == 0 or not np.array_equal(traj[-1], position):
+            traj.append(position.copy())
+            vel.append(velocity.copy())
+
+    def packed_track():
+        return (
+            np.asarray(traj, dtype=float) if track_points else None,
+            np.asarray(vel, dtype=float) if track_points else None,
+        )
 
     q_over_m = -e_charge / m_e
 
@@ -372,22 +408,26 @@ def fly_primary_to_sample(
                 hit["grid_classification"] = cls
                 hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
                 hit["v_in"] = v.copy()
-                if len(traj) >= 2:
-                    hit["p_before"] = np.asarray(traj[-2], dtype=float).copy()
+                if p_previous is not None:
+                    hit["p_before"] = p_previous.copy()
 
+                append_track(hit["location"], v, force=True)
+                traj_out, vel_out = packed_track()
                 return {
                     "reason": "hit_sample",
                     "hit_info": hit,
-                    "traj": np.asarray(traj),
-                    "vel": np.asarray(vel),
+                    "traj": traj_out,
+                    "vel": vel_out,
                     "steps": step,
                 }
 
+            append_track(p, v, force=True)
+            traj_out, vel_out = packed_track()
             return {
                 "reason": cls["status"],
                 "hit_info": cls,
-                "traj": np.asarray(traj),
-                "vel": np.asarray(vel),
+                "traj": traj_out,
+                "vel": vel_out,
                 "steps": step,
             }
 
@@ -440,19 +480,19 @@ def fly_primary_to_sample(
             t_hit = float(np.clip(t_hit, 0.0, 1.0))
             v_hit = v + t_hit * (v_new - v)
 
-            traj.append(hit["location"].copy())
-            vel.append(v_hit.copy())
+            append_track(hit["location"], v_hit, force=True)
 
             if hit["kind"] == "sample_plane":
                 hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_hit)
                 hit["v_in"] = v_hit.copy()
                 hit["p_before"] = p.copy()
 
+                traj_out, vel_out = packed_track()
                 return {
                     "reason": "hit_sample",
                     "hit_info": hit,
-                    "traj": np.asarray(traj),
-                    "vel": np.asarray(vel),
+                    "traj": traj_out,
+                    "vel": vel_out,
                     "steps": step + 1,
                 }
 
@@ -461,25 +501,27 @@ def fly_primary_to_sample(
                 hit["v_in"] = v_hit.copy()
                 hit["p_before"] = p.copy()
 
+                traj_out, vel_out = packed_track()
                 return {
                     "reason": "hit_stl",
                     "hit_info": hit,
-                    "traj": np.asarray(traj),
-                    "vel": np.asarray(vel),
+                    "traj": traj_out,
+                    "vel": vel_out,
                     "steps": step + 1,
                 }
 
+        p_previous = p.copy()
         p = p_new
         v = v_new
+        append_track(p, v, accepted_step=step + 1)
 
-        traj.append(p.copy())
-        vel.append(v.copy())
-
+    append_track(p, v, force=True)
+    traj_out, vel_out = packed_track()
     return {
         "reason": "max_steps",
         "hit_info": None,
-        "traj": np.asarray(traj),
-        "vel": np.asarray(vel),
+        "traj": traj_out,
+        "vel": vel_out,
         "steps": max_steps,
     }
 
@@ -583,7 +625,7 @@ def run_one_primary_with_model_emission(
     E_inc_eV = hit["KE_hit_eV"]
     v_in = hit["v_in"]
 
-    emitted_electrons = generate_surface_emissions(
+    emitted_electrons, _emission_event_info = generate_surface_emissions(
         surface_name="sample",
         r_hit=p_hit,
         v_in=v_in,

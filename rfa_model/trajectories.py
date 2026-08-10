@@ -50,8 +50,8 @@ def _trajectory_failure(
         "reason": reason,
         "p_final": np.asarray(p, dtype=float),
         "v_final": np.asarray(v, dtype=float),
-        "traj": np.asarray(traj, dtype=float),
-        "vel": np.asarray(vel, dtype=float),
+        "traj": None if traj is None else np.asarray(traj, dtype=float),
+        "vel": None if vel is None else np.asarray(vel, dtype=float),
         "steps": step,
         "hit_info": hit_info,
     }
@@ -453,31 +453,15 @@ def integrate_one_electron(
     sample_z_bounds=None,
     min_sample_return_distance: float = 5e-7,
     sample_geometry: dict | None = None,
+    track_points: bool = False,
+    track_stride: int = 1,
 ):
-    """
-    Integrate one electron trajectory through the RFA.
+    """Integrate one electron trajectory through the RFA.
 
-    Parameters
-    ----------
-    p0, v0:
-        Initial position and velocity.
-    field:
-        RFA field dictionary.
-    Ex_interp, Ey_interp, Ez_interp:
-        Electric-field interpolators.
-    intersector, face_owner, collision_mesh:
-        STL ray-intersection data.
-    grid_transparency:
-        Dict such as {"g1_shell": 0.90, ...}.
-    sample_plane_return:
-        If True, hits of the analytic sample face are terminal.  When
-        ``sample_geometry`` is supplied this is the finite rotated plane;
-        otherwise the legacy x=0 plane is used.
-
-    Returns
-    -------
-    dict:
-        Trajectory result with reason, hit_info, traj, vel, events.
+    Point-by-point storage is disabled by default.  When enabled, the launch
+    point, every ``track_stride`` accepted integration steps, analytic grid
+    crossings, and exact terminal hit locations are retained.  Collision
+    physics never depends on the stored trajectory history.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -489,15 +473,44 @@ def integrate_one_electron(
             "g3_shell": 0.93,
         }
 
+    if track_stride <= 0:
+        raise ValueError("track_stride must be positive")
+
     p = np.asarray(p0, dtype=float).copy()
     v = np.asarray(v0, dtype=float).copy()
-    
-    traj = [p.copy()]
-    vel = [v.copy()]
+
+    if track_points:
+        traj = [p.copy()]
+        vel = [v.copy()]
+    else:
+        traj = None
+        vel = None
+
+    # Keep the previous accepted vacuum point for p_before/fallback logic.
+    # This must not depend on optional trajectory storage.
+    p_previous = None
+
+    def append_track(position, velocity, *, force=False, accepted_step=None):
+        if not track_points:
+            return
+        if not force:
+            if accepted_step is None or (accepted_step % track_stride) != 0:
+                return
+        position = np.asarray(position, dtype=float)
+        velocity = np.asarray(velocity, dtype=float)
+        if len(traj) == 0 or not np.array_equal(traj[-1], position):
+            traj.append(position.copy())
+            vel.append(velocity.copy())
+
+    def packed_track():
+        return (
+            np.asarray(traj, dtype=float) if track_points else None,
+            np.asarray(vel, dtype=float) if track_points else None,
+        )
+
     grid_events = []
-    
     ignore_sphere_owners = set()
-    
+
     if not np.all(np.isfinite(p)) or not np.all(np.isfinite(v)):
         return _trajectory_failure(
             reason="nan_state",
@@ -509,9 +522,6 @@ def integrate_one_electron(
         )
 
     for step in range(max_steps):
-        # Use the same effective collision classification everywhere,
-        # including launch placement. Grid/collector shell voxels impose the
-        # field boundary but are not physical collision geometry.
         cls = classify_effective_vacuum_point(p, field)
 
         if cls["status"] != "free":
@@ -521,11 +531,6 @@ def integrate_one_electron(
                 owner_id = cls.get("owner_id", None)
                 owner = fixed_owner_name(owner_id, field=field)
 
-                # For a rotated analytic sample, do not let the staircase
-                # fixed-voxel boundary replace the physical face or its
-                # normal.  A voxel may protrude into vacuum by O(h), so map
-                # a sample-owned voxel hit back to the continuous sample
-                # plane before returning it to the cascade logic.
                 if (
                     sample_plane_return
                     and owner == "sample"
@@ -568,16 +573,16 @@ def integrate_one_electron(
                         sample_hit["grid_classification"] = dict(cls)
                         sample_hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
                         sample_hit["v_in"] = v.copy()
-                        if len(traj) >= 2:
-                            sample_hit["p_before"] = np.asarray(
-                                traj[-2], dtype=float
-                            ).copy()
+                        if p_previous is not None:
+                            sample_hit["p_before"] = p_previous.copy()
 
+                        append_track(sample_hit["location"], v, force=True)
+                        traj_out, vel_out = packed_track()
                         return {
                             "reason": "hit_sample",
                             "hit_info": sample_hit,
-                            "traj": np.asarray(traj),
-                            "vel": np.asarray(vel),
+                            "traj": traj_out,
+                            "vel": vel_out,
                             "steps": step,
                             "grid_events": grid_events,
                             "events": grid_events,
@@ -588,27 +593,23 @@ def integrate_one_electron(
                 hit_info["location"] = p.copy()
                 hit_info["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
                 hit_info["v_in"] = v.copy()
-                if len(traj) >= 2:
-                    hit_info["p_before"] = np.asarray(
-                        traj[-2], dtype=float
-                    ).copy()
+                if p_previous is not None:
+                    hit_info["p_before"] = p_previous.copy()
 
-                # Grid-shell owners can never reach this point: they were
-                # already neutralized to "free" above, since grid crossing
-                # is now handled exclusively by the analytic segment-sphere
-                # test later in this loop. Any remaining fixed-voxel hit
-                # here is therefore an ordinary absorbing electrode.
+                append_track(p, v, force=True)
+                traj_out, vel_out = packed_track()
                 return {
                     "reason": "hit_fixed",
                     "hit_info": hit_info,
-                    "traj": np.asarray(traj),
-                    "vel": np.asarray(vel),
+                    "traj": traj_out,
+                    "vel": vel_out,
                     "steps": step,
                     "grid_events": grid_events,
                 }
 
             if cls["status"] in {"left_grid", "left_update_region"}:
                 if is_drifttube_escape_candidate(p, v, field):
+                    append_track(p, v, force=True)
                     return drifttube_escape_result(
                         p=p,
                         v=v,
@@ -619,11 +620,13 @@ def integrate_one_electron(
                         extra={"original_grid_status": cls["status"]},
                     )
 
+            append_track(p, v, force=True)
+            traj_out, vel_out = packed_track()
             return {
                 "reason": cls["status"],
                 "hit_info": hit_info,
-                "traj": np.asarray(traj),
-                "vel": np.asarray(vel),
+                "traj": traj_out,
+                "vel": vel_out,
                 "steps": step,
                 "grid_events": grid_events,
             }
@@ -645,21 +648,17 @@ def integrate_one_electron(
                 p, v, dt_step,
                 Ex_interp, Ey_interp, Ez_interp,
             )
-        
         elif integrator == "rk4":
             p_new, v_new = rk4_step(
                 p, v, dt_step,
                 Ex_interp, Ey_interp, Ez_interp,
             )
-        
         else:
             raise ValueError(f"Unknown integrator: {integrator}")
 
         if not np.all(np.isfinite(p_new)) or not np.all(np.isfinite(v_new)):
-            # Field interpolation commonly becomes nonfinite immediately after
-            # a valid electron crosses the +X drift-tube aperture.  Classify
-            # that physical boundary exit before calling it a numerical error.
             if is_drifttube_escape_candidate(p, v, field):
+                append_track(p, v, force=True)
                 return drifttube_escape_result(
                     p=p,
                     v=v,
@@ -675,6 +674,7 @@ def integrate_one_electron(
                     },
                 )
 
+            append_track(p, v, force=True)
             return _trajectory_failure(
                 reason="nan_state_after_step",
                 p=p_new,
@@ -694,9 +694,6 @@ def integrate_one_electron(
                 },
             )
 
-        # Analytic sample-face return.  No global-x sign test is used: the
-        # signed distance to the oriented plane is handled inside the collision
-        # helper, so this works at every sample rotation angle.
         hit_sample = None
         if sample_plane_return:
             hit_sample = segment_hits_sample_plane(
@@ -712,7 +709,6 @@ def integrate_one_electron(
                 if np.linalg.norm(hit_sample["location"] - p0) < min_sample_return_distance:
                     hit_sample = None
 
-        # STL hit only if broad-phase says segment is near an STL box.
         hit_stl = None
         if stl_boxes is None or segment_near_any_stl_box(p, p_new, stl_boxes):
             hit_stl = first_segment_hit(
@@ -723,7 +719,6 @@ def integrate_one_electron(
                 collision_mesh,
             )
 
-        # Analytic grid/collector hit.
         hit_grid = first_analytic_grid_hit(
             p,
             p_new,
@@ -737,34 +732,34 @@ def integrate_one_electron(
             if hit["kind"] == "sample_plane":
                 t_hit = float(np.clip(hit.get("t", 1.0), 0.0, 1.0))
                 v_hit = v + t_hit * (v_new - v)
-                traj.append(hit["location"].copy())
-                vel.append(v_hit.copy())
+                append_track(hit["location"], v_hit, force=True)
                 hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_hit)
                 hit["v_in"] = np.asarray(v_hit, dtype=float).copy()
                 hit["p_before"] = np.asarray(p, dtype=float).copy()
 
+                traj_out, vel_out = packed_track()
                 return {
                     "reason": "hit_sample",
                     "hit_info": hit,
-                    "traj": np.asarray(traj),
-                    "vel": np.asarray(vel),
+                    "traj": traj_out,
+                    "vel": vel_out,
                     "grid_events": grid_events,
                     "events": grid_events,
                     "steps": step + 1,
                 }
 
             if hit["kind"] == "stl":
-                traj.append(hit["location"].copy())
-                vel.append(v_new.copy())
+                append_track(hit["location"], v_new, force=True)
                 hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
                 hit["v_in"] = np.asarray(v_new, dtype=float).copy()
                 hit["p_before"] = np.asarray(p, dtype=float).copy()
 
+                traj_out, vel_out = packed_track()
                 return {
                     "reason": "hit_stl",
                     "hit_info": hit,
-                    "traj": np.asarray(traj),
-                    "vel": np.asarray(vel),
+                    "traj": traj_out,
+                    "vel": vel_out,
                     "grid_events": grid_events,
                     "events": grid_events,
                     "steps": step + 1,
@@ -775,16 +770,16 @@ def integrate_one_electron(
                 owner = hit["owner"]
 
                 if event_type == "hit_collector":
-                    traj.append(hit["location"].copy())
-                    vel.append(v_new.copy())
+                    append_track(hit["location"], v_new, force=True)
                     hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
                     hit["v_in"] = np.asarray(v_new, dtype=float).copy()
 
+                    traj_out, vel_out = packed_track()
                     return {
                         "reason": "hit_collector",
                         "hit_info": hit,
-                        "traj": np.asarray(traj),
-                        "vel": np.asarray(vel),
+                        "traj": traj_out,
+                        "vel": vel_out,
                         "grid_events": grid_events,
                         "events": grid_events,
                         "steps": step + 1,
@@ -792,20 +787,19 @@ def integrate_one_electron(
 
                 if event_type == "transmit_grid":
                     T = transparency_for_owner(grid_transparency, owner, default=1.0)
-
                     u = rng.random()
 
                     if u > T:
-                        traj.append(hit["location"].copy())
-                        vel.append(v_new.copy())
+                        append_track(hit["location"], v_new, force=True)
                         hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
                         hit["v_in"] = np.asarray(v_new, dtype=float).copy()
 
+                        traj_out, vel_out = packed_track()
                         return {
                             "reason": "hit_grid_wire",
                             "hit_info": hit,
-                            "traj": np.asarray(traj),
-                            "vel": np.asarray(vel),
+                            "traj": traj_out,
+                            "vel": vel_out,
                             "grid_events": grid_events,
                             "events": grid_events,
                             "steps": step + 1,
@@ -820,36 +814,36 @@ def integrate_one_electron(
                         "T": T,
                     })
 
-                    # Move only a tiny distance onto the transmitted side
-                    # to avoid detecting the same analytic sphere again.
-                    # No voxel-clearing jump is needed because grid-shell
-                    # voxels do not act as collision geometry.
+                    # Preserve the exact crossing in presentation trajectories,
+                    # regardless of track_stride, then move a tiny distance to
+                    # the transmitted side to avoid redetecting the same shell.
+                    append_track(hit["location"], v_new, force=True)
                     analytic_eps = max(
                         float(surface_eps),
                         1.0e-6 * float(field["h"]),
                     )
+                    p_previous = p.copy()
                     p = hit["location"] + analytic_eps * unit(v_new)
                     v = v_new.copy()
-
-                    traj.append(p.copy())
-                    vel.append(v.copy())
+                    append_track(p, v, force=True)
 
                     ignore_sphere_owners = {owner}
                     continue
 
         ignore_sphere_owners = set()
 
+        p_previous = p.copy()
         p = p_new
         v = v_new
+        append_track(p, v, accepted_step=step + 1)
 
-        traj.append(p.copy())
-        vel.append(v.copy())
-
+    append_track(p, v, force=True)
+    traj_out, vel_out = packed_track()
     return {
         "reason": "max_steps",
         "hit_info": None,
-        "traj": np.asarray(traj),
-        "vel": np.asarray(vel),
+        "traj": traj_out,
+        "vel": vel_out,
         "grid_events": grid_events,
         "events": grid_events,
         "steps": max_steps,

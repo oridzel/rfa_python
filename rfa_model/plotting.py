@@ -23,6 +23,14 @@ def _get_traj(res):
     return traj
 
 
+def _tracked_result_indices(cascade_results_all):
+    """Return list indices for cascade results that actually store a trajectory."""
+    return [
+        i for i, res in enumerate(cascade_results_all)
+        if _get_traj(res) is not None
+    ]
+
+
 def _set_axes_equal_3d(ax):
     """
     Make 3D axes approximately equal scale.
@@ -120,11 +128,19 @@ def plot_trajectories_3d(
     Coordinates are shown in mm.
     """
     if indices is None:
+        tracked_indices = _tracked_result_indices(cascade_results_all)
         if df_cascade is None:
-            indices = list(range(min(n, len(cascade_results_all))))
+            indices = tracked_indices[:n]
         else:
+            # df_cascade is generated in the same order as
+            # cascade_results_all. Restrict selection to rows for which point
+            # tracking was actually enabled, otherwise a random request for N
+            # trajectories may silently select mostly traj=None rows.
+            available = df_cascade.loc[
+                df_cascade.index.intersection(tracked_indices)
+            ]
             indices = select_cascade_indices(
-                df_cascade,
+                available,
                 n=n,
                 seed=seed,
                 terminal_electrode=terminal_electrode,
@@ -207,11 +223,19 @@ def plot_trajectory_projections(
     Plot x-y, x-z, and y-z projections of selected trajectories.
     """
     if indices is None:
+        tracked_indices = _tracked_result_indices(cascade_results_all)
         if df_cascade is None:
-            indices = list(range(min(n, len(cascade_results_all))))
+            indices = tracked_indices[:n]
         else:
+            # df_cascade is generated in the same order as
+            # cascade_results_all. Restrict selection to rows for which point
+            # tracking was actually enabled, otherwise a random request for N
+            # trajectories may silently select mostly traj=None rows.
+            available = df_cascade.loc[
+                df_cascade.index.intersection(tracked_indices)
+            ]
             indices = select_cascade_indices(
-                df_cascade,
+                available,
                 n=n,
                 seed=seed,
                 terminal_electrode=terminal_electrode,
@@ -539,28 +563,6 @@ def plot_current_balance(
     return fig, ax
 
 
-def _set_axes_equal_3d(ax):
-    """
-    Make 3D axes approximately equal scale.
-    """
-    x_limits = ax.get_xlim3d()
-    y_limits = ax.get_ylim3d()
-    z_limits = ax.get_zlim3d()
-
-    x_range = abs(x_limits[1] - x_limits[0])
-    y_range = abs(y_limits[1] - y_limits[0])
-    z_range = abs(z_limits[1] - z_limits[0])
-
-    x_middle = np.mean(x_limits)
-    y_middle = np.mean(y_limits)
-    z_middle = np.mean(z_limits)
-
-    plot_radius = 0.5 * max([x_range, y_range, z_range])
-
-    ax.set_xlim3d([x_middle - plot_radius, x_middle + plot_radius])
-    ax.set_ylim3d([y_middle - plot_radius, y_middle + plot_radius])
-    ax.set_zlim3d([z_middle - plot_radius, z_middle + plot_radius])
-
 
 def plot_meshes_3d(
     meshes: dict,
@@ -869,3 +871,34 @@ def plot_potential_slice(
     ax.set_title(title)
 
     return fig, ax
+
+
+def collect_tracked_trajectories(primary_results, cascade_results_all):
+    tracked = {
+        "primary": [],
+        "cascade": [],
+    }
+
+    for res in primary_results:
+        traj = res.get("traj", None)
+        if traj is not None:
+            tracked["primary"].append({
+                "primary_index": res.get("primary_index", None),
+                "traj": traj,
+                "reason": res.get("reason", None),
+            })
+
+    for res in cascade_results_all:
+        traj = res.get("traj", None)
+        if traj is not None:
+            tracked["cascade"].append({
+                "primary_index": res.get("primary_index", None),
+                "electron_id": res.get("electron_id", None),
+                "parent_id": res.get("parent_id", None),
+                "generation": res.get("generation", None),
+                "terminal_electrode": res.get("terminal_electrode", None),
+                "emission_kind": res.get("emission_kind", None),
+                "traj": traj,
+            })
+
+    return tracked
