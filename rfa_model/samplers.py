@@ -1230,6 +1230,8 @@ def generate_surface_emissions(
     sample_launch_eps: float = 1.0e-6,
     U0: float = 15.0,
     Phi_interp=None,
+    track_sub_barrier_sample_emissions: bool = False,
+    visualization_rng=None,
 ) -> tuple[list[dict], dict]:
     """
     Generate emitted electrons from one surface impact.
@@ -1237,7 +1239,8 @@ def generate_surface_emissions(
     Returns
     -------
     emitted:
-        List of dicts with p0, v0, E_emit_eV, kind, cos_theta.
+        List of dicts with p0, v0, E_emit_eV, kind, cos_theta. Optional
+        sub-barrier sample emissions are tagged for visualization only.
     event_info:
         Per-impact diagnostics. For analytic grid-wire hits this records the
         sampled local-wire incidence cosine and angular gain even when the hit
@@ -1335,6 +1338,9 @@ def generate_surface_emissions(
                 "Phi_emit": Phi_emit,
                 "kind": "quantum_reflection",
                 "cos_theta": cos_theta,
+                "sub_barrier": False,
+                "escape_eligible": True,
+                "visualization_only": False,
             })
 
             return emitted, event_info
@@ -1356,20 +1362,33 @@ def generate_surface_emissions(
             rng=rng,
         )
 
-        # Cutoff check uses raw surface energy (escape condition).
-        if not (surface_name == "sample" and E_bse < Phi_emit):
+        # Optional visualization-only launch of sample electrons below the
+        # positive sample-bias escape threshold. The historical physics model
+        # omitted these because they cannot escape; when enabled we launch them
+        # so the field can visibly turn them back to the sample.
+        sub_barrier_bse = bool(surface_name == "sample" and E_bse < Phi_emit)
+        if (not sub_barrier_bse) or track_sub_barrier_sample_emissions:
             if E_bse > 0:
+                # Preserve the historical physics RNG stream.  The old model
+                # stopped immediately after sampling E_bse for a sub-barrier
+                # electron, so its visualization-only angle/azimuth must come
+                # from an independent RNG.
+                rng_emit = (
+                    visualization_rng
+                    if sub_barrier_bse and visualization_rng is not None
+                    else rng
+                )
                 theta_bs = np.deg2rad(
                     sample_surface_theta(
                         theta_models=theta_models,
                         surface_name=surface_name,
                         kind="BSE",
                         Einc=Einc,
-                        rng=rng,
+                        rng=rng_emit,
                     )
                 )
 
-                phi_bs = 2.0 * np.pi * rng.random()
+                phi_bs = 2.0 * np.pi * rng_emit.random()
 
                 # Apply launch-point potential correction to kinetic energy.
                 # Clamp to a small positive value so speed stays real.
@@ -1408,6 +1427,9 @@ def generate_surface_emissions(
                     "Phi_emit": Phi_emit,
                     "kind": "BSE",
                     "cos_theta": cos_theta,
+                    "sub_barrier": sub_barrier_bse,
+                    "escape_eligible": not sub_barrier_bse,
+                    "visualization_only": sub_barrier_bse,
                 })
 
     for _ in range(Nse):
@@ -1419,24 +1441,33 @@ def generate_surface_emissions(
             rng=rng,
         )
 
-        # Cutoff check uses raw surface energy (escape condition).
-        if surface_name == "sample" and E_se < Phi_emit:
+        # Optional visualization-only launch of sub-barrier sample SEs.
+        sub_barrier_se = bool(surface_name == "sample" and E_se < Phi_emit)
+        if sub_barrier_se and not track_sub_barrier_sample_emissions:
             continue
 
         if E_se <= 0:
             continue
 
+        # As above, visualization-only sub-barrier angles must not consume the
+        # main cascade RNG or enabling this figure mode would perturb the
+        # ordinary simulated currents/yields.
+        rng_emit = (
+            visualization_rng
+            if sub_barrier_se and visualization_rng is not None
+            else rng
+        )
         theta_se = np.deg2rad(
             sample_surface_theta(
                 theta_models=theta_models,
                 surface_name=surface_name,
                 kind="SE",
                 Einc=Einc,
-                rng=rng,
+                rng=rng_emit,
             )
         )
 
-        phi_se = 2.0 * np.pi * rng.random()
+        phi_se = 2.0 * np.pi * rng_emit.random()
 
         # Apply launch-point potential correction to kinetic energy.
         # Clamp to a small positive value so speed stays real.
@@ -1472,8 +1503,16 @@ def generate_surface_emissions(
             "v0": v_se,
             "E_emit_eV": E_se,          # record physical surface energy
             "E_launch_eV": E_se_launch,
+            # Preserve historical ordinary-SE launch behavior.  Phi_emit is
+            # supplied only for visualization-only sub-barrier SEs so their
+            # kinetic energy is adjusted consistently when moved to the safe
+            # launch point.
+            "Phi_emit": (Phi_emit if sub_barrier_se else np.nan),
             "kind": "SE",
             "cos_theta": cos_theta,
+            "sub_barrier": sub_barrier_se,
+            "escape_eligible": not sub_barrier_se,
+            "visualization_only": sub_barrier_se,
         })
 
     return emitted, event_info

@@ -548,6 +548,8 @@ def generate_cascade_emissions_from_hit(
     launch_step_fraction_of_h: float = 0.10,
     Phi_interp=None,
     sample_geometry: dict | None = None,
+    track_sub_barrier_sample_emissions: bool = False,
+    visualization_rng=None,
 ) -> tuple[list[dict], list[dict], dict]:
     """
     Generate cascade emissions and place them safely in free vacuum.
@@ -585,6 +587,8 @@ def generate_cascade_emissions_from_hit(
         sample_launch_eps=1.0e-6,
         U0=15.0,
         Phi_interp=Phi_interp,
+        track_sub_barrier_sample_emissions=track_sub_barrier_sample_emissions,
+        visualization_rng=visualization_rng,
     )
 
     safe_emissions, failed_emissions = make_emissions_safe_to_launch(
@@ -653,6 +657,8 @@ def run_one_primary_with_cascade(
     track_stride: int = 1,
     track_primary_only: bool = False,
     track_this_primary: bool = False,
+    track_sub_barrier_sample_emissions: bool = False,
+    visualization_rng=None,
 ):
     """
     Run one primary electron with full cascade emission.
@@ -708,6 +714,11 @@ def run_one_primary_with_cascade(
 
     queue = deque()
     next_electron_id = 0
+    # The existing max_total_electrons cap and accounting apply only to the
+    # historical physics cascade. Visualization-only sub-barrier electrons do
+    # not consume that budget.
+    physics_results_count = 0
+    physics_generated_count = 0
 
     # First-generation sample emission.
     (
@@ -730,6 +741,8 @@ def run_one_primary_with_cascade(
         launch_step_fraction_of_h=launch_step_fraction_of_h,
         Phi_interp=Phi_interp,
         sample_geometry=sample_geometry,
+        track_sub_barrier_sample_emissions=track_sub_barrier_sample_emissions,
+        visualization_rng=visualization_rng,
     )
 
     for failed in first_launch_failures:
@@ -744,6 +757,9 @@ def run_one_primary_with_cascade(
             "emission_kind": failed.get("kind", None),
             "E_emit_eV": failed.get("E_emit_eV", np.nan),
             "launch_offset_m": failed.get("launch_offset_m", np.nan),
+            "sub_barrier": bool(failed.get("sub_barrier", False)),
+            "escape_eligible": bool(failed.get("escape_eligible", True)),
+            "visualization_only": bool(failed.get("visualization_only", False)),
             "launch_failure_reason": failed.get("launch_failure_reason", None),
             "launch_grid_status": failed.get(
                 "launch_grid_classification", {}
@@ -777,16 +793,21 @@ def run_one_primary_with_cascade(
         }
 
         queue.append(record)
+        if not bool(e.get("visualization_only", False)):
+            physics_generated_count += 1
         next_electron_id += 1
 
     # Main cascade loop.
     while queue:
         item = queue.popleft()
 
-        if len(cascade_results) >= max_total_electrons:
-            break
-
         e = item["emission"]
+        visualization_only = bool(e.get("visualization_only", False))
+
+        # Preserve the old physics-electron cap exactly while still allowing
+        # visualization-only return trajectories to be drawn.
+        if (not visualization_only) and physics_results_count >= max_total_electrons:
+            continue
 
         track_emitted_points = bool(
             track_points
@@ -810,7 +831,7 @@ def run_one_primary_with_cascade(
             max_steps=emitted_max_steps,
             surface_eps=surface_skip_eps,
             grid_transparency=grid_transparency,
-            rng=rng,
+            rng=(visualization_rng if visualization_only and visualization_rng is not None else rng),
             adaptive_dt=True,
             dt_min=1.0e-13,
             dt_max=emitted_dt_max,
@@ -844,8 +865,13 @@ def run_one_primary_with_cascade(
         res["E_launch_eV"] = e.get("E_launch_eV", e.get("E_emit_eV", np.nan))
         res["primary_E_inc_eV"] = E_inc_eV
         res["primary_cos_theta"] = e.get("cos_theta", np.nan)
+        res["sub_barrier"] = bool(e.get("sub_barrier", False))
+        res["escape_eligible"] = bool(e.get("escape_eligible", True))
+        res["visualization_only"] = visualization_only
 
         cascade_results.append(res)
+        if not visualization_only:
+            physics_results_count += 1
 
         cascade_log.append({
             "electron_id": item["electron_id"],
@@ -857,7 +883,16 @@ def run_one_primary_with_cascade(
             "emission_kind": e.get("kind", None),
             "E_emit_eV": e.get("E_emit_eV", np.nan),
             "launch_offset_m": e.get("launch_offset_m", np.nan),
+            "sub_barrier": bool(e.get("sub_barrier", False)),
+            "escape_eligible": bool(e.get("escape_eligible", True)),
+            "visualization_only": visualization_only,
         })
+
+        # Visualization-only sub-barrier electrons exist solely to show the
+        # biased return path. They must not create children or alter the
+        # historical cascade/current calculation when they re-hit the sample.
+        if visualization_only:
+            continue
 
         # Stop cascade if generation limit reached.
         if item["generation"] >= max_generation:
@@ -980,6 +1015,8 @@ def run_one_primary_with_cascade(
             launch_step_fraction_of_h=launch_step_fraction_of_h,
             Phi_interp=Phi_interp,
             sample_geometry=sample_geometry,
+            track_sub_barrier_sample_emissions=track_sub_barrier_sample_emissions,
+            visualization_rng=visualization_rng,
         )
 
         cascade_log.append({
@@ -1029,6 +1066,9 @@ def run_one_primary_with_cascade(
                 "emission_kind": failed.get("kind", None),
                 "E_emit_eV": failed.get("E_emit_eV", np.nan),
                 "launch_offset_m": failed.get("launch_offset_m", np.nan),
+                "sub_barrier": bool(failed.get("sub_barrier", False)),
+                "escape_eligible": bool(failed.get("escape_eligible", True)),
+                "visualization_only": bool(failed.get("visualization_only", False)),
                 "launch_failure_reason": failed.get(
                     "launch_failure_reason", None
                 ),
@@ -1053,8 +1093,9 @@ def run_one_primary_with_cascade(
             })
 
         for child in child_emissions:
-            if next_electron_id >= max_total_electrons:
-                break
+            child_visual_only = bool(child.get("visualization_only", False))
+            if (not child_visual_only) and physics_generated_count >= max_total_electrons:
+                continue
 
             queue.append({
                 "electron_id": next_electron_id,
@@ -1066,6 +1107,8 @@ def run_one_primary_with_cascade(
                 "emission": child,
             })
 
+            if not child_visual_only:
+                physics_generated_count += 1
             next_electron_id += 1
 
     return primary_result, cascade_results, cascade_log
@@ -1129,6 +1172,9 @@ def cascade_results_to_dataframe(
                 "phi_launch_correction_eV", np.nan
             ),
             "E_launch_eV": res.get("E_launch_eV", np.nan),
+            "sub_barrier": bool(res.get("sub_barrier", False)),
+            "escape_eligible": bool(res.get("escape_eligible", True)),
+            "visualization_only": bool(res.get("visualization_only", False)),
 
             "reason": res.get("reason", None),
             "terminal_owner": terminal_owner,
@@ -1209,6 +1255,7 @@ def _run_cascade_chunk(
     track_stride: int = 1,
     track_primary_only: bool = False,
     tracked_primary_indices=None,
+    track_sub_barrier_sample_emissions: bool = False,
 ):
     """
     Worker function for one cascade chunk.
@@ -1221,6 +1268,12 @@ def _run_cascade_chunk(
 
     for i in range(len(p0s_chunk)):
         primary_index = primary_index_offset + i
+
+        # Dedicated visualization RNG. Enabling sub-barrier trajectories must
+        # not perturb the main physics RNG stream.
+        visualization_rng = np.random.default_rng(
+            np.random.SeedSequence([int(seed), int(primary_index), 0x5EED5E])
+        )
 
         track_this_primary = (
             track_points
@@ -1275,6 +1328,8 @@ def _run_cascade_chunk(
             track_stride=track_stride,
             track_primary_only=track_primary_only,
             track_this_primary=track_this_primary,
+            track_sub_barrier_sample_emissions=track_sub_barrier_sample_emissions,
+            visualization_rng=visualization_rng,
         )
 
         primary_res_i["primary_index"] = primary_index
@@ -1479,6 +1534,7 @@ def run_cascade_batch_parallel(
     track_stride: int = 1,
     track_primary_only: bool = False,
     tracked_primary_indices: set[int] | None = None,
+    track_sub_barrier_sample_emissions: bool = False,
 ):
     """
     Parallel cascade batch runner.
@@ -1704,6 +1760,7 @@ def run_cascade_batch_parallel(
             track_stride=track_stride,
             track_primary_only=track_primary_only,
             tracked_primary_indices=tracked_primary_indices,
+            track_sub_barrier_sample_emissions=track_sub_barrier_sample_emissions,
         )
         for ic, (start, stop) in enumerate(chunks)
     )
@@ -1738,6 +1795,8 @@ def run_cascade_batch_parallel(
 
     if not df_log.empty and "event" in df_log.columns:
         launch_failure_mask = df_log["event"].eq("launch_failed")
+        if "visualization_only" in df_log.columns:
+            launch_failure_mask &= ~df_log["visualization_only"].fillna(False).astype(bool)
         N_launch_failed = int(launch_failure_mask.sum())
         launch_failures_by_surface = (
             df_log.loc[launch_failure_mask, "source_electrode"]
@@ -1748,8 +1807,16 @@ def run_cascade_batch_parallel(
         N_launch_failed = 0
         launch_failures_by_surface = {}
 
+    # Visualization-only sub-barrier electrons are deliberately absent from
+    # the historical physics/current accounting. This keeps enabling the
+    # presentation mode from changing TEY/BSEY/current results.
+    cascade_results_physics = [
+        r for r in cascade_results_all
+        if not bool(r.get("visualization_only", False))
+    ]
+
     acct = summarize_cascade_accounting(
-        cascade_results=cascade_results_all,
+        cascade_results=cascade_results_physics,
         N_primary=N_primary,
         owner_name_map=owner_name_map,
         field=field,
@@ -1760,11 +1827,16 @@ def run_cascade_batch_parallel(
         N_primary=N_primary,
     )
 
+    N_visualization_only = int(sum(
+        bool(r.get("visualization_only", False)) for r in cascade_results_all
+    ))
+    acct["summary"]["N_visualization_only"] = N_visualization_only
+
     # Reuse grid-event helper from first-generation accounting.
     # It expects list[list[dict]], so group cascade results by primary.
     cascade_by_primary = [[] for _ in range(N_primary)]
 
-    for res in cascade_results_all:
+    for res in cascade_results_physics:
         pi = res.get("primary_index", None)
         if pi is not None and 0 <= int(pi) < N_primary:
             cascade_by_primary[int(pi)].append(res)
@@ -1794,6 +1866,7 @@ def run_cascade_batch_parallel(
         "runtime_per_primary_s": runtime_s / N_primary,
         "N_launch_failed": N_launch_failed,
         "launch_failures_by_surface": launch_failures_by_surface,
+        "N_visualization_only": N_visualization_only,
 
         "p0s": p0s,
         "v0s": v0s,
@@ -1832,6 +1905,7 @@ def run_cascade_batch_parallel(
         "track_points": track_points,
         "track_stride": track_stride,
         "track_primary_only": track_primary_only,
+        "track_sub_barrier_sample_emissions": bool(track_sub_barrier_sample_emissions),
         "tracked_primary_indices": (
             None if tracked_primary_indices is None
             else sorted(tracked_primary_indices)
@@ -1859,6 +1933,8 @@ def print_cascade_batch_summary(result: dict):
     print(f"\nRuntime:                 {result['runtime_s']:.2f} s")
     print(f"Runtime per primary:     {result['runtime_per_primary_s']:.4f} s")
     print(f"Launch failures:         {result.get('N_launch_failed', 0)}")
+    if result.get("N_visualization_only", 0):
+        print(f"Visualization-only e-:  {result['N_visualization_only']}")
     if result.get("launch_failures_by_surface"):
         print(f"Failures by surface:     {result['launch_failures_by_surface']}")
 
@@ -1866,16 +1942,20 @@ def print_cascade_batch_summary(result: dict):
     print(result["current_counts"])
 
     df_cascade = result["df_cascade"]
+    if not df_cascade.empty and "visualization_only" in df_cascade.columns:
+        df_cascade_physics = df_cascade.loc[~df_cascade["visualization_only"].astype(bool)]
+    else:
+        df_cascade_physics = df_cascade
 
-    if not df_cascade.empty:
-        print("\nTerminal electrodes:")
-        print(df_cascade["terminal_electrode"].value_counts())
+    if not df_cascade_physics.empty:
+        print("\nTerminal electrodes (physics accounting):")
+        print(df_cascade_physics["terminal_electrode"].value_counts())
 
         print("\nSource electrodes:")
-        print(df_cascade["source_electrode"].value_counts())
+        print(df_cascade_physics["source_electrode"].value_counts())
 
         print("\nGenerations:")
-        print(df_cascade["generation"].value_counts().sort_index())
+        print(df_cascade_physics["generation"].value_counts().sort_index())
 
     df_grid_events = result.get("df_grid_events", pd.DataFrame())
 
@@ -1960,7 +2040,7 @@ def save_tracked_trajectories_npz(result: dict, path):
         return payload, valid_records, kept_indices
 
     payload = {
-        "format_version": np.asarray([1], dtype=np.int64),
+        "format_version": np.asarray([2], dtype=np.int64),
         "track_stride": np.asarray([int(result.get("track_stride", 1))], dtype=np.int64),
         "sample_theta_deg": np.asarray([float(result.get("sample_theta_deg", np.nan))]),
         "E0_eV": np.asarray([float(result.get("E0_eV", np.nan))]),
@@ -2027,6 +2107,21 @@ def save_tracked_trajectories_npz(result: dict, path):
         "cascade_emission_kind": np.asarray([
             text(meta_value(r, row, "emission_kind")) for r, row in c_meta_rows
         ]),
+        "cascade_E_emit_eV": np.asarray([
+            float(meta_value(r, row, "E_emit_eV", np.nan)) for r, row in c_meta_rows
+        ], dtype=float),
+        "cascade_E_launch_eV": np.asarray([
+            float(meta_value(r, row, "E_launch_eV", np.nan)) for r, row in c_meta_rows
+        ], dtype=float),
+        "cascade_sub_barrier": np.asarray([
+            bool(meta_value(r, row, "sub_barrier", False)) for r, row in c_meta_rows
+        ], dtype=bool),
+        "cascade_escape_eligible": np.asarray([
+            bool(meta_value(r, row, "escape_eligible", True)) for r, row in c_meta_rows
+        ], dtype=bool),
+        "cascade_visualization_only": np.asarray([
+            bool(meta_value(r, row, "visualization_only", False)) for r, row in c_meta_rows
+        ], dtype=bool),
     })
 
     np.savez_compressed(path, **payload)

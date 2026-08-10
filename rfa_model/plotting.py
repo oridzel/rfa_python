@@ -919,6 +919,35 @@ def load_tracked_trajectories_npz(path):
     c_terminal_owner = np.asarray(data["cascade_terminal_owner"]).astype(str)
     c_terminal_electrode = np.asarray(data["cascade_terminal_electrode"]).astype(str)
     c_kind = np.asarray(data["cascade_emission_kind"]).astype(str)
+    c_E_emit = (
+        np.asarray(data["cascade_E_emit_eV"], dtype=float)
+        if "cascade_E_emit_eV" in data.files
+        else np.full(len(cascade), np.nan, dtype=float)
+    )
+    c_E_launch = (
+        np.asarray(data["cascade_E_launch_eV"], dtype=float)
+        if "cascade_E_launch_eV" in data.files
+        else np.full(len(cascade), np.nan, dtype=float)
+    )
+
+    # Format v2 adds visualization-only sub-barrier metadata.  Keep v1 NPZ
+    # files fully readable by supplying historical defaults when absent.
+    n_cascade = len(cascade)
+    c_sub_barrier = (
+        np.asarray(data["cascade_sub_barrier"], dtype=bool)
+        if "cascade_sub_barrier" in data.files
+        else np.zeros(n_cascade, dtype=bool)
+    )
+    c_escape_eligible = (
+        np.asarray(data["cascade_escape_eligible"], dtype=bool)
+        if "cascade_escape_eligible" in data.files
+        else np.ones(n_cascade, dtype=bool)
+    )
+    c_visualization_only = (
+        np.asarray(data["cascade_visualization_only"], dtype=bool)
+        if "cascade_visualization_only" in data.files
+        else np.zeros(n_cascade, dtype=bool)
+    )
 
     for i, res in enumerate(cascade):
         res.update({
@@ -932,6 +961,11 @@ def load_tracked_trajectories_npz(path):
             "terminal_owner": c_terminal_owner[i] or None,
             "terminal_electrode": c_terminal_electrode[i] or None,
             "emission_kind": c_kind[i] or None,
+            "E_emit_eV": float(c_E_emit[i]),
+            "E_launch_eV": float(c_E_launch[i]),
+            "sub_barrier": bool(c_sub_barrier[i]),
+            "escape_eligible": bool(c_escape_eligible[i]),
+            "visualization_only": bool(c_visualization_only[i]),
         })
 
     df_primary = pd.DataFrame({
@@ -950,6 +984,11 @@ def load_tracked_trajectories_npz(path):
         "terminal_owner": c_terminal_owner,
         "terminal_electrode": c_terminal_electrode,
         "emission_kind": c_kind,
+        "E_emit_eV": c_E_emit,
+        "E_launch_eV": c_E_launch,
+        "sub_barrier": c_sub_barrier,
+        "escape_eligible": c_escape_eligible,
+        "visualization_only": c_visualization_only,
     })
 
     return {
@@ -1194,12 +1233,13 @@ def plot_stl_trajectories_plotly(
     cascade_results_all: list[dict] | None = None,
     primary_indices=None,
     cascade_indices=None,
-    n_primary: int = 60,
-    n_cascade: int = 0,
+    n_primary: int | None = 60,
+    n_cascade: int | None = 0,
     seed: int = 1,
     geometry_opacity: float = 0.22,
     trajectory_width: float = 4.0,
     cascade_width: float = 2.0,
+    color_cascade_by_kind: bool = True,
     show_hits: bool = True,
     show_edges: bool = False,
     part_colors: dict | None = None,
@@ -1224,6 +1264,9 @@ def plot_stl_trajectories_plotly(
         be included in either dictionary and will be rendered too.
     primary_results, cascade_results_all:
         Trajectory records, e.g. from ``load_tracked_trajectories_npz``.
+    n_primary, n_cascade:
+        Maximum number to draw. ``None`` means all tracked trajectories;
+        ``n_cascade=0`` draws no cascade trajectories.
     scale:
         Coordinate scale for display. Default 1e3 converts metres to mm.
     """
@@ -1262,7 +1305,9 @@ def plot_stl_trajectories_plotly(
     if primary_results:
         available = [i for i, res in enumerate(primary_results) if _get_traj(res) is not None]
         if primary_indices is None:
-            if len(available) > int(n_primary):
+            if n_primary is None:
+                chosen_primary = available
+            elif len(available) > int(n_primary):
                 chosen_primary = list(rng.choice(available, size=int(n_primary), replace=False))
             else:
                 chosen_primary = available
@@ -1304,38 +1349,83 @@ def plot_stl_trajectories_plotly(
             first_primary = False
 
     # -------- cascade trajectories --------
-    if cascade_results_all and int(n_cascade) != 0:
-        available = [i for i, res in enumerate(cascade_results_all) if _get_traj(res) is not None]
+    # n_cascade=None means ALL tracked cascade trajectories.  n_cascade=0
+    # preserves the old "do not draw cascade" behavior.
+    if cascade_results_all and n_cascade != 0:
+        available = [
+            i for i, res in enumerate(cascade_results_all)
+            if _get_traj(res) is not None
+        ]
         if cascade_indices is None:
-            if int(n_cascade) > 0 and len(available) > int(n_cascade):
-                chosen_cascade = list(rng.choice(available, size=int(n_cascade), replace=False))
+            if n_cascade is None:
+                chosen_cascade = available
+            elif int(n_cascade) > 0 and len(available) > int(n_cascade):
+                chosen_cascade = list(
+                    rng.choice(available, size=int(n_cascade), replace=False)
+                )
             else:
                 chosen_cascade = available
         else:
             wanted = set(int(i) for i in cascade_indices)
             chosen_cascade = [i for i in available if i in wanted]
 
-        first_cascade = True
+        # Stable presentation colors.  Sub-barrier electrons get their own
+        # high-contrast category because their biased return to the sample is
+        # the mechanism this figure is intended to demonstrate.
+        category_style = {
+            "subbarrier": ("Sub-barrier return", "magenta"),
+            "SE": ("Secondary electrons", "deepskyblue"),
+            "BSE": ("Backscattered electrons", "darkorange"),
+            "quantum_reflection": ("Quantum reflection", "mediumseagreen"),
+            "other": ("Other cascade electrons", "royalblue"),
+        }
+        legend_seen = set()
+
         for idx in chosen_cascade:
             res = cascade_results_all[idx]
             tr = _get_traj(res) * float(scale)
             term = res.get("terminal_electrode", None)
-            label = "Cascade electrons" if first_cascade else f"cascade {idx}"
+            kind = str(res.get("emission_kind", "") or "")
+            subbarrier = bool(res.get("sub_barrier", False))
+
+            if subbarrier:
+                category = "subbarrier"
+            elif kind == "SE":
+                category = "SE"
+            elif kind == "BSE":
+                category = "BSE"
+            elif kind == "quantum_reflection":
+                category = "quantum_reflection"
+            else:
+                category = "other"
+
+            if color_cascade_by_kind:
+                label, color = category_style[category]
+            else:
+                label, color = ("Cascade electrons", "royalblue")
+                category = "cascade"
+
+            show_this_legend = category not in legend_seen
+            legend_seen.add(category)
+
             fig.add_trace(
                 go.Scatter3d(
                     x=tr[:, 0], y=tr[:, 1], z=tr[:, 2],
                     mode="lines",
-                    line=dict(width=float(cascade_width), color="royalblue"),
+                    line=dict(width=float(cascade_width), color=color),
                     name=label,
-                    legendgroup="cascade",
-                    showlegend=first_cascade,
+                    legendgroup=category,
+                    showlegend=show_this_legend,
                     hovertemplate=(
-                        f"cascade {idx}<br>generation={res.get('generation', None)}"
+                        f"cascade {idx}"
+                        f"<br>generation={res.get('generation', None)}"
+                        f"<br>kind={kind or None}"
+                        f"<br>E_emit={res.get('E_emit_eV', None)} eV"
+                        f"<br>sub-barrier={subbarrier}"
                         f"<br>terminal={term}<extra></extra>"
                     ),
                 )
             )
-            first_cascade = False
 
     # Keep true 3-D proportions while giving the whole assembly a useful view.
     if camera is None:
