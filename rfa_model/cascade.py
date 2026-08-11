@@ -47,6 +47,7 @@ from .samplers import (
     canonical_surface_name,
     surface_family,
     angular_yield_gain,
+    sample_angle_dependent_yield_gains,
     ANALYTIC_MESH_SURFACES,
     MAX_ANGULAR_YIELD_GAIN,
 )
@@ -943,6 +944,9 @@ def run_one_primary_with_cascade(
         terminal_cos_theta_raw = -float(np.dot(vhat_term, n_term))
         terminal_surface_canonical = cascade_surface_name(terminal_owner)
 
+        terminal_sey_gain_used = np.nan
+        terminal_bsey_gain_used = np.nan
+
         if terminal_surface_canonical in ANALYTIC_MESH_SURFACES:
             # The shell normal is only the mesh-plane normal. The actual yield
             # calculation samples a local cylindrical-wire normal inside
@@ -952,6 +956,28 @@ def run_one_primary_with_cascade(
             terminal_cos_theta_used = np.nan
             terminal_angular_gain_used = np.nan
             terminal_theta_used_deg = np.nan
+        elif terminal_surface_canonical == "sample":
+            terminal_cos_theta_used = float(
+                np.clip(terminal_cos_theta_raw, 0.0, 1.0)
+            )
+            (
+                terminal_sey_gain_used,
+                terminal_bsey_gain_used,
+                terminal_theta_used_deg,
+                sample_angle_source,
+            ) = sample_angle_dependent_yield_gains(
+                yield_models=yield_models,
+                Einc=E_term,
+                cos_theta=terminal_cos_theta_used,
+            )
+            terminal_angle_model = (
+                "jmonsel_sample_angular_table"
+                if sample_angle_source != "capped_secant"
+                else "capped_secant_from_surface_normal"
+            )
+            # There is intentionally no single gain for the sample because SEY
+            # and BSEY use distinct angular dependencies.
+            terminal_angular_gain_used = np.nan
         else:
             terminal_angle_model = "capped_secant_from_surface_normal"
             terminal_cos_theta_used = max(
@@ -961,6 +987,8 @@ def run_one_primary_with_cascade(
             terminal_angular_gain_used = angular_yield_gain(
                 terminal_cos_theta_raw
             )
+            terminal_sey_gain_used = terminal_angular_gain_used
+            terminal_bsey_gain_used = terminal_angular_gain_used
             terminal_theta_used_deg = float(
                 np.degrees(
                     np.arccos(
@@ -992,6 +1020,8 @@ def run_one_primary_with_cascade(
             "terminal_theta_raw_deg": terminal_theta_raw_deg,
             "terminal_theta_used_deg": terminal_theta_used_deg,
             "terminal_angular_gain_used": terminal_angular_gain_used,
+            "terminal_sey_gain_used": terminal_sey_gain_used,
+            "terminal_bsey_gain_used": terminal_bsey_gain_used,
             "terminal_angle_model": terminal_angle_model,
         })
 
@@ -1034,6 +1064,8 @@ def run_one_primary_with_cascade(
             "terminal_theta_raw_deg": terminal_theta_raw_deg,
             "terminal_theta_used_deg": terminal_theta_used_deg,
             "terminal_angular_gain_used": terminal_angular_gain_used,
+            "terminal_sey_gain_used": terminal_sey_gain_used,
+            "terminal_bsey_gain_used": terminal_bsey_gain_used,
             "terminal_angle_model": terminal_angle_model,
 
             # Actual event-by-event wire geometry sampled inside samplers.py.
@@ -1051,6 +1083,18 @@ def run_one_primary_with_cascade(
             ),
             "wire_bsey_gain_used": emission_event_info.get(
                 "wire_bsey_gain_used", np.nan
+            ),
+            "sample_incidence_theta_deg": emission_event_info.get(
+                "sample_incidence_theta_deg", np.nan
+            ),
+            "sample_sey_gain_used": emission_event_info.get(
+                "sample_sey_gain_used", np.nan
+            ),
+            "sample_bsey_gain_used": emission_event_info.get(
+                "sample_bsey_gain_used", np.nan
+            ),
+            "sample_angular_yield_model": emission_event_info.get(
+                "sample_angular_yield_model", None
             ),
         })
 

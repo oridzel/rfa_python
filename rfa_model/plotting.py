@@ -1191,42 +1191,6 @@ def collect_tracked_trajectories(primary_results, cascade_results_all):
 # Plotly solid-STL + trajectory visualization
 # ============================================================
 
-def _is_returned_to_sample(res: dict) -> bool:
-    """Return True when a tracked cascade electron ultimately lands on the sample."""
-    term = str(res.get("terminal_electrode", "") or "").strip().lower()
-    owner = str(res.get("terminal_owner", "") or "").strip().lower()
-    reason = str(res.get("reason", "") or "").strip().lower()
-
-    if term == "sample" or owner == "sample":
-        return True
-    if reason in {"hit_sample", "returned_to_sample", "sample_return"}:
-        return True
-    return ("sample" in reason) and ("return" in reason)
-
-
-def _cascade_matches_filter(res: dict, cascade_filter: str) -> bool:
-    """Return True when this cascade trajectory should be drawn."""
-    filt = str(cascade_filter).strip().lower()
-    returned = _is_returned_to_sample(res)
-    subbarrier = bool(res.get("sub_barrier", False))
-    visualization_only = bool(res.get("visualization_only", False))
-
-    if filt == "all":
-        return True
-    if filt in {"returned_to_sample", "return_to_sample", "returned"}:
-        return returned
-    if filt in {"not_returned_to_sample", "not_returned", "escaped_or_other"}:
-        return not returned
-    if filt in {"sub_barrier_return", "subbarrier_return", "sub_barrier_returned_to_sample"}:
-        return returned and subbarrier
-    if filt in {"sub_barrier", "subbarrier", "all_sub_barrier", "visualization_only"}:
-        return subbarrier or visualization_only
-    raise ValueError(
-        "cascade_filter must be one of: 'all', 'returned_to_sample', "
-        "'sub_barrier_return', 'sub_barrier', 'not_returned_to_sample'"
-    )
-
-
 def _default_stl_plotly_color(name: str) -> str:
     """Presentation-friendly default colors for aligned RFA STL parts."""
     colors = {
@@ -1339,8 +1303,6 @@ def plot_stl_trajectories_plotly(
     energy_range_eV: tuple[float, float] | None = None,
     energy_floor_eV: float = 1.0e-3,
     show_energy_colorbar: bool = True,
-    show_trajectory_legend: bool = False,
-    cascade_filter: str = "all",
     show_hits: bool = True,
     show_edges: bool = False,
     part_colors: dict | None = None,
@@ -1363,23 +1325,8 @@ def plot_stl_trajectories_plotly(
     logarithmic energy scale is the default because one figure can contain
     sub-eV returning secondaries together with ~keV primary/BSE trajectories.
 
-    The trajectory-category legend is hidden by default because energy-colored
-    trajectories are already explained by the kinetic-energy colorbar. Set
-    ``show_trajectory_legend=True`` only when a categorical legend is useful.
-
     ``n_primary=None`` and ``n_cascade=None`` mean draw every tracked
     trajectory. ``n_cascade=0`` suppresses cascade trajectories.
-
-    ``cascade_filter`` can be used to keep only a subset of cascade
-    trajectories in the figure:
-        - ``'all'``
-        - ``'returned_to_sample'``
-        - ``'sub_barrier_return'``
-        - ``'sub_barrier'``
-        - ``'not_returned_to_sample'``
-    This is especially useful in sample-bias mode when you want to show only
-    the electrons that curve back into the nearby sample/holder/receiver
-    assembly because they are below the sample-bias barrier.
     """
     import plotly.graph_objects as go
 
@@ -1390,9 +1337,6 @@ def plot_stl_trajectories_plotly(
     energy_scale = str(energy_scale).lower()
     if energy_scale not in {"linear", "log"}:
         raise ValueError("energy_scale must be 'linear' or 'log'")
-
-    cascade_filter = str(cascade_filter).strip().lower()
-    _cascade_matches_filter({}, cascade_filter)
 
     fig = go.Figure()
     part_colors = {} if part_colors is None else dict(part_colors)
@@ -1454,7 +1398,6 @@ def plot_stl_trajectories_plotly(
         available = [
             i for i, res in enumerate(cascade_results_all)
             if _get_traj(res) is not None
-            and _cascade_matches_filter(res, cascade_filter)
         ]
         if cascade_indices is None:
             if n_cascade is None:
@@ -1573,7 +1516,7 @@ def plot_stl_trajectories_plotly(
                 customdata=customdata,
                 name="Primary electrons" if first_primary else f"primary {idx}",
                 legendgroup="primaries",
-                showlegend=bool(show_trajectory_legend and first_primary),
+                showlegend=first_primary,
                 hovertemplate=hovertemplate,
             )
         )
@@ -1675,7 +1618,7 @@ def plot_stl_trajectories_plotly(
                 customdata=customdata,
                 name=label,
                 legendgroup=category,
-                showlegend=bool(show_trajectory_legend and show_this_legend),
+                showlegend=show_this_legend,
                 hovertemplate=hovertemplate,
             )
         )
@@ -1696,7 +1639,6 @@ def plot_stl_trajectories_plotly(
         width=int(width),
         height=int(height),
         scene=scene,
-        showlegend=bool(show_trajectory_legend),
         legend=dict(x=0.01, y=0.99),
         margin=dict(l=0, r=0, t=45, b=0),
     )

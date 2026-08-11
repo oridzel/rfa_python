@@ -138,6 +138,18 @@ MEASURED_CARBON_SOURCE = (
     "BSEY mean runs 1-2; SEY=TEY-BSEY"
 )
 
+# Incidence-angle-dependent Cu yields calculated with JMONSEL.
+#
+# IMPORTANT: these data are used only as ANGULAR GAINS, normalized to the
+# 0-degree row at the same incident energy. The existing normal-incidence Cu
+# yield curves therefore remain the absolute normalization of the RFA model.
+# This lets us replace the crude secant law without changing any established
+# normal-incidence results.
+SAMPLE_ANGULAR_YIELD_FILENAME = "yieldsCu100TDDFT10ED.csv"
+SAMPLE_ANGULAR_YIELD_SOURCE = (
+    "Cu TDDFT b=1, l=0, April 2026; Browning elastic below 100 eV"
+)
+
 
 def canonical_surface_name_for_sey(surface_name):
     if surface_name is None:
@@ -395,6 +407,229 @@ def load_theta_sampler_csv(path: str | Path) -> dict:
 
 
 # ============================================================
+# Sample incidence-angle-dependent yield table
+# ============================================================
+
+def load_sample_angular_yield_csv(path: str | Path) -> dict:
+    """
+    Load the JMONSEL Cu yield-vs-energy-and-incidence-angle table.
+
+    Expected format
+    ---------------
+    line 1: description
+    line 2: E_beam (eV), Sample tilt (deg), BSEY, SEY
+    remaining lines: one complete rectangular E x angle grid
+
+    The absolute values are retained for interpolation, but the RFA model uses
+    them only through Y(E, theta) / Y(E, 0). Thus the existing normal-incidence
+    sample yield curves remain the absolute normalization.
+    """
+    path = Path(path)
+    df = pd.read_csv(path, skiprows=1)
+
+    required = ["E_beam (eV)", "Sample tilt (deg)", "BSEY", "SEY"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Sample angular-yield table {path.name!r} is missing columns: {missing}"
+        )
+
+    work = df[required].copy()
+    for c in required:
+        work[c] = pd.to_numeric(work[c], errors="coerce")
+    work = work.dropna()
+
+    Egrid = np.sort(work["E_beam (eV)"].unique().astype(float))
+    Agrid = np.sort(work["Sample tilt (deg)"].unique().astype(float))
+
+    if Egrid.size < 2 or Agrid.size < 2:
+        raise ValueError("Sample angular-yield table needs at least 2 energies and 2 angles")
+    if not np.any(np.isclose(Agrid, 0.0, atol=1.0e-12)):
+        raise ValueError("Sample angular-yield table must contain a 0-degree row")
+    if np.any(Egrid <= 0.0):
+        raise ValueError("Sample angular-yield energies must be positive")
+    if np.any(Agrid < 0.0) or np.any(Agrid >= 90.0):
+        raise ValueError("Sample angular-yield angles must satisfy 0 <= theta < 90 deg")
+
+    matrices = {}
+    for kind in ("BSEY", "SEY"):
+        piv = work.pivot(
+            index="E_beam (eV)",
+            columns="Sample tilt (deg)",
+            values=kind,
+        ).reindex(index=Egrid, columns=Agrid)
+
+        if piv.isna().any().any():
+            raise ValueError(
+                f"Sample angular-yield table is not a complete rectangular grid for {kind}"
+            )
+
+        Y = piv.to_numpy(dtype=float)
+        if np.any(~np.isfinite(Y)) or np.any(Y < 0.0):
+            raise ValueError(f"Sample angular-yield {kind} values must be finite and non-negative")
+        matrices[kind] = Y
+
+    return {
+        "E": Egrid,
+        "theta_deg": Agrid,
+        "BSEY": matrices["BSEY"],
+        "SEY": matrices["SEY"],
+        "source": path.name,
+        "description": SAMPLE_ANGULAR_YIELD_SOURCE,
+        "interpolation": "linear_in_angle_linear_in_log_energy",
+        "normalization": "gain = JMONSEL(E,theta) / JMONSEL(E,0deg)",
+    }
+
+
+def interp_sample_angular_yield(
+    angular_model: dict,
+    Einc: float,
+    theta_deg: float,
+    kind: str,
+) -> float:
+    """
+    Interpolate the absolute JMONSEL angular-yield table.
+
+    Interpolation is deliberately shape-safe and inexpensive because this is
+    called for every sample impact in a cascade:
+      * linear in incidence angle;
+      * linear in log(incident energy).
+
+    Queries are clamped to the tabulated E and angle ranges. In particular,
+    angles above the last row (89 deg in the supplied table) use the 89-degree
+    value rather than extrapolating into the 90-degree singular limit.
+    """
+    kind = str(kind).upper()
+    if kind not in ("SEY", "BSEY"):
+        raise ValueError(f"Unknown sample angular-yield kind: {kind}")
+
+    Egrid = np.asarray(angular_model["E"], dtype=float)
+    Agrid = np.asarray(angular_model["theta_deg"], dtype=float)
+    Y = np.asarray(angular_model[kind], dtype=float)
+
+    E = float(np.clip(float(Einc), Egrid[0], Egrid[-1]))
+    theta = float(np.clip(float(theta_deg), Agrid[0], Agrid[-1]))
+    logE = float(np.log(E))
+    logEgrid = np.log(Egrid)
+
+    # Bracket angle, then interpolate each bracketing angular curve in energy.
+    ihi = int(np.searchsorted(Agrid, theta, side="left"))
+    if ihi <= 0:
+        ilo = ihi = 0
+        wa = 0.0
+    elif ihi >= Agrid.size:
+        ilo = ihi = Agrid.size - 1
+        wa = 0.0
+    elif np.isclose(theta, Agrid[ihi], atol=1.0e-12):
+        ilo = ihi
+        wa = 0.0
+    else:
+        ilo = ihi - 1
+        wa = (theta - Agrid[ilo]) / (Agrid[ihi] - Agrid[ilo])
+
+    ylo = float(np.interp(logE, logEgrid, Y[:, ilo]))
+    if ihi == ilo:
+        return max(0.0, ylo)
+
+    yhi = float(np.interp(logE, logEgrid, Y[:, ihi]))
+    return max(0.0, (1.0 - wa) * ylo + wa * yhi)
+
+
+def sample_angle_dependent_yield_gains(
+    yield_models: dict,
+    Einc: float,
+    cos_theta: float,
+) -> tuple[float, float, float, str]:
+    """
+    Return (SEY_gain, BSEY_gain, theta_deg, model_label) for a Cu sample hit.
+
+    If no angular table is attached to yield_models["sample"], this function
+    falls back to the historical capped secant law for backward compatibility.
+    """
+    c = float(np.clip(float(cos_theta), 0.0, 1.0))
+    theta_deg = float(np.degrees(np.arccos(c)))
+
+    sample_models = yield_models.get("sample", {})
+    angular_model = sample_models.get("angular_yields", None)
+
+    if angular_model is None:
+        g = angular_yield_gain(cos_theta)
+        return float(g), float(g), theta_deg, "capped_secant"
+
+    y0_se = interp_sample_angular_yield(angular_model, Einc, 0.0, "SEY")
+    yth_se = interp_sample_angular_yield(angular_model, Einc, theta_deg, "SEY")
+    y0_bse = interp_sample_angular_yield(angular_model, Einc, 0.0, "BSEY")
+    yth_bse = interp_sample_angular_yield(angular_model, Einc, theta_deg, "BSEY")
+
+    # The supplied BSEY table has exactly zero normal-incidence BSEY at 50 eV.
+    # BSE generation is disabled at Einc <= 50 eV elsewhere in the model, so a
+    # neutral gain is the only well-defined choice at that exact zero.
+    sey_gain = 1.0 if y0_se <= 1.0e-15 else yth_se / y0_se
+    bsey_gain = 1.0 if y0_bse <= 1.0e-15 else yth_bse / y0_bse
+
+    sey_gain = max(0.0, float(sey_gain))
+    bsey_gain = max(0.0, float(bsey_gain))
+
+    return (
+        sey_gain,
+        bsey_gain,
+        theta_deg,
+        str(angular_model.get("source", SAMPLE_ANGULAR_YIELD_FILENAME)),
+    )
+
+
+def describe_sample_angular_yields(
+    yield_models: dict,
+    energies=(200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0),
+    angles_deg=(0.0, 30.0, 45.0, 60.0, 75.0, 80.0, 85.0),
+    verbose: bool = True,
+):
+    """Return/print the SEY and BSEY angular gains actually used on the sample."""
+    rows = []
+    angular_model = yield_models.get("sample", {}).get("angular_yields", None)
+    source = (
+        angular_model.get("source", "<unknown>")
+        if angular_model is not None
+        else "capped_secant (no angular table loaded)"
+    )
+
+    if verbose:
+        print("=" * 78)
+        print("SAMPLE ANGULAR YIELD GAINS")
+        print("=" * 78)
+        print(f"model: {source}")
+        print("normal-incidence absolute Cu yield curves are unchanged")
+        print()
+        print(f"{'E (eV)':>9} {'angle':>7} {'SEY gain':>11} {'BSEY gain':>11}")
+
+    for E in energies:
+        for theta in angles_deg:
+            c = float(np.cos(np.deg2rad(float(theta))))
+            sey_gain, bsey_gain, theta_used, model_label = (
+                sample_angle_dependent_yield_gains(
+                    yield_models=yield_models,
+                    Einc=float(E),
+                    cos_theta=c,
+                )
+            )
+            row = {
+                "E_eV": float(E),
+                "theta_deg": float(theta_used),
+                "SEY_gain": float(sey_gain),
+                "BSEY_gain": float(bsey_gain),
+                "model": model_label,
+            }
+            rows.append(row)
+            if verbose:
+                print(
+                    f"{float(E):9.0f} {float(theta_used):7.1f} "
+                    f"{float(sey_gain):11.4f} {float(bsey_gain):11.4f}"
+                )
+
+    return rows
+
+
+# ============================================================
 # Default model loader
 # ============================================================
 
@@ -403,6 +638,8 @@ def load_default_surface_models(
     bronstein_dir: str | Path | None = None,
     use_measured_carbon_coating: bool = True,
     use_measured_carbon_for_grids: bool = False,
+    use_sample_angle_dependent_yields: bool = True,
+    sample_angular_yield_filename: str = SAMPLE_ANGULAR_YIELD_FILENAME,
 ) -> tuple[dict, dict, dict]:
     """
     Load the same surface models used in the MATLAB setup.
@@ -431,6 +668,14 @@ def load_default_surface_models(
         energy/angle samplers and vacuum-hemisphere emission from their STL
         normals; mesh energy/angle distributions remain JMONSEL FromWire.
         Requires use_measured_carbon_coating=True.
+    use_sample_angle_dependent_yields:
+        If True (default), replace the sample's capped-secant angular yield law
+        with the JMONSEL Cu yield-vs-energy-and-angle table. Only the angular
+        gain Y(E,theta)/Y(E,0) is used, separately for SEY and BSEY, so the
+        existing normal-incidence Cu yield curves remain unchanged.
+    sample_angular_yield_filename:
+        CSV filename, relative to model_dir, containing E_beam, sample tilt,
+        BSEY, and SEY. The default is yieldsCu100TDDFT10ED.csv.
 
     Returns
     -------
@@ -573,11 +818,27 @@ def load_default_surface_models(
         gridframe_bsey = grid_bsey_jmonsel
         gridframe_sey = grid_sey_jmonsel
 
+    sample_yield_models = {
+        "BSEY": load_yield_curve_csv(model_dir / "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
+        "SEY": load_yield_curve_csv(model_dir / "SEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
+    }
+
+    if use_sample_angle_dependent_yields:
+        angular_path = model_dir / sample_angular_yield_filename
+        if not angular_path.exists():
+            raise FileNotFoundError(
+                f"Angle-dependent Cu sample yields are enabled, but {angular_path} "
+                "does not exist. Put yieldsCu100TDDFT10ED.csv in model_dir, or "
+                "call load_default_surface_models(..., "
+                "use_sample_angle_dependent_yields=False) to reproduce the old "
+                "capped-secant sample model."
+            )
+        sample_yield_models["angular_yields"] = load_sample_angular_yield_csv(
+            angular_path
+        )
+
     yield_models = {
-        "sample": {
-            "BSEY": load_yield_curve_csv(model_dir / "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
-            "SEY": load_yield_curve_csv(model_dir / "SEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
-        },
+        "sample": sample_yield_models,
         "holder": {
             "BSEY": load_yield_curve_csv(bronstein_dir / "BSEY_Mo_Bronstein.csv"),
             "SEY": load_yield_curve_csv(bronstein_dir / "SEY_Mo_Bronstein.csv"),
@@ -877,13 +1138,24 @@ def sample_surface_event(
             return angular_yield_gain(cos_theta) if geom == "plane" else 1.0
         return angular_yield_gain(cos_theta)
 
-    sey_val = sey_base * _geometry_gain(sey_mdl)
-    bsey_val = bsey_base * _geometry_gain(bsey_mdl)
+    if surf == "sample":
+        sey_gain, bsey_gain, _theta_deg, _model_label = (
+            sample_angle_dependent_yield_gains(
+                yield_models=yield_models,
+                Einc=Einc,
+                cos_theta=cos_theta,
+            )
+        )
+        sey_val = sey_base * sey_gain
+        bsey_val = bsey_base * bsey_gain
+    else:
+        sey_val = sey_base * _geometry_gain(sey_mdl)
+        bsey_val = bsey_base * _geometry_gain(bsey_mdl)
 
     # No yield multipliers.
     #
     # Every surface runs directly off its curve:
-    #   sample                      JMONSEL Cu
+    #   sample                      JMONSEL Cu normal curve × JMONSEL angular gain
     #   grid mesh / grid frames     measured C-on-SS (event-sampled wire
     #                               incidence on mesh only), or JMONSEL FromWire
     #   collector / rod / drifttube measured C-on-SS
@@ -1252,6 +1524,10 @@ def generate_surface_emissions(
         "sampled_wire_angular_gain": np.nan,
         "wire_sey_gain_used": np.nan,
         "wire_bsey_gain_used": np.nan,
+        "sample_incidence_theta_deg": np.nan,
+        "sample_sey_gain_used": np.nan,
+        "sample_bsey_gain_used": np.nan,
+        "sample_angular_yield_model": None,
     }
 
     surface_name = canonical_surface_name(surface_name)
@@ -1280,7 +1556,26 @@ def generate_surface_emissions(
         # normal oriented toward the incident vacuum half-space.
         n_out = orient_normal_against_incoming(n_out, v_in)
 
-    cos_theta = max(0.05, -float(np.dot(vhat, n_out)))
+    # Preserve the true incidence cosine all the way to grazing incidence.
+    # The historical 0.05 floor was only a numerical guard for 1/cos(theta).
+    # angular_yield_gain() is already capped safely, while the Cu sample now
+    # needs the actual angle to query the JMONSEL angular table.
+    cos_theta = float(np.clip(-float(np.dot(vhat, n_out)), 0.0, 1.0))
+
+    if surf == "sample":
+        sample_sey_gain, sample_bsey_gain, sample_theta_deg, sample_model = (
+            sample_angle_dependent_yield_gains(
+                yield_models=yield_models,
+                Einc=Einc,
+                cos_theta=cos_theta,
+            )
+        )
+        event_info.update({
+            "sample_incidence_theta_deg": float(sample_theta_deg),
+            "sample_sey_gain_used": float(sample_sey_gain),
+            "sample_bsey_gain_used": float(sample_bsey_gain),
+            "sample_angular_yield_model": sample_model,
+        })
 
     if surf in ANALYTIC_MESH_SURFACES:
         # Record the actual local-wire geometry sampled for this impact.
