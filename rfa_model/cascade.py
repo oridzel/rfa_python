@@ -746,6 +746,52 @@ def run_one_primary_with_cascade(
         visualization_rng=visualization_rng,
     )
 
+    # Record the primary sample-emission decision itself, including the Cu
+    # angular-yield and quantum-reflection diagnostics.  This makes grazing-
+    # incidence validation possible even when no emitted electron survives the
+    # safe-launch placement step.
+    cascade_log.append({
+        "event": "first_generation_emissions_sampled",
+        "electron_id": None,
+        "parent_id": -1,
+        "generation": 1,
+        "source_owner": "sample",
+        "source_electrode": "sample",
+        "source_Einc_eV": E_inc_eV,
+        "N_child_emissions": len(first_emissions),
+        "N_launch_failures": len(first_launch_failures),
+        "sample_incidence_theta_deg": first_emission_event_info.get(
+            "sample_incidence_theta_deg", np.nan
+        ),
+        "sample_sey_gain_used": first_emission_event_info.get(
+            "sample_sey_gain_used", np.nan
+        ),
+        "sample_bsey_gain_used": first_emission_event_info.get(
+            "sample_bsey_gain_used", np.nan
+        ),
+        "sample_sey_mean_used": first_emission_event_info.get(
+            "sample_sey_mean_used", np.nan
+        ),
+        "sample_bsey_mean_used": first_emission_event_info.get(
+            "sample_bsey_mean_used", np.nan
+        ),
+        "sample_angular_yield_model": first_emission_event_info.get(
+            "sample_angular_yield_model", None
+        ),
+        "sample_bse_multiplicity_sampled": first_emission_event_info.get(
+            "sample_bse_multiplicity_sampled", np.nan
+        ),
+        "sample_quantum_reflection_mode": first_emission_event_info.get(
+            "sample_quantum_reflection_mode", None
+        ),
+        "sample_quantum_reflection_probability": first_emission_event_info.get(
+            "sample_quantum_reflection_probability", np.nan
+        ),
+        "sample_quantum_reflection_applied": first_emission_event_info.get(
+            "sample_quantum_reflection_applied", False
+        ),
+    })
+
     for failed in first_launch_failures:
         cascade_log.append({
             "event": "launch_failed",
@@ -1093,8 +1139,26 @@ def run_one_primary_with_cascade(
             "sample_bsey_gain_used": emission_event_info.get(
                 "sample_bsey_gain_used", np.nan
             ),
+            "sample_sey_mean_used": emission_event_info.get(
+                "sample_sey_mean_used", np.nan
+            ),
+            "sample_bsey_mean_used": emission_event_info.get(
+                "sample_bsey_mean_used", np.nan
+            ),
             "sample_angular_yield_model": emission_event_info.get(
                 "sample_angular_yield_model", None
+            ),
+            "sample_bse_multiplicity_sampled": emission_event_info.get(
+                "sample_bse_multiplicity_sampled", np.nan
+            ),
+            "sample_quantum_reflection_mode": emission_event_info.get(
+                "sample_quantum_reflection_mode", None
+            ),
+            "sample_quantum_reflection_probability": emission_event_info.get(
+                "sample_quantum_reflection_probability", np.nan
+            ),
+            "sample_quantum_reflection_applied": emission_event_info.get(
+                "sample_quantum_reflection_applied", False
             ),
         })
 

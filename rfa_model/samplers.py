@@ -143,12 +143,24 @@ MEASURED_CARBON_SOURCE = (
 # IMPORTANT: these data are used only as ANGULAR GAINS, normalized to the
 # 0-degree row at the same incident energy. The existing normal-incidence Cu
 # yield curves therefore remain the absolute normalization of the RFA model.
-# This lets us replace the crude secant law without changing any established
-# normal-incidence results.
+# This lets us replace the crude secant law without changing the established
+# normal-incidence yield normalization.  In v8 the default quantum-reflection
+# treatment is also corrected separately; that can make a tiny stochastic
+# difference even at 0 degrees.
 SAMPLE_ANGULAR_YIELD_FILENAME = "yieldsCu100TDDFT10ED.csv"
 SAMPLE_ANGULAR_YIELD_SOURCE = (
     "Cu TDDFT b=1, l=0, April 2026; Browning elastic below 100 eV"
 )
+
+# The historical model also contained a separate surface-barrier quantum-
+# reflection branch for gun electrons hitting Cu.  When a full JMONSEL
+# incidence-angle yield table is active, applying that branch on top of the
+# tabulated BSEY/SEY can double count reflected electrons and, more seriously,
+# the historical early-return branch suppresses all ordinary SE/BSE emission
+# for that impact.  ``auto`` therefore disables the separate branch whenever
+# the JMONSEL angular table is present, while retaining exact legacy behavior
+# when that table is not used.
+SAMPLE_QUANTUM_REFLECTION_MODES = {"auto", "legacy_replace", "disabled"}
 
 
 def canonical_surface_name_for_sey(surface_name):
@@ -578,6 +590,60 @@ def sample_angle_dependent_yield_gains(
     )
 
 
+def resolve_sample_quantum_reflection_mode(yield_models: dict) -> str:
+    """Return the active Cu-sample quantum-reflection treatment.
+
+    Modes
+    -----
+    auto
+        Disable the separate MATLAB-style quantum-reflection branch when the
+        JMONSEL angular-yield table is loaded; otherwise reproduce the legacy
+        replacement branch.
+    legacy_replace
+        Historical behavior: if quantum reflection is selected for a gun
+        electron, emit one specular reflected primary and return immediately,
+        without sampling ordinary SE/BSE emission from that impact.
+    disabled
+        Do not apply a separate quantum-reflection branch.
+    """
+    sample_models = yield_models.get("sample", {})
+    requested = str(sample_models.get("quantum_reflection_mode", "auto")).strip().lower()
+
+    if requested not in SAMPLE_QUANTUM_REFLECTION_MODES:
+        raise ValueError(
+            "sample quantum_reflection_mode must be one of "
+            f"{sorted(SAMPLE_QUANTUM_REFLECTION_MODES)}, got {requested!r}"
+        )
+
+    if requested == "auto":
+        return (
+            "disabled"
+            if sample_models.get("angular_yields", None) is not None
+            else "legacy_replace"
+        )
+
+    return requested
+
+
+def _sample_integer_count_from_mean(mean: float, rng) -> int:
+    """Sample a non-negative integer with the requested mean.
+
+    This is floor-plus-Bernoulli rather than Poisson.  For 0 <= mean < 1 it
+    is exactly the historical Bernoulli sampler (including one RNG draw), so
+    all established sub-unity BSE behavior is preserved.  For mean > 1 it
+    naturally permits multiple BSEs while retaining the requested mean.
+    """
+    mean = max(0.0, float(mean))
+    n_floor = int(np.floor(mean))
+    frac = float(mean - n_floor)
+
+    if n_floor == 0:
+        return int(rng.random() < frac)
+    if frac <= 0.0:
+        return n_floor
+    return n_floor + int(rng.random() < frac)
+
+
 def describe_sample_angular_yields(
     yield_models: dict,
     energies=(200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0),
@@ -599,6 +665,10 @@ def describe_sample_angular_yields(
         print("=" * 78)
         print(f"model: {source}")
         print("normal-incidence absolute Cu yield curves are unchanged")
+        print(
+            "sample quantum reflection: "
+            f"{resolve_sample_quantum_reflection_mode(yield_models)}"
+        )
         print()
         print(f"{'E (eV)':>9} {'angle':>7} {'SEY gain':>11} {'BSEY gain':>11}")
 
@@ -640,6 +710,7 @@ def load_default_surface_models(
     use_measured_carbon_for_grids: bool = False,
     use_sample_angle_dependent_yields: bool = True,
     sample_angular_yield_filename: str = SAMPLE_ANGULAR_YIELD_FILENAME,
+    sample_quantum_reflection_mode: str = "auto",
 ) -> tuple[dict, dict, dict]:
     """
     Load the same surface models used in the MATLAB setup.
@@ -676,6 +747,12 @@ def load_default_surface_models(
     sample_angular_yield_filename:
         CSV filename, relative to model_dir, containing E_beam, sample tilt,
         BSEY, and SEY. The default is yieldsCu100TDDFT10ED.csv.
+    sample_quantum_reflection_mode:
+        ``"auto"`` (default) disables the separate MATLAB-style quantum-
+        reflection replacement branch when the JMONSEL angular-yield table is
+        active, avoiding double counting/suppression of the tabulated yield.
+        ``"legacy_replace"`` reproduces the historical early-return branch;
+        ``"disabled"`` always disables it.
 
     Returns
     -------
@@ -818,9 +895,17 @@ def load_default_surface_models(
         gridframe_bsey = grid_bsey_jmonsel
         gridframe_sey = grid_sey_jmonsel
 
+    requested_qr_mode = str(sample_quantum_reflection_mode).strip().lower()
+    if requested_qr_mode not in SAMPLE_QUANTUM_REFLECTION_MODES:
+        raise ValueError(
+            "sample_quantum_reflection_mode must be one of "
+            f"{sorted(SAMPLE_QUANTUM_REFLECTION_MODES)}, got {sample_quantum_reflection_mode!r}"
+        )
+
     sample_yield_models = {
         "BSEY": load_yield_curve_csv(model_dir / "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
         "SEY": load_yield_curve_csv(model_dir / "SEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
+        "quantum_reflection_mode": requested_qr_mode,
     }
 
     if use_sample_angle_dependent_yields:
@@ -1093,9 +1178,9 @@ def sample_surface_event(
     Einc: float,
     cos_theta: float,
     rng,
-) -> tuple[bool, int]:
+) -> tuple[int, int]:
     """
-    Sample whether a BSE occurs and how many SE electrons are emitted.
+    Sample the number of BSE and SE electrons emitted by one surface impact.
 
     Multipliers
     -----------
@@ -1104,8 +1189,11 @@ def sample_surface_event(
 
     Returns
     -------
-    did_bse:
-        True/False.
+    Nbse:
+        Integer number of BSE electrons.  This remains exactly Bernoulli for
+        sub-unity yields.  When the Cu JMONSEL angular table requests BSEY > 1,
+        floor-plus-Bernoulli sampling permits multiple BSEs with the correct
+        mean instead of silently clipping BSEY to 0.99.
     Nse:
         Poisson-sampled number of secondary electrons.
     """
@@ -1138,6 +1226,11 @@ def sample_surface_event(
             return angular_yield_gain(cos_theta) if geom == "plane" else 1.0
         return angular_yield_gain(cos_theta)
 
+    sample_has_angular_table = bool(
+        surf == "sample"
+        and yield_models.get("sample", {}).get("angular_yields", None) is not None
+    )
+
     if surf == "sample":
         sey_gain, bsey_gain, _theta_deg, _model_label = (
             sample_angle_dependent_yield_gains(
@@ -1154,26 +1247,26 @@ def sample_surface_event(
 
     # No yield multipliers.
     #
-    # Every surface runs directly off its curve:
-    #   sample                      JMONSEL Cu normal curve × JMONSEL angular gain
-    #   grid mesh / grid frames     measured C-on-SS (event-sampled wire
-    #                               incidence on mesh only), or JMONSEL FromWire
-    #   collector / rod / drifttube measured C-on-SS
-    #   holder / receiver           Bronstein Mo / Ti
-    #
-    # Scale factors were removed deliberately. They let a geometry error (for
-    # example the known rod line-of-sight deficit) be absorbed into a yield
-    # parameter, giving a good chi-squared for the wrong reason; and because
-    # they were threaded through five call layers, a surface's effective yield
-    # depended on which call site happened to forward which keyword. What the
-    # curves say is now what the model uses.
+    # Every surface runs directly off its curve.  The Cu sample is special only
+    # in one respect: when its explicit JMONSEL angular table is active, BSEY is
+    # allowed to exceed unity and is represented by an integer multiplicity.
+    # For every legacy path (including sample capped-secant mode and coated
+    # hardware) retain the historical 0.99 BSE cap so existing runs remain
+    # reproducible.
     sey_val = max(0.0, float(sey_val))
-    bsey_val = max(0.0, min(float(bsey_val), 0.99))
+    if sample_has_angular_table:
+        bsey_val = max(0.0, float(bsey_val))
+    else:
+        bsey_val = max(0.0, min(float(bsey_val), 0.99))
 
-    did_bse = False if Einc <= 50.0 else (rng.random() < bsey_val)
-    Nse = rng.poisson(sey_val)
+    if Einc <= 50.0:
+        Nbse = 0
+    else:
+        Nbse = _sample_integer_count_from_mean(bsey_val, rng)
 
-    return did_bse, Nse
+    Nse = int(rng.poisson(sey_val))
+
+    return int(Nbse), Nse
 
 
 # ============================================================
@@ -1527,7 +1620,13 @@ def generate_surface_emissions(
         "sample_incidence_theta_deg": np.nan,
         "sample_sey_gain_used": np.nan,
         "sample_bsey_gain_used": np.nan,
+        "sample_sey_mean_used": np.nan,
+        "sample_bsey_mean_used": np.nan,
         "sample_angular_yield_model": None,
+        "sample_bse_multiplicity_sampled": np.nan,
+        "sample_quantum_reflection_mode": None,
+        "sample_quantum_reflection_probability": np.nan,
+        "sample_quantum_reflection_applied": False,
     }
 
     surface_name = canonical_surface_name(surface_name)
@@ -1570,10 +1669,25 @@ def generate_surface_emissions(
                 cos_theta=cos_theta,
             )
         )
+        sample_sey_mean = max(
+            0.0,
+            interp_yield_model(yield_models["sample"]["SEY"], Einc)
+            * float(sample_sey_gain),
+        )
+        sample_bsey_mean = max(
+            0.0,
+            interp_yield_model(yield_models["sample"]["BSEY"], Einc)
+            * float(sample_bsey_gain),
+        )
+        if yield_models.get("sample", {}).get("angular_yields", None) is None:
+            sample_bsey_mean = min(sample_bsey_mean, 0.99)
+
         event_info.update({
             "sample_incidence_theta_deg": float(sample_theta_deg),
             "sample_sey_gain_used": float(sample_sey_gain),
             "sample_bsey_gain_used": float(sample_bsey_gain),
+            "sample_sey_mean_used": float(sample_sey_mean),
+            "sample_bsey_mean_used": float(sample_bsey_mean),
             "sample_angular_yield_model": sample_model,
         })
 
@@ -1622,7 +1736,15 @@ def generate_surface_emissions(
     else:
         phi_correction = 0.0
 
-    if surface_name == "sample" and origin == "gun":
+    qr_mode = None
+    if surface_name == "sample":
+        qr_mode = resolve_sample_quantum_reflection_mode(yield_models)
+        event_info.update({
+            "sample_quantum_reflection_mode": qr_mode,
+            "sample_quantum_reflection_probability": float(R_quantum),
+        })
+
+    if surface_name == "sample" and origin == "gun" and qr_mode == "legacy_replace":
         if rng.random() < R_quantum:
             v_reflect = v_in - 2.0 * np.dot(v_in, n_out) * n_out
 
@@ -1637,10 +1759,11 @@ def generate_surface_emissions(
                 "escape_eligible": True,
                 "visualization_only": False,
             })
+            event_info["sample_quantum_reflection_applied"] = True
 
             return emitted, event_info
 
-    did_bse, Nse = sample_surface_event(
+    Nbse, Nse = sample_surface_event(
         yield_models=yield_models,
         surface_name=surface_name,
         Einc=Einc,
@@ -1648,7 +1771,10 @@ def generate_surface_emissions(
         rng=rng,
     )
 
-    if did_bse:
+    if surface_name == "sample":
+        event_info["sample_bse_multiplicity_sampled"] = int(Nbse)
+
+    for _ in range(Nbse):
         E_bse = sample_surface_energy(
             energy_models=energy_models,
             surface_name=surface_name,
@@ -1933,14 +2059,14 @@ def describe_surface_yields(
                         -float(np.dot(unit(v_in_audit), n_wire)),
                     )
 
-                did_bse, nse = sample_surface_event(
+                nbse, nse = sample_surface_event(
                     yield_models=yield_models,
                     surface_name=surf,
                     Einc=float(E),
                     cos_theta=c_event,
                     rng=rng,
                 )
-                n_bse += bool(did_bse)
+                n_bse += int(nbse)
                 n_se += int(nse)
 
             sey = n_se / n_samples
