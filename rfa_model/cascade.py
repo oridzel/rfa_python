@@ -130,18 +130,24 @@ def infer_sample_front_face_geometry_from_stl(
     plane_tolerance_m: float = 2.0e-6,
     fallback_center=None,
 ) -> dict:
-    """Build the analytic finite sample face from the actual sample STL.
+    """Build a pivot-anchored analytic sample face using STL dimensions.
 
     The sample solid has finite thickness, so the midpoint of its *rotated
     axis-aligned bounding box* is not the front-face centre at grazing angle.
     Instead, identify sample-owned triangles whose normals are parallel to the
     expected rotated front-face normal and select the outermost plane along
-    that normal.  The local U/V extents are then measured directly from those
-    front-face triangles.
+    that normal.  The local U/V *spans* are measured from those triangles, but
+    their absolute STL coordinates are deliberately not copied into the
+    analytic collision geometry.  The analytic face is anchored at the known
+    rotation pivot/front-face position.
 
-    If STL inference is impossible, fall back to a plane through the known
-    rotation-pivot/front-face position (x_sample, y=0, z=mid-z), never to the
-    rotated Y-AABB midpoint that caused the grazing-angle offset.
+    ``fallback_center`` is retained as the argument name for compatibility,
+    but when supplied it is the authoritative face anchor even when STL
+    inference succeeds.  Otherwise the anchor is
+    ``(x_sample, 0, midpoint(sample_z_bounds))``.
+
+    If STL inference is impossible, use the supplied sample bounds on the same
+    pivot-anchored plane.
     """
     a = np.deg2rad(float(theta_deg))
     n_expected = unit(np.array([np.cos(a), np.sin(a), 0.0], dtype=float))
@@ -156,6 +162,15 @@ def infer_sample_front_face_geometry_from_stl(
         theta_deg=float(theta_deg),
         x_sample=float(x_sample),
     )
+
+    if fallback_center is None:
+        z0 = 0.5 * (float(sample_z_bounds[0]) + float(sample_z_bounds[1]))
+        face_anchor = np.array([float(x_sample), 0.0, z0], dtype=float)
+    else:
+        face_anchor = np.asarray(fallback_center, dtype=float)
+
+    if face_anchor.shape != (3,) or not np.all(np.isfinite(face_anchor)):
+        raise ValueError("sample face anchor must be a finite three-vector")
 
     try:
         owners = np.asarray(face_owner, dtype=object)
@@ -200,12 +215,28 @@ def infer_sample_front_face_geometry_from_stl(
 
         u_min_abs, u_max_abs = float(np.min(u_abs)), float(np.max(u_abs))
         v_min_abs, v_max_abs = float(np.min(v_abs)), float(np.max(v_abs))
-        u_center = 0.5 * (u_min_abs + u_max_abs)
-        v_center = 0.5 * (v_min_abs + v_max_abs)
+        u_center_raw = 0.5 * (u_min_abs + u_max_abs)
+        v_center_raw = 0.5 * (v_min_abs + v_max_abs)
+        stl_center_raw = (
+            d * n_expected
+            + u_center_raw * u_axis
+            + v_center_raw * v_axis
+        )
 
-        center = d * n_expected + u_center * u_axis + v_center * v_axis
-        u_bounds = (u_min_abs - u_center, u_max_abs - u_center)
-        v_bounds = (v_min_abs - v_center, v_max_abs - v_center)
+        # The aligned collision STL may carry an assembly translation.  That
+        # translation must not redefine the analytical sample coordinate
+        # system or move the primary beam.  Preserve only the measured face
+        # dimensions and place them symmetrically about the known pivot.
+        u_span = u_max_abs - u_min_abs
+        v_span = v_max_abs - v_min_abs
+        if not (np.isfinite(u_span) and u_span > 0.0):
+            raise ValueError("sample STL front face has invalid U span")
+        if not (np.isfinite(v_span) and v_span > 0.0):
+            raise ValueError("sample STL front face has invalid V span")
+
+        center = face_anchor.copy()
+        u_bounds = (-0.5 * u_span, 0.5 * u_span)
+        v_bounds = (-0.5 * v_span, 0.5 * v_span)
 
         g = _patch_sample_geometry_extents(
             base,
@@ -216,22 +247,21 @@ def infer_sample_front_face_geometry_from_stl(
             u_bounds=u_bounds,
             v_bounds=v_bounds,
             theta_deg=float(theta_deg),
-            source="sample_stl_front_face",
+            source="sample_stl_extents_pivot_anchored",
         )
         g.update({
             "front_face_triangle_count": int(front_face_ids.size),
             "front_face_ids": front_face_ids,
             "normal_alignment_min": float(normal_alignment_min),
             "front_plane_tolerance_m": float(plane_tolerance_m),
+            "stl_front_face_center_raw": stl_center_raw,
+            "stl_front_plane_offset_raw_m": d,
+            "stl_to_analytic_center_shift_m": center - stl_center_raw,
         })
         return g
 
     except Exception as exc:
-        if fallback_center is None:
-            z0 = 0.5 * (float(sample_z_bounds[0]) + float(sample_z_bounds[1]))
-            center = np.array([float(x_sample), 0.0, z0], dtype=float)
-        else:
-            center = np.asarray(fallback_center, dtype=float)
+        center = face_anchor.copy()
 
         # Preserve generous finite bounds on fallback.  The key correction is
         # that the plane itself passes through the pivot/front-face location,
@@ -1742,16 +1772,39 @@ def run_cascade_batch_parallel(
     if sample_theta_deg is None:
         sample_theta_deg = float(field.get("sample_theta_deg", 0.0))
 
+    sample_x = float(field.get("sample_x", 0.0))
     explicit_face_center = field.get("sample_face_center", None)
+    if explicit_face_center is None:
+        sample_face_anchor = np.array([
+            sample_x,
+            0.0,
+            0.5 * (float(sample_z_bounds[0]) + float(sample_z_bounds[1])),
+        ], dtype=float)
+    else:
+        sample_face_anchor = np.asarray(explicit_face_center, dtype=float)
+
     sample_geometry = infer_sample_front_face_geometry_from_stl(
         collision_mesh=collision_mesh_primary,
         face_owner=face_owner_primary,
         theta_deg=float(sample_theta_deg),
         sample_y_bounds=sample_y_bounds,
         sample_z_bounds=sample_z_bounds,
-        x_sample=float(field.get("sample_x", 0.0)),
-        fallback_center=explicit_face_center,
+        x_sample=sample_x,
+        fallback_center=sample_face_anchor,
     )
+
+    # This is a coordinate-system invariant: STL placement can supply face
+    # dimensions, never move the analytical face away from its configured
+    # pivot.  Fail loudly if a future geometry change violates it.
+    if not np.allclose(
+        np.asarray(sample_geometry["center"], dtype=float),
+        sample_face_anchor,
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
+        raise RuntimeError(
+            "analytic sample face moved away from configured sample_face_center"
+        )
 
     # Beam transverse coordinates must be centred on the *front face*, not on
     # the midpoint of the rotated solid's axis-aligned Y bounds.
@@ -1773,6 +1826,13 @@ def run_cascade_batch_parallel(
                 else f"{float(primary_launch_clearance_h):.2f} h normal-clearance"
             )
         )
+        raw_stl_center = sample_geometry.get("stl_front_face_center_raw", None)
+        if raw_stl_center is not None:
+            print(
+                "[cascade] raw sample-STL face center "
+                f"{np.asarray(raw_stl_center, dtype=float)} was used for "
+                "dimensions only; its assembly translation was ignored"
+            )
 
     p0s, v0s, K0s, Phi0s = make_primary_beam_near_sample(
         N=N_primary,
@@ -1893,6 +1953,53 @@ def run_cascade_batch_parallel(
         sample_geometry=sample_geometry,
     )
 
+    # Guard against a translated sample STL intercepting primaries before the
+    # pivot-anchored analytical plane.  A few edge/bevel hits may legitimately
+    # be off-plane, so use the median absolute residual rather than the maximum.
+    # For a correctly aligned front-face population the median is effectively
+    # zero (up to the integrator/collision tolerance).
+    sample_hit_plane_residual_median_m = np.nan
+    sample_hit_plane_residual_p95_m = np.nan
+    if not df_primary.empty and "reason" in df_primary.columns:
+        sample_hit_mask = df_primary["reason"].eq("hit_sample").to_numpy()
+        if np.any(sample_hit_mask):
+            hit_xyz = df_primary.loc[
+                sample_hit_mask, ["x_hit", "y_hit", "z_hit"]
+            ].to_numpy(dtype=float)
+            finite_hit = np.all(np.isfinite(hit_xyz), axis=1)
+            hit_xyz = hit_xyz[finite_hit]
+            if len(hit_xyz):
+                face_center = np.asarray(sample_geometry["center"], dtype=float)
+                face_normal = unit(np.asarray(sample_geometry["normal"], dtype=float))
+                plane_residual = np.abs((hit_xyz - face_center) @ face_normal)
+                sample_hit_plane_residual_median_m = float(
+                    np.median(plane_residual)
+                )
+                sample_hit_plane_residual_p95_m = float(
+                    np.percentile(plane_residual, 95.0)
+                )
+                residual_tolerance_m = max(
+                    5.0e-6,
+                    0.25 * float(field["h"]),
+                )
+                if sample_hit_plane_residual_median_m > residual_tolerance_m:
+                    raise RuntimeError(
+                        "primary hit_sample population is displaced from the "
+                        "configured analytic sample face: median normal "
+                        f"residual={1e3 * sample_hit_plane_residual_median_m:.6f} "
+                        f"mm, tolerance={1e3 * residual_tolerance_m:.6f} mm. "
+                        "The translated sample STL is probably intercepting "
+                        "the beam and must be excluded from primary collisions "
+                        "or realigned to the sample pivot."
+                    )
+
+    if verbose and np.isfinite(sample_hit_plane_residual_median_m):
+        print(
+            "[cascade] primary sample-plane residual: "
+            f"median={1e6 * sample_hit_plane_residual_median_m:.3f} um, "
+            f"p95={1e6 * sample_hit_plane_residual_p95_m:.3f} um"
+        )
+
     df_cascade = cascade_results_to_dataframe(
         cascade_results_all,
         owner_name_map=owner_name_map,
@@ -1975,6 +2082,10 @@ def run_cascade_batch_parallel(
         "N_launch_failed": N_launch_failed,
         "launch_failures_by_surface": launch_failures_by_surface,
         "N_visualization_only": N_visualization_only,
+        "sample_hit_plane_residual_median_m": (
+            sample_hit_plane_residual_median_m
+        ),
+        "sample_hit_plane_residual_p95_m": sample_hit_plane_residual_p95_m,
 
         "p0s": p0s,
         "v0s": v0s,
