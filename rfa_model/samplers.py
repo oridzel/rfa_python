@@ -152,6 +152,25 @@ SAMPLE_ANGULAR_YIELD_SOURCE = (
     "Cu TDDFT b=1, l=0, April 2026; Browning elastic below 100 eV"
 )
 
+# Optional incidence-specific sample tables.  The filenames deliberately match
+# the normal-incidence tables because JMONSEL writes one self-contained folder
+# per incidence angle.  Keep the tilted files in a separate directory and pass
+# that directory explicitly to load_default_surface_models().
+SAMPLE_GUN_INCIDENCE_FILENAMES = {
+    "BSEY": "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv",
+    "SEY": "SEYFromPlane_SEVaccum_t0nmCuFPA.csv",
+    "BSE_energy": "BSEeEFromPlaneSampler_SEVaccum_t0nmCuFPA.csv",
+    "SE_energy": "SEeEFromPlaneSampler_SEVaccum_t0nmCuFPA.csv",
+    "BSE_theta": "BSEThetaFromPlaneSampler_uncoatedCuFPA.csv",
+    "SE_theta": "SEThetaFromPlaneSampler_uncoatedCuFPA.csv",
+}
+
+# The RFA coordinate convention has +X pointing from the sample toward the
+# drift tube/electron gun.  The tilted JMONSEL theta tables are explicitly
+# referenced to this fixed axis (the untilted-sample normal), not to a primary
+# velocity after it has been slightly deflected by the electrostatic field.
+SAMPLE_BEAM_BACK_AXIS = np.array([1.0, 0.0, 0.0], dtype=float)
+
 # The historical model also contained a separate surface-barrier quantum-
 # reflection branch for gun electrons hitting Cu.  When a full JMONSEL
 # incidence-angle yield table is active, applying that branch on top of the
@@ -418,6 +437,113 @@ def load_theta_sampler_csv(path: str | Path) -> dict:
     }
 
 
+def load_sample_gun_incidence_model(
+    sampler_dir: str | Path,
+    incidence_angle_deg: float,
+    angle_tolerance_deg: float = 0.5,
+) -> dict:
+    """Load one incidence-specific Cu sample model.
+
+    These JMONSEL tables are a matched set: absolute SEY/BSEY, emitted-energy
+    inverse CDFs, and emitted-polar-angle inverse CDFs.  The polar angle is
+    measured from the fixed direction back toward the gun/drift tube (+X), not
+    from the tilted sample normal and not from a field-deflected impact
+    velocity.  Its azimuth is not tabulated and is sampled later from only the
+    portion of the polar cone that lies in the vacuum half-space.
+
+    The returned model is intentionally marked ``gun_only``.  A later cascade
+    electron that re-impacts the sample generally has a different incident
+    direction, so this one-angle model must not be reused for that event.
+    """
+    sampler_dir = Path(sampler_dir)
+    angle = float(incidence_angle_deg)
+    tolerance = float(angle_tolerance_deg)
+
+    if not np.isfinite(angle) or not (0.0 < angle < 90.0):
+        raise ValueError(
+            "sample gun-incidence angle must satisfy 0 < angle < 90 deg"
+        )
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("sample gun-incidence angle tolerance must be >= 0 deg")
+
+    paths = {
+        key: sampler_dir / filename
+        for key, filename in SAMPLE_GUN_INCIDENCE_FILENAMES.items()
+    }
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Incidence-specific Cu sample model is incomplete; missing: "
+            + ", ".join(missing)
+        )
+
+    model = {
+        "incidence_angle_deg": angle,
+        "angle_tolerance_deg": tolerance,
+        "gun_only": True,
+        "polar_axis": "fixed_beam_back_axis",
+        "beam_back_axis": SAMPLE_BEAM_BACK_AXIS.copy(),
+        "azimuth_model": "uniform_over_outward_part_of_polar_cone",
+        "yield": {
+            "BSEY": load_yield_curve_csv(paths["BSEY"]),
+            "SEY": load_yield_curve_csv(paths["SEY"]),
+        },
+        "energy": {
+            "BSE": load_energy_sampler_csv(paths["BSE_energy"]),
+            "SE": load_energy_sampler_csv(paths["SE_energy"]),
+        },
+        "theta": {
+            "BSE": load_theta_sampler_csv(paths["BSE_theta"]),
+            "SE": load_theta_sampler_csv(paths["SE_theta"]),
+        },
+        "source_dir": sampler_dir.name,
+    }
+
+    # All six files must describe the same incident-energy grid.  A mismatch
+    # would otherwise mix yields and distributions from different simulations.
+    grids = {
+        "BSEY": np.asarray(model["yield"]["BSEY"]["E"], dtype=float),
+        "SEY": np.asarray(model["yield"]["SEY"]["E"], dtype=float),
+        "BSE energy": np.asarray(model["energy"]["BSE"]["E"], dtype=float),
+        "SE energy": np.asarray(model["energy"]["SE"]["E"], dtype=float),
+        "BSE theta": np.asarray(model["theta"]["BSE"]["E"], dtype=float),
+        "SE theta": np.asarray(model["theta"]["SE"]["E"], dtype=float),
+    }
+    reference_name, reference_grid = next(iter(grids.items()))
+    for name, grid in grids.items():
+        if grid.shape != reference_grid.shape or not np.allclose(
+            grid, reference_grid, rtol=0.0, atol=1.0e-12
+        ):
+            raise ValueError(
+                f"Incidence-specific sample energy grid in {name} does not "
+                f"match {reference_name}"
+            )
+
+    # For incidence alpha and a polar axis back toward the gun, the outward
+    # vacuum hemisphere terminates at theta = 90 deg + alpha.  The supplied
+    # 75-degree tables therefore end at 165 degrees.  Validate this convention
+    # explicitly so a normal-relative table cannot be misinterpreted silently.
+    expected_theta_max = 90.0 + angle
+    for kind in ("BSE", "SE"):
+        tables = model["theta"][kind]["tables"]
+        theta_min = min(float(np.min(tab["theta"])) for tab in tables)
+        theta_max = max(float(np.max(tab["theta"])) for tab in tables)
+        if theta_min < -1.0e-9 or theta_max > expected_theta_max + 1.0e-6:
+            raise ValueError(
+                f"{kind} tilted-sample polar angles [{theta_min:g}, "
+                f"{theta_max:g}] deg exceed the physical range "
+                f"[0, {expected_theta_max:g}] deg"
+            )
+        if not np.isclose(theta_max, expected_theta_max, rtol=0.0, atol=0.25):
+            raise ValueError(
+                f"{kind} tilted-sample table ends at {theta_max:g} deg; "
+                f"expected {expected_theta_max:g} deg for {angle:g}-degree "
+                "incidence and a beam-relative polar axis"
+            )
+
+    return model
+
+
 # ============================================================
 # Sample incidence-angle-dependent yield table
 # ============================================================
@@ -551,26 +677,45 @@ def sample_angle_dependent_yield_gains(
     yield_models: dict,
     Einc: float,
     cos_theta: float,
+    reference_theta_deg: float = 0.0,
 ) -> tuple[float, float, float, str]:
     """
     Return (SEY_gain, BSEY_gain, theta_deg, model_label) for a Cu sample hit.
 
+    ``reference_theta_deg`` is the incidence angle represented by the absolute
+    SEY/BSEY curves being multiplied.  It is zero for the standard sample
+    curves and 75 degrees for the optional 75-degree absolute-yield curves.
+    This prevents the 75-degree angular enhancement from being counted twice.
+
     If no angular table is attached to yield_models["sample"], this function
-    falls back to the historical capped secant law for backward compatibility.
+    uses the ratio of capped-secant gains at the actual and reference angles.
     """
     c = float(np.clip(float(cos_theta), 0.0, 1.0))
     theta_deg = float(np.degrees(np.arccos(c)))
+    reference_theta_deg = float(reference_theta_deg)
+    if not np.isfinite(reference_theta_deg) or not (
+        0.0 <= reference_theta_deg < 90.0
+    ):
+        raise ValueError("sample yield reference angle must satisfy 0 <= angle < 90 deg")
 
     sample_models = yield_models.get("sample", {})
     angular_model = sample_models.get("angular_yields", None)
 
     if angular_model is None:
-        g = angular_yield_gain(cos_theta)
-        return float(g), float(g), theta_deg, "capped_secant"
+        g_actual = angular_yield_gain(cos_theta)
+        g_reference = angular_yield_gain(
+            float(np.cos(np.deg2rad(reference_theta_deg)))
+        )
+        g = float(g_actual / g_reference)
+        return g, g, theta_deg, "capped_secant_ratio"
 
-    y0_se = interp_sample_angular_yield(angular_model, Einc, 0.0, "SEY")
+    y0_se = interp_sample_angular_yield(
+        angular_model, Einc, reference_theta_deg, "SEY"
+    )
     yth_se = interp_sample_angular_yield(angular_model, Einc, theta_deg, "SEY")
-    y0_bse = interp_sample_angular_yield(angular_model, Einc, 0.0, "BSEY")
+    y0_bse = interp_sample_angular_yield(
+        angular_model, Einc, reference_theta_deg, "BSEY"
+    )
     yth_bse = interp_sample_angular_yield(angular_model, Einc, theta_deg, "BSEY")
 
     # The supplied BSEY table has exactly zero normal-incidence BSEY at 50 eV.
@@ -586,7 +731,10 @@ def sample_angle_dependent_yield_gains(
         sey_gain,
         bsey_gain,
         theta_deg,
-        str(angular_model.get("source", SAMPLE_ANGULAR_YIELD_FILENAME)),
+        (
+            f"{angular_model.get('source', SAMPLE_ANGULAR_YIELD_FILENAME)}"
+            f" normalized_at_{reference_theta_deg:g}deg"
+        ),
     )
 
 
@@ -711,6 +859,9 @@ def load_default_surface_models(
     use_sample_angle_dependent_yields: bool = True,
     sample_angular_yield_filename: str = SAMPLE_ANGULAR_YIELD_FILENAME,
     sample_quantum_reflection_mode: str = "auto",
+    sample_gun_incidence_dir: str | Path | None = None,
+    sample_gun_incidence_angle_deg: float = 75.0,
+    sample_gun_incidence_tolerance_deg: float = 0.5,
 ) -> tuple[dict, dict, dict]:
     """
     Load the same surface models used in the MATLAB setup.
@@ -753,12 +904,39 @@ def load_default_surface_models(
         active, avoiding double counting/suppression of the tabulated yield.
         ``"legacy_replace"`` reproduces the historical early-return branch;
         ``"disabled"`` always disables it.
+    sample_gun_incidence_dir:
+        Optional separate directory containing the six matched Cu yield,
+        emitted-energy, and emitted-angle CSVs for one oblique gun-incidence
+        angle.  These files are used only for first-generation gun impacts on
+        the sample.  Keep this directory separate from ``model_dir`` because
+        the incidence-specific files use the same filenames as the standard
+        normal-incidence files.
+    sample_gun_incidence_angle_deg:
+        Incidence angle represented by ``sample_gun_incidence_dir``.  The
+        current test data use 75 degrees.
+    sample_gun_incidence_tolerance_deg:
+        Allowed difference between the batch sample angle and the sampler
+        angle.  The batch runner validates this before launching primaries.
 
     Returns
     -------
     yield_models, energy_models, theta_models
     """
     model_dir = Path(model_dir)
+
+    if sample_gun_incidence_dir is not None:
+        sample_gun_incidence_dir = Path(sample_gun_incidence_dir)
+        try:
+            same_directory = (
+                sample_gun_incidence_dir.resolve() == model_dir.resolve()
+            )
+        except OSError:
+            same_directory = False
+        if same_directory:
+            raise ValueError(
+                "sample_gun_incidence_dir must be separate from model_dir "
+                "because the tilted and normal tables have identical filenames"
+            )
 
     if bronstein_dir is None:
         bronstein_dir = model_dir
@@ -945,6 +1123,38 @@ def load_default_surface_models(
             "SEY": collector_sey,
         },
     }
+
+    if sample_gun_incidence_dir is not None:
+        incidence_model = load_sample_gun_incidence_model(
+            sampler_dir=sample_gun_incidence_dir,
+            incidence_angle_deg=sample_gun_incidence_angle_deg,
+            angle_tolerance_deg=sample_gun_incidence_tolerance_deg,
+        )
+
+        common = {
+            "incidence_angle_deg": incidence_model["incidence_angle_deg"],
+            "angle_tolerance_deg": incidence_model["angle_tolerance_deg"],
+            "gun_only": True,
+            "source_dir": incidence_model["source_dir"],
+        }
+        yield_models["sample"]["gun_incidence"] = {
+            **common,
+            "BSEY": incidence_model["yield"]["BSEY"],
+            "SEY": incidence_model["yield"]["SEY"],
+        }
+        energy_models["sample"]["gun_incidence"] = {
+            **common,
+            "BSE": incidence_model["energy"]["BSE"],
+            "SE": incidence_model["energy"]["SE"],
+        }
+        theta_models["sample"]["gun_incidence"] = {
+            **common,
+            "polar_axis": incidence_model["polar_axis"],
+            "beam_back_axis": incidence_model["beam_back_axis"],
+            "azimuth_model": incidence_model["azimuth_model"],
+            "BSE": incidence_model["theta"]["BSE"],
+            "SE": incidence_model["theta"]["SE"],
+        }
 
     return yield_models, energy_models, theta_models
 
@@ -1178,6 +1388,8 @@ def sample_surface_event(
     Einc: float,
     cos_theta: float,
     rng,
+    sample_yield_override: dict | None = None,
+    sample_yield_reference_angle_deg: float = 0.0,
 ) -> tuple[int, int]:
     """
     Sample the number of BSE and SE electrons emitted by one surface impact.
@@ -1200,8 +1412,12 @@ def sample_surface_event(
     surf = canonical_surface_name(surface_name)
     model_key = _surface_model_key(yield_models, surface_name)
 
-    sey_mdl = yield_models[model_key]["SEY"]
-    bsey_mdl = yield_models[model_key]["BSEY"]
+    if surf == "sample" and sample_yield_override is not None:
+        sey_mdl = sample_yield_override["SEY"]
+        bsey_mdl = sample_yield_override["BSEY"]
+    else:
+        sey_mdl = yield_models[model_key]["SEY"]
+        bsey_mdl = yield_models[model_key]["BSEY"]
 
     sey_base = interp_yield_model(sey_mdl, Einc)
     bsey_base = interp_yield_model(bsey_mdl, Einc)
@@ -1237,6 +1453,7 @@ def sample_surface_event(
                 yield_models=yield_models,
                 Einc=Einc,
                 cos_theta=cos_theta,
+                reference_theta_deg=sample_yield_reference_angle_deg,
             )
         )
         sey_val = sey_base * sey_gain
@@ -1399,11 +1616,16 @@ def sample_surface_energy(
     kind: str,
     Einc: float,
     rng,
+    model_override: dict | None = None,
 ) -> float:
     model_key = _surface_model_key(energy_models, surface_name)
     kind = kind.upper()
 
-    mdl = energy_models[model_key][kind]
+    mdl = (
+        model_override[kind]
+        if model_override is not None
+        else energy_models[model_key][kind]
+    )
 
     Einc = max(float(Einc), 0.01)
 
@@ -1432,6 +1654,7 @@ def sample_surface_theta(
     kind: str,
     Einc: float,
     rng,
+    model_override: dict | None = None,
 ) -> float:
     """
     Sample emitted polar angle in degrees.
@@ -1442,7 +1665,11 @@ def sample_surface_theta(
     model_key = _surface_model_key(theta_models, surface_name)
     kind = kind.upper()
 
-    mdl = theta_models[model_key][kind]
+    mdl = (
+        model_override[kind]
+        if model_override is not None
+        else theta_models[model_key][kind]
+    )
 
     if isinstance(mdl, str) and mdl.lower() == "cosine":
         theta_rad = np.arcsin(np.sqrt(rng.random()))
@@ -1515,6 +1742,103 @@ def launch_electron_about_axis(
         phi_rad=phi_rad,
         speed=speed,
     )
+
+
+def launch_sample_electron_beam_relative(
+    theta_rad: float,
+    Eout_eV: float,
+    beam_back_axis,
+    n_out,
+    rng,
+) -> tuple[np.ndarray, float, float]:
+    """Launch a tilted-sample electron without changing its sampled polar angle.
+
+    ``theta_rad`` is measured from the fixed axis back toward the gun/drift
+    tube.  For the 75-degree tables it may span 0--165 degrees.  At fixed polar angle, sample
+    azimuth uniformly only over the portion of that cone satisfying
+
+        dot(direction, n_out) > 0,
+
+    where ``n_out`` is the vacuum-side sample normal.  This is conditional
+    azimuth sampling: theta is never rejected, reflected, or clamped, so the
+    inverse-CDF polar distribution supplied by JMONSEL is preserved exactly.
+
+    Returns
+    -------
+    velocity, phi_rad, outward_cosine
+        ``phi_rad=0`` lies in the beam/sample-normal plane toward ``n_out``.
+    """
+    axis = unit(beam_back_axis)
+    n_out = unit(n_out)
+    theta = float(theta_rad)
+
+    if not np.isfinite(theta) or theta < 0.0 or theta > np.pi:
+        raise ValueError("beam-relative emission theta must lie in [0, pi]")
+
+    # Orienting n_out against v_in should already guarantee c >= 0.  Retain a
+    # tiny numerical tolerance but fail on a genuinely inconsistent geometry.
+    c_alpha = float(np.dot(axis, n_out))
+    if c_alpha < -1.0e-12:
+        raise ValueError(
+            "beam-back axis and sample outward normal point to opposite hemispheres"
+        )
+    c_alpha = float(np.clip(c_alpha, 0.0, 1.0))
+    s_alpha = float(np.sqrt(max(0.0, 1.0 - c_alpha * c_alpha)))
+
+    # e1 is the beam-transverse direction toward the outward normal.  e2
+    # completes a right-handed basis around the beam-back polar axis.
+    if s_alpha > 1.0e-14:
+        e1 = unit(n_out - c_alpha * axis)
+    else:
+        tmp = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(tmp, axis))) > 0.9:
+            tmp = np.array([0.0, 1.0, 0.0])
+        e1 = unit(np.cross(axis, tmp))
+    e2 = unit(np.cross(axis, e1))
+
+    c_theta = float(np.cos(theta))
+    s_theta = float(np.sin(theta))
+    A = c_theta * c_alpha
+    B = s_theta * s_alpha
+
+    # A + B*cos(phi) > 0.  Draw from the open interval so an RNG value exactly
+    # equal to zero cannot select a tangent boundary direction.
+    u = float(np.clip(
+        rng.random(),
+        np.nextafter(0.0, 1.0),
+        np.nextafter(1.0, 0.0),
+    ))
+
+    if B <= 1.0e-15:
+        if A <= 0.0:
+            raise ValueError(
+                "sampled polar angle has no outward azimuth for this sample incidence"
+            )
+        phi = -np.pi + 2.0 * np.pi * u
+    else:
+        q = -A / B
+        if q <= -1.0:
+            phi = -np.pi + 2.0 * np.pi * u
+        elif q >= 1.0:
+            raise ValueError(
+                "sampled polar angle exceeds the outward vacuum-cone limit"
+            )
+        else:
+            phi_max = float(np.arccos(np.clip(q, -1.0, 1.0)))
+            phi = -phi_max + 2.0 * phi_max * u
+
+    direction = unit(
+        c_theta * axis
+        + s_theta * (np.cos(phi) * e1 + np.sin(phi) * e2)
+    )
+    outward_cosine = float(np.dot(direction, n_out))
+    if not outward_cosine > 0.0:
+        raise RuntimeError(
+            "outward-azimuth sampler produced a non-outward sample direction"
+        )
+
+    speed = speed_from_energy_eV(Eout_eV)
+    return speed * direction, float(phi), outward_cosine
 
 
 def launch_surface_electron(
@@ -1627,6 +1951,10 @@ def generate_surface_emissions(
         "sample_quantum_reflection_mode": None,
         "sample_quantum_reflection_probability": np.nan,
         "sample_quantum_reflection_applied": False,
+        "sample_gun_incidence_sampler_used": False,
+        "sample_gun_incidence_sampler_angle_deg": np.nan,
+        "sample_gun_incidence_sampler_source": None,
+        "sample_emission_polar_axis": None,
     }
 
     surface_name = canonical_surface_name(surface_name)
@@ -1661,22 +1989,78 @@ def generate_surface_emissions(
     # needs the actual angle to query the JMONSEL angular table.
     cos_theta = float(np.clip(-float(np.dot(vhat, n_out)), 0.0, 1.0))
 
+    sample_yield_override = None
+    sample_energy_override = None
+    sample_theta_override = None
+    sample_yield_reference_angle_deg = 0.0
+    use_sample_gun_incidence = False
+
+    if surf == "sample" and str(origin).lower() == "gun":
+        incidence_configs = {
+            "yield": yield_models.get("sample", {}).get("gun_incidence", None),
+            "energy": energy_models.get("sample", {}).get("gun_incidence", None),
+            "theta": theta_models.get("sample", {}).get("gun_incidence", None),
+        }
+        configured = [cfg is not None for cfg in incidence_configs.values()]
+        if any(configured) and not all(configured):
+            raise ValueError(
+                "sample gun-incidence model must be present in yield, energy, "
+                "and theta model dictionaries"
+            )
+        if all(configured):
+            angles = np.asarray([
+                float(cfg["incidence_angle_deg"])
+                for cfg in incidence_configs.values()
+            ])
+            tolerances = np.asarray([
+                float(cfg["angle_tolerance_deg"])
+                for cfg in incidence_configs.values()
+            ])
+            if not np.allclose(angles, angles[0], rtol=0.0, atol=1.0e-12):
+                raise ValueError("sample gun-incidence model angles are inconsistent")
+            if not np.allclose(
+                tolerances, tolerances[0], rtol=0.0, atol=1.0e-12
+            ):
+                raise ValueError(
+                    "sample gun-incidence model angle tolerances are inconsistent"
+                )
+
+            use_sample_gun_incidence = True
+            sample_yield_override = incidence_configs["yield"]
+            sample_energy_override = incidence_configs["energy"]
+            sample_theta_override = incidence_configs["theta"]
+            sample_yield_reference_angle_deg = float(angles[0])
+            event_info.update({
+                "sample_gun_incidence_sampler_used": True,
+                "sample_gun_incidence_sampler_angle_deg": float(angles[0]),
+                "sample_gun_incidence_sampler_source": str(
+                    sample_theta_override.get("source_dir", "<unknown>")
+                ),
+                "sample_emission_polar_axis": "fixed_beam_back_axis",
+            })
+
     if surf == "sample":
         sample_sey_gain, sample_bsey_gain, sample_theta_deg, sample_model = (
             sample_angle_dependent_yield_gains(
                 yield_models=yield_models,
                 Einc=Einc,
                 cos_theta=cos_theta,
+                reference_theta_deg=sample_yield_reference_angle_deg,
             )
+        )
+        sample_absolute_yields = (
+            sample_yield_override
+            if sample_yield_override is not None
+            else yield_models["sample"]
         )
         sample_sey_mean = max(
             0.0,
-            interp_yield_model(yield_models["sample"]["SEY"], Einc)
+            interp_yield_model(sample_absolute_yields["SEY"], Einc)
             * float(sample_sey_gain),
         )
         sample_bsey_mean = max(
             0.0,
-            interp_yield_model(yield_models["sample"]["BSEY"], Einc)
+            interp_yield_model(sample_absolute_yields["BSEY"], Einc)
             * float(sample_bsey_gain),
         )
         if yield_models.get("sample", {}).get("angular_yields", None) is None:
@@ -1769,6 +2153,8 @@ def generate_surface_emissions(
         Einc=Einc,
         cos_theta=cos_theta,
         rng=rng,
+        sample_yield_override=sample_yield_override,
+        sample_yield_reference_angle_deg=sample_yield_reference_angle_deg,
     )
 
     if surface_name == "sample":
@@ -1781,6 +2167,7 @@ def generate_surface_emissions(
             kind="BSE",
             Einc=Einc,
             rng=rng,
+            model_override=sample_energy_override,
         )
 
         # Optional visualization-only launch of sample electrons below the
@@ -1806,16 +2193,29 @@ def generate_surface_emissions(
                         kind="BSE",
                         Einc=Einc,
                         rng=rng_emit,
+                        model_override=sample_theta_override,
                     )
                 )
-
-                phi_bs = 2.0 * np.pi * rng_emit.random()
 
                 # Apply launch-point potential correction to kinetic energy.
                 # Clamp to a small positive value so speed stays real.
                 E_bse_launch = max(E_bse + phi_correction, 1.0e-3)
 
-                if surf in ANALYTIC_MESH_SURFACES:
+                if use_sample_gun_incidence:
+                    v_bse, phi_bs, emission_outward_cosine = (
+                        launch_sample_electron_beam_relative(
+                            theta_rad=theta_bs,
+                            Eout_eV=E_bse_launch,
+                            beam_back_axis=sample_theta_override["beam_back_axis"],
+                            n_out=n_out,
+                            rng=rng_emit,
+                        )
+                    )
+                    emission_polar_axis = "fixed_beam_back_axis"
+                    p0_bse = p0_surface
+
+                elif surf in ANALYTIC_MESH_SURFACES:
+                    phi_bs = 2.0 * np.pi * rng_emit.random()
                     axis_backscatter = -unit(v_in)
 
                     v_bse = launch_electron_about_axis(
@@ -1826,8 +2226,13 @@ def generate_surface_emissions(
                     )
 
                     p0_bse = r_hit + sample_launch_eps * unit(v_bse)
+                    emission_polar_axis = "opposite_incoming_direction"
+                    emission_outward_cosine = float(
+                        np.dot(unit(v_bse), n_out)
+                    )
 
                 else:
+                    phi_bs = 2.0 * np.pi * rng_emit.random()
                     use_full = is_fullsphere_surface(surface_name)
 
                     v_bse = launch_surface_electron(
@@ -1839,6 +2244,10 @@ def generate_surface_emissions(
                     )
 
                     p0_bse = p0_surface
+                    emission_polar_axis = "surface_normal"
+                    emission_outward_cosine = float(
+                        np.dot(unit(v_bse), n_out)
+                    )
 
                 emitted.append({
                     "p0": p0_bse,
@@ -1848,6 +2257,13 @@ def generate_surface_emissions(
                     "Phi_emit": Phi_emit,
                     "kind": "BSE",
                     "cos_theta": cos_theta,
+                    "emission_theta_deg": float(np.rad2deg(theta_bs)),
+                    "emission_phi_deg": float(np.rad2deg(phi_bs)),
+                    "emission_polar_axis": emission_polar_axis,
+                    "emission_outward_cosine": emission_outward_cosine,
+                    "sample_gun_incidence_sampler_used": bool(
+                        use_sample_gun_incidence
+                    ),
                     "sub_barrier": sub_barrier_bse,
                     "escape_eligible": not sub_barrier_bse,
                     "visualization_only": sub_barrier_bse,
@@ -1860,6 +2276,7 @@ def generate_surface_emissions(
             kind="SE",
             Einc=Einc,
             rng=rng,
+            model_override=sample_energy_override,
         )
 
         # Optional visualization-only launch of sub-barrier sample SEs.
@@ -1885,16 +2302,29 @@ def generate_surface_emissions(
                 kind="SE",
                 Einc=Einc,
                 rng=rng_emit,
+                model_override=sample_theta_override,
             )
         )
-
-        phi_se = 2.0 * np.pi * rng_emit.random()
 
         # Apply launch-point potential correction to kinetic energy.
         # Clamp to a small positive value so speed stays real.
         E_se_launch = max(E_se + phi_correction, 1.0e-3)
 
-        if surf in ANALYTIC_MESH_SURFACES:
+        if use_sample_gun_incidence:
+            v_se, phi_se, emission_outward_cosine = (
+                launch_sample_electron_beam_relative(
+                    theta_rad=theta_se,
+                    Eout_eV=E_se_launch,
+                    beam_back_axis=sample_theta_override["beam_back_axis"],
+                    n_out=n_out,
+                    rng=rng_emit,
+                )
+            )
+            emission_polar_axis = "fixed_beam_back_axis"
+            p0_se = p0_surface
+
+        elif surf in ANALYTIC_MESH_SURFACES:
+            phi_se = 2.0 * np.pi * rng_emit.random()
             axis_backscatter = -unit(v_in)
 
             v_se = launch_electron_about_axis(
@@ -1905,8 +2335,11 @@ def generate_surface_emissions(
             )
 
             p0_se = r_hit + sample_launch_eps * unit(v_se)
+            emission_polar_axis = "opposite_incoming_direction"
+            emission_outward_cosine = float(np.dot(unit(v_se), n_out))
 
         else:
+            phi_se = 2.0 * np.pi * rng_emit.random()
             use_full = is_fullsphere_surface(surface_name)
 
             v_se = launch_surface_electron(
@@ -1918,6 +2351,8 @@ def generate_surface_emissions(
             )
 
             p0_se = p0_surface
+            emission_polar_axis = "surface_normal"
+            emission_outward_cosine = float(np.dot(unit(v_se), n_out))
 
         emitted.append({
             "p0": p0_se,
@@ -1931,6 +2366,13 @@ def generate_surface_emissions(
             "Phi_emit": (Phi_emit if sub_barrier_se else np.nan),
             "kind": "SE",
             "cos_theta": cos_theta,
+            "emission_theta_deg": float(np.rad2deg(theta_se)),
+            "emission_phi_deg": float(np.rad2deg(phi_se)),
+            "emission_polar_axis": emission_polar_axis,
+            "emission_outward_cosine": emission_outward_cosine,
+            "sample_gun_incidence_sampler_used": bool(
+                use_sample_gun_incidence
+            ),
             "sub_barrier": sub_barrier_se,
             "escape_eligible": not sub_barrier_se,
             "visualization_only": sub_barrier_se,

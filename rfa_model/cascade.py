@@ -820,6 +820,18 @@ def run_one_primary_with_cascade(
         "sample_quantum_reflection_applied": first_emission_event_info.get(
             "sample_quantum_reflection_applied", False
         ),
+        "sample_gun_incidence_sampler_used": first_emission_event_info.get(
+            "sample_gun_incidence_sampler_used", False
+        ),
+        "sample_gun_incidence_sampler_angle_deg": first_emission_event_info.get(
+            "sample_gun_incidence_sampler_angle_deg", np.nan
+        ),
+        "sample_gun_incidence_sampler_source": first_emission_event_info.get(
+            "sample_gun_incidence_sampler_source", None
+        ),
+        "sample_emission_polar_axis": first_emission_event_info.get(
+            "sample_emission_polar_axis", None
+        ),
     })
 
     for failed in first_launch_failures:
@@ -942,6 +954,15 @@ def run_one_primary_with_cascade(
         res["E_launch_eV"] = e.get("E_launch_eV", e.get("E_emit_eV", np.nan))
         res["primary_E_inc_eV"] = E_inc_eV
         res["primary_cos_theta"] = e.get("cos_theta", np.nan)
+        res["emission_theta_deg"] = e.get("emission_theta_deg", np.nan)
+        res["emission_phi_deg"] = e.get("emission_phi_deg", np.nan)
+        res["emission_polar_axis"] = e.get("emission_polar_axis", None)
+        res["emission_outward_cosine"] = e.get(
+            "emission_outward_cosine", np.nan
+        )
+        res["sample_gun_incidence_sampler_used"] = bool(
+            e.get("sample_gun_incidence_sampler_used", False)
+        )
         res["sub_barrier"] = bool(e.get("sub_barrier", False))
         res["escape_eligible"] = bool(e.get("escape_eligible", True))
         res["visualization_only"] = visualization_only
@@ -960,6 +981,15 @@ def run_one_primary_with_cascade(
             "emission_kind": e.get("kind", None),
             "E_emit_eV": e.get("E_emit_eV", np.nan),
             "launch_offset_m": e.get("launch_offset_m", np.nan),
+            "emission_theta_deg": e.get("emission_theta_deg", np.nan),
+            "emission_phi_deg": e.get("emission_phi_deg", np.nan),
+            "emission_polar_axis": e.get("emission_polar_axis", None),
+            "emission_outward_cosine": e.get(
+                "emission_outward_cosine", np.nan
+            ),
+            "sample_gun_incidence_sampler_used": bool(
+                e.get("sample_gun_incidence_sampler_used", False)
+            ),
             "sub_barrier": bool(e.get("sub_barrier", False)),
             "escape_eligible": bool(e.get("escape_eligible", True)),
             "visualization_only": visualization_only,
@@ -1190,6 +1220,18 @@ def run_one_primary_with_cascade(
             "sample_quantum_reflection_applied": emission_event_info.get(
                 "sample_quantum_reflection_applied", False
             ),
+            "sample_gun_incidence_sampler_used": emission_event_info.get(
+                "sample_gun_incidence_sampler_used", False
+            ),
+            "sample_gun_incidence_sampler_angle_deg": emission_event_info.get(
+                "sample_gun_incidence_sampler_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_source": emission_event_info.get(
+                "sample_gun_incidence_sampler_source", None
+            ),
+            "sample_emission_polar_axis": emission_event_info.get(
+                "sample_emission_polar_axis", None
+            ),
         })
 
         for failed in child_launch_failures:
@@ -1310,6 +1352,15 @@ def cascade_results_to_dataframe(
                 "phi_launch_correction_eV", np.nan
             ),
             "E_launch_eV": res.get("E_launch_eV", np.nan),
+            "emission_theta_deg": res.get("emission_theta_deg", np.nan),
+            "emission_phi_deg": res.get("emission_phi_deg", np.nan),
+            "emission_polar_axis": res.get("emission_polar_axis", None),
+            "emission_outward_cosine": res.get(
+                "emission_outward_cosine", np.nan
+            ),
+            "sample_gun_incidence_sampler_used": bool(
+                res.get("sample_gun_incidence_sampler_used", False)
+            ),
             "sub_barrier": bool(res.get("sub_barrier", False)),
             "escape_eligible": bool(res.get("escape_eligible", True)),
             "visualization_only": bool(res.get("visualization_only", False)),
@@ -1772,6 +1823,78 @@ def run_cascade_batch_parallel(
     if sample_theta_deg is None:
         sample_theta_deg = float(field.get("sample_theta_deg", 0.0))
 
+    # An incidence-specific sample model is an explicit one-angle experiment.
+    # Validate it once at batch start so a 75-degree table can never be used
+    # silently for a different configured sample rotation.  Small primary-ray
+    # deflections by the field are handled event by event; this check concerns
+    # the nominal mechanical sample angle.
+    sample_gun_configs = {
+        "yield": yield_models.get("sample", {}).get("gun_incidence", None),
+        "energy": energy_models.get("sample", {}).get("gun_incidence", None),
+        "theta": theta_models.get("sample", {}).get("gun_incidence", None),
+    }
+    configured = [cfg is not None for cfg in sample_gun_configs.values()]
+    if any(configured):
+        if not all(configured):
+            raise ValueError(
+                "sample gun-incidence model must be present in yield, energy, "
+                "and theta model dictionaries"
+            )
+        sampler_angles = np.asarray([
+            float(cfg["incidence_angle_deg"])
+            for cfg in sample_gun_configs.values()
+        ])
+        sampler_tolerances = np.asarray([
+            float(cfg["angle_tolerance_deg"])
+            for cfg in sample_gun_configs.values()
+        ])
+        if not np.allclose(
+            sampler_angles, sampler_angles[0], rtol=0.0, atol=1.0e-12
+        ):
+            raise ValueError("sample gun-incidence model angles are inconsistent")
+        if not np.allclose(
+            sampler_tolerances, sampler_tolerances[0], rtol=0.0, atol=1.0e-12
+        ):
+            raise ValueError(
+                "sample gun-incidence model angle tolerances are inconsistent"
+            )
+
+        sampler_angle = float(sampler_angles[0])
+        sampler_tolerance = float(sampler_tolerances[0])
+        angle_delta = abs(float(sample_theta_deg) - sampler_angle)
+        if angle_delta > sampler_tolerance:
+            raise ValueError(
+                f"configured sample angle is {float(sample_theta_deg):g} deg, "
+                f"but the gun-incidence sample model is for {sampler_angle:g} "
+                f"deg (allowed difference {sampler_tolerance:g} deg)"
+            )
+        if verbose:
+            theta_cfg = sample_gun_configs["theta"]
+            yield_cfg = sample_gun_configs["yield"]
+            energy_cfg = sample_gun_configs["energy"]
+            print(
+                "[cascade] sample gun-incidence model: "
+                f"angle={sampler_angle:g} deg, "
+                f"tolerance={sampler_tolerance:g} deg, "
+                "polar axis=fixed +X beam-back/drift-tube axis, "
+                "azimuth=uniform outward cone"
+            )
+            print(
+                "    yields: "
+                f"SE={yield_cfg['SEY'].get('source', '?')}; "
+                f"BSE={yield_cfg['BSEY'].get('source', '?')}"
+            )
+            print(
+                "    energy: "
+                f"SE={energy_cfg['SE'].get('source', '?')}; "
+                f"BSE={energy_cfg['BSE'].get('source', '?')}"
+            )
+            print(
+                "    theta:  "
+                f"SE={theta_cfg['SE'].get('source', '?')}; "
+                f"BSE={theta_cfg['BSE'].get('source', '?')}"
+            )
+
     sample_x = float(field.get("sample_x", 0.0))
     explicit_face_center = field.get("sample_face_center", None)
     if explicit_face_center is None:
@@ -1792,6 +1915,21 @@ def run_cascade_batch_parallel(
         x_sample=sample_x,
         fallback_center=sample_face_anchor,
     )
+
+    if all(configured):
+        beam_back_axis = unit(np.asarray(
+            sample_gun_configs["theta"]["beam_back_axis"], dtype=float
+        ))
+        sample_normal = unit(np.asarray(sample_geometry["normal"], dtype=float))
+        geometry_angle = float(np.degrees(np.arccos(np.clip(
+            float(np.dot(beam_back_axis, sample_normal)), -1.0, 1.0
+        ))))
+        if abs(geometry_angle - sampler_angle) > sampler_tolerance:
+            raise ValueError(
+                f"sample normal is {geometry_angle:g} deg from the configured "
+                f"beam-back polar axis, but the incidence-specific sampler is "
+                f"for {sampler_angle:g} deg"
+            )
 
     # This is a coordinate-system invariant: STL placement can supply face
     # dimensions, never move the analytical face away from its configured
