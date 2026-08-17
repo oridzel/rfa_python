@@ -832,6 +832,15 @@ def run_one_primary_with_cascade(
         "sample_emission_polar_axis": first_emission_event_info.get(
             "sample_emission_polar_axis", None
         ),
+        "sample_gun_joint_sampler_used": first_emission_event_info.get(
+            "sample_gun_joint_sampler_used", False
+        ),
+        "sample_gun_joint_sampler_source": first_emission_event_info.get(
+            "sample_gun_joint_sampler_source", None
+        ),
+        "sample_gun_azimuth_model": first_emission_event_info.get(
+            "sample_gun_azimuth_model", None
+        ),
     })
 
     for failed in first_launch_failures:
@@ -963,6 +972,31 @@ def run_one_primary_with_cascade(
         res["sample_gun_incidence_sampler_used"] = bool(
             e.get("sample_gun_incidence_sampler_used", False)
         )
+        res["sample_gun_joint_sampler_used"] = bool(
+            e.get("sample_gun_joint_sampler_used", False)
+        )
+        res["sample_gun_joint_sampler_source"] = e.get(
+            "sample_gun_joint_sampler_source", None
+        )
+        res["joint_sampler_incident_energy_eV"] = e.get(
+            "joint_sampler_incident_energy_eV", np.nan
+        )
+        res["joint_sampler_event_index"] = e.get(
+            "joint_sampler_event_index", -1
+        )
+        res["joint_sampler_Eout_raw_eV"] = e.get(
+            "joint_sampler_Eout_raw_eV", np.nan
+        )
+        res["joint_sampler_energy_clipped"] = bool(
+            e.get("joint_sampler_energy_clipped", False)
+        )
+        res["emission_mu_beam_back"] = e.get(
+            "emission_mu_beam_back", np.nan
+        )
+        res["emission_mu_toward_normal"] = e.get(
+            "emission_mu_toward_normal", np.nan
+        )
+        res["emission_mu_side"] = e.get("emission_mu_side", np.nan)
         res["sub_barrier"] = bool(e.get("sub_barrier", False))
         res["escape_eligible"] = bool(e.get("escape_eligible", True))
         res["visualization_only"] = visualization_only
@@ -990,6 +1024,31 @@ def run_one_primary_with_cascade(
             "sample_gun_incidence_sampler_used": bool(
                 e.get("sample_gun_incidence_sampler_used", False)
             ),
+            "sample_gun_joint_sampler_used": bool(
+                e.get("sample_gun_joint_sampler_used", False)
+            ),
+            "sample_gun_joint_sampler_source": e.get(
+                "sample_gun_joint_sampler_source", None
+            ),
+            "joint_sampler_incident_energy_eV": e.get(
+                "joint_sampler_incident_energy_eV", np.nan
+            ),
+            "joint_sampler_event_index": e.get(
+                "joint_sampler_event_index", -1
+            ),
+            "joint_sampler_Eout_raw_eV": e.get(
+                "joint_sampler_Eout_raw_eV", np.nan
+            ),
+            "joint_sampler_energy_clipped": bool(
+                e.get("joint_sampler_energy_clipped", False)
+            ),
+            "emission_mu_beam_back": e.get(
+                "emission_mu_beam_back", np.nan
+            ),
+            "emission_mu_toward_normal": e.get(
+                "emission_mu_toward_normal", np.nan
+            ),
+            "emission_mu_side": e.get("emission_mu_side", np.nan),
             "sub_barrier": bool(e.get("sub_barrier", False)),
             "escape_eligible": bool(e.get("escape_eligible", True)),
             "visualization_only": visualization_only,
@@ -1232,6 +1291,15 @@ def run_one_primary_with_cascade(
             "sample_emission_polar_axis": emission_event_info.get(
                 "sample_emission_polar_axis", None
             ),
+            "sample_gun_joint_sampler_used": emission_event_info.get(
+                "sample_gun_joint_sampler_used", False
+            ),
+            "sample_gun_joint_sampler_source": emission_event_info.get(
+                "sample_gun_joint_sampler_source", None
+            ),
+            "sample_gun_azimuth_model": emission_event_info.get(
+                "sample_gun_azimuth_model", None
+            ),
         })
 
         for failed in child_launch_failures:
@@ -1361,6 +1429,31 @@ def cascade_results_to_dataframe(
             "sample_gun_incidence_sampler_used": bool(
                 res.get("sample_gun_incidence_sampler_used", False)
             ),
+            "sample_gun_joint_sampler_used": bool(
+                res.get("sample_gun_joint_sampler_used", False)
+            ),
+            "sample_gun_joint_sampler_source": res.get(
+                "sample_gun_joint_sampler_source", None
+            ),
+            "joint_sampler_incident_energy_eV": res.get(
+                "joint_sampler_incident_energy_eV", np.nan
+            ),
+            "joint_sampler_event_index": res.get(
+                "joint_sampler_event_index", -1
+            ),
+            "joint_sampler_Eout_raw_eV": res.get(
+                "joint_sampler_Eout_raw_eV", np.nan
+            ),
+            "joint_sampler_energy_clipped": bool(
+                res.get("joint_sampler_energy_clipped", False)
+            ),
+            "emission_mu_beam_back": res.get(
+                "emission_mu_beam_back", np.nan
+            ),
+            "emission_mu_toward_normal": res.get(
+                "emission_mu_toward_normal", np.nan
+            ),
+            "emission_mu_side": res.get("emission_mu_side", np.nan),
             "sub_barrier": bool(res.get("sub_barrier", False)),
             "escape_eligible": bool(res.get("escape_eligible", True)),
             "visualization_only": bool(res.get("visualization_only", False)),
@@ -1877,7 +1970,7 @@ def run_cascade_batch_parallel(
                 f"angle={sampler_angle:g} deg, "
                 f"tolerance={sampler_tolerance:g} deg, "
                 "polar axis=fixed +X beam-back/drift-tube axis, "
-                "azimuth=uniform outward cone"
+                f"azimuth={theta_cfg.get('azimuth_model', '?')}"
             )
             print(
                 "    yields: "
@@ -1894,6 +1987,20 @@ def run_cascade_batch_parallel(
                 f"SE={theta_cfg['SE'].get('source', '?')}; "
                 f"BSE={theta_cfg['BSE'].get('source', '?')}"
             )
+            joint_cfg = theta_cfg.get("joint", None)
+            if joint_cfg is not None:
+                print(
+                    "    joint:  "
+                    f"SE={joint_cfg['SE'].get('source', '?')} "
+                    f"({joint_cfg['SE'].get('n_events', '?')} events); "
+                    f"BSE={joint_cfg['BSE'].get('source', '?')} "
+                    f"({joint_cfg['BSE'].get('n_events', '?')} events)"
+                )
+            else:
+                print(
+                    "    WARNING: no joint emitted-event sampler loaded; "
+                    "oblique azimuth is still the legacy conditional-uniform model"
+                )
 
     sample_x = float(field.get("sample_x", 0.0))
     explicit_face_center = field.get("sample_face_center", None)
