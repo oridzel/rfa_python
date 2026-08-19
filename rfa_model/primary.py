@@ -412,49 +412,128 @@ def fly_primary_to_sample(
                 # into physical vacuum, so it must not become the collision
                 # surface.  Traverse only that local artifact while continuing
                 # to test the continuous finite sample plane.
-                bypass = advance_through_sample_voxel_artifact(
-                    p=p,
-                    v=v,
-                    field=field,
-                    sample_geometry=sample_geometry,
-                    sample_owner_id=sample_owner_id,
-                )
+                # ``advance_through_sample_voxel_artifact`` deliberately uses
+                # a short conservative search window. At grazing incidence a
+                # fixed ray-distance window can be much shorter than one voxel
+                # thickness measured normal to the physical sample plane:
+                #
+                #     L_ray ~ h / |vhat dot n_sample|.
+                #
+                # Walk through the staircase in repeated conservative chunks,
+                # checking the continuous sample plane and real STL geometry
+                # after every chunk. The total allowance is two voxel widths
+                # in the sample-normal direction.
+                n_sample = unit(np.asarray(sample_geometry["normal"], dtype=float))
+                vhat_now = unit(v)
+                mu_sample = abs(float(np.dot(vhat_now, n_sample)))
+                mu_sample = max(mu_sample, 1.0e-6)
 
-                bypass_end = np.asarray(bypass["point"], dtype=float)
-                hit_sample_bypass = bypass.get("hit_info", None)
-                hit_stl_bypass = None
+                h_grid = float(field["h"])
+                max_artifact_distance = 2.0 * h_grid / mu_sample
 
-                if (
-                    stl_boxes is None
-                    or segment_near_any_stl_box(p, bypass_end, stl_boxes)
-                ):
-                    hit_stl_bypass = first_segment_hit(
-                        p,
-                        bypass_end,
-                        intersector,
-                        face_owner,
-                        collision_mesh,
+                artifact_start = p.copy()
+                artifact_point = p.copy()
+                artifact_total_distance = 0.0
+                artifact_total_attempts = 0
+                artifact_chunks = 0
+                artifact_last_status = None
+                artifact_terminal_hit = None
+
+                # Defensive guard only; the angle-scaled physical distance
+                # criterion above is the real stopping condition.
+                max_artifact_chunks = 128
+
+                while artifact_chunks < max_artifact_chunks:
+                    bypass = advance_through_sample_voxel_artifact(
+                        p=artifact_point,
+                        v=v,
+                        field=field,
+                        sample_geometry=sample_geometry,
+                        sample_owner_id=sample_owner_id,
                     )
 
-                hit = hit_stl_bypass if hit_stl_bypass is not None else hit_sample_bypass
+                    artifact_chunks += 1
+                    artifact_total_attempts += int(bypass.get("attempts", 0))
 
-                if hit is not None:
-                    hit = dict(hit)
+                    bypass_end = np.asarray(bypass["point"], dtype=float)
+                    chunk_distance = float(np.linalg.norm(
+                        bypass_end - artifact_point
+                    ))
+                    artifact_total_distance += chunk_distance
+                    artifact_last_status = bypass.get("status", None)
+
+                    hit_sample_bypass = bypass.get("hit_info", None)
+                    hit_stl_bypass = None
+
+                    if (
+                        stl_boxes is None
+                        or segment_near_any_stl_box(
+                            artifact_point, bypass_end, stl_boxes
+                        )
+                    ):
+                        hit_stl_bypass = first_segment_hit(
+                            artifact_point,
+                            bypass_end,
+                            intersector,
+                            face_owner,
+                            collision_mesh,
+                        )
+
+                    artifact_terminal_hit = (
+                        hit_stl_bypass
+                        if hit_stl_bypass is not None
+                        else hit_sample_bypass
+                    )
+
+                    if artifact_terminal_hit is not None:
+                        break
+
+                    artifact_point = bypass_end
+
+                    if bypass["status"] in {
+                        "cleared",
+                        "left_grid",
+                        "left_update_region",
+                    }:
+                        break
+
+                    if artifact_total_distance >= max_artifact_distance:
+                        break
+
+                    # Require forward progress from the helper.
+                    if chunk_distance <= 0.0:
+                        break
+
+                if artifact_terminal_hit is not None:
+                    hit = dict(artifact_terminal_hit)
                     hit["sample_voxel_artifact_traversal"] = True
-                    hit["sample_voxel_artifact_attempts"] = bypass["attempts"]
-                    hit["sample_voxel_artifact_distance_m"] = bypass["distance_m"]
+                    hit["sample_voxel_artifact_attempts"] = (
+                        artifact_total_attempts
+                    )
+                    hit["sample_voxel_artifact_chunks"] = artifact_chunks
+                    hit["sample_voxel_artifact_distance_m"] = (
+                        artifact_total_distance
+                    )
+                    hit["sample_voxel_artifact_max_distance_m"] = (
+                        max_artifact_distance
+                    )
                     hit["grid_classification"] = dict(cls)
+
                     if hit.get("kind") == "stl" and _stl_owner_is_sample(hit):
                         hit = _finalize_sample_stl_hit(
-                            hit, v_hit=v, p_before=p, sample_geometry=sample_geometry
+                            hit,
+                            v_hit=v,
+                            p_before=artifact_start,
+                            sample_geometry=sample_geometry,
                         )
                         reason = "hit_sample"
                     else:
                         hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
                         hit["v_in"] = v.copy()
-                        hit["p_before"] = p.copy()
+                        hit["p_before"] = artifact_start.copy()
                         reason = (
-                            "hit_sample" if hit.get("kind") == "sample_plane"
+                            "hit_sample"
+                            if hit.get("kind") == "sample_plane"
                             else "hit_stl"
                         )
 
@@ -468,26 +547,29 @@ def fly_primary_to_sample(
                         "steps": step,
                     }
 
-                if bypass["status"] == "cleared":
-                    p_previous = p.copy()
-                    p = bypass_end
+                final_cls = classify_grid_point(artifact_point, field)
+                if final_cls["status"] == "free":
+                    p_previous = artifact_start.copy()
+                    p = artifact_point
                     append_track(p, v, force=True)
                     continue
 
-                # Reaching this branch means the local staircase could not be
-                # cleared within the conservative search window.  Keep it
-                # explicit rather than silently turning a voxel artifact into a
-                # physical sample hit.
+                # The continuous sample plane remains authoritative. Never
+                # silently convert a fixed sample voxel into a physical hit.
                 fail_info = dict(cls)
                 fail_info.update({
                     "kind": "sample_voxel_artifact",
                     "owner": "sample",
                     "owner_name": "sample",
-                    "location": p.copy(),
-                    "sample_voxel_artifact_attempts": bypass["attempts"],
-                    "sample_voxel_artifact_distance_m": bypass["distance_m"],
+                    "location": artifact_point.copy(),
+                    "sample_voxel_artifact_attempts": artifact_total_attempts,
+                    "sample_voxel_artifact_chunks": artifact_chunks,
+                    "sample_voxel_artifact_distance_m": artifact_total_distance,
+                    "sample_voxel_artifact_max_distance_m": max_artifact_distance,
+                    "sample_voxel_artifact_mu": mu_sample,
+                    "sample_voxel_artifact_last_status": artifact_last_status,
                 })
-                append_track(p, v, force=True)
+                append_track(artifact_point, v, force=True)
                 traj_out, vel_out = packed_track()
                 return {
                     "reason": "sample_voxel_artifact_failed",
