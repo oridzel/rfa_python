@@ -587,9 +587,15 @@ def load_sample_gun_incidence_model(
 ) -> dict:
     """Load one incidence-specific Cu sample model.
 
+<<<<<<< HEAD
     The six incidence-specific tables are a matched set: absolute SEY/BSEY,
     emitted-energy inverse CDFs, and emitted-polar-angle inverse CDFs.  If the
     two optional SEEMC ``*JointFromPlaneSampler*.npz`` files are present, they are
+=======
+    The six historical JMONSEL tables are a matched set: absolute SEY/BSEY,
+    emitted-energy inverse CDFs, and emitted-polar-angle inverse CDFs.  If the
+    two optional ``*JointFromPlaneSampler*.npz`` files are present, they are
+>>>>>>> f64e32595f6064b2b4cc96333f79d5f442b2b5f6
     loaded as the preferred first-generation emission model because they retain
     the event-by-event E-theta-phi correlation.  Without those files the legacy
     theta-only model remains available as a backward-compatible fallback.
@@ -1840,6 +1846,7 @@ def sample_joint_emission_event(
     drawn from that table, so emitted energy and all direction components stay
     coupled.  No independent phi draw is made.
     """
+<<<<<<< HEAD
     Egrid = np.asarray(model["E"], dtype=float)
     tables = model["tables"]
     Equery = float(Einc)
@@ -1854,6 +1861,9 @@ def sample_joint_emission_event(
     else:
         tab = _choose_sampler_table(model, Equery, rng)
 
+=======
+    tab = _choose_sampler_table(model, Einc, rng)
+>>>>>>> f64e32595f6064b2b4cc96333f79d5f442b2b5f6
     Eout = np.asarray(tab["Eout_eV"], dtype=float)
     directions = np.asarray(tab["direction_local"], dtype=float)
 
