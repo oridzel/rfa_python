@@ -165,6 +165,32 @@ SAMPLE_GUN_INCIDENCE_FILENAMES = {
     "SE_theta": "SEThetaFromPlaneSampler_uncoatedCuFPA.csv",
 }
 
+# Optional event-level emitted-electron samplers for oblique gun incidence.
+#
+# These files preserve the correlation that is lost when emitted energy and
+# polar angle are reduced to separate inverse-CDF tables. Each NPZ contains
+# one row per emitted electron and must provide either
+#
+#   Einc_eV, Eout_eV, theta_deg, phi_deg
+#
+# or
+#
+#   Einc_eV, Eout_eV,
+#   dir_beam_back, dir_toward_normal, dir_side
+#
+# The local basis is the same one used by launch_sample_electron_beam_relative:
+#   beam_back      = fixed +X axis back toward the gun/drift tube;
+#   toward_normal  = in the incidence plane, perpendicular to beam_back and
+#                    pointing toward the sample's outward normal;
+#   side           = beam_back x toward_normal.
+#
+# Having separate SE and BSE files avoids string/object arrays and keeps the
+# NPZ pickle-free.
+SAMPLE_GUN_JOINT_FILENAMES = {
+    "BSE": "BSEJointFromPlaneSampler_uncoatedCuFPA.npz",
+    "SE": "SEJointFromPlaneSampler_uncoatedCuFPA.npz",
+}
+
 # The RFA coordinate convention has +X pointing from the sample toward the
 # drift tube/electron gun.  The tilted JMONSEL theta tables are explicitly
 # referenced to this fixed axis (the untilted-sample normal), not to a primary
@@ -437,6 +463,123 @@ def load_theta_sampler_csv(path: str | Path) -> dict:
     }
 
 
+def load_joint_emission_sampler_npz(path: str | Path) -> dict:
+    """Load event-level correlated emitted-electron samples.
+
+    Required arrays
+    ---------------
+    Einc_eV, Eout_eV
+
+    Direction may be represented in either of two equivalent schemas:
+
+    1. ``theta_deg`` and ``phi_deg`` in the beam/sample basis used by
+       :func:`launch_sample_electron_beam_relative`; or
+    2. the corresponding local direction cosines
+       ``dir_beam_back``, ``dir_toward_normal``, and ``dir_side``.
+
+    The loader converts both forms to normalized local direction cosines and
+    groups rows by incident energy.  Keeping one table row per emitted electron
+    preserves the full E-theta-phi correlation during resampling.
+    """
+    path = Path(path)
+
+    with np.load(path, allow_pickle=False) as data:
+        keys = set(data.files)
+        required = {"Einc_eV", "Eout_eV"}
+        missing = sorted(required - keys)
+        if missing:
+            raise ValueError(
+                f"Joint sampler {path.name!r} is missing arrays: {missing}"
+            )
+
+        Einc = np.asarray(data["Einc_eV"], dtype=float).reshape(-1)
+        Eout = np.asarray(data["Eout_eV"], dtype=float).reshape(-1)
+
+        angle_schema = {"theta_deg", "phi_deg"}.issubset(keys)
+        component_schema = {
+            "dir_beam_back",
+            "dir_toward_normal",
+            "dir_side",
+        }.issubset(keys)
+
+        if not angle_schema and not component_schema:
+            raise ValueError(
+                f"Joint sampler {path.name!r} must contain either "
+                "theta_deg/phi_deg or dir_beam_back/dir_toward_normal/dir_side"
+            )
+
+        if component_schema:
+            u0 = np.asarray(data["dir_beam_back"], dtype=float).reshape(-1)
+            u1 = np.asarray(data["dir_toward_normal"], dtype=float).reshape(-1)
+            u2 = np.asarray(data["dir_side"], dtype=float).reshape(-1)
+            schema = "direction_cosines"
+        else:
+            theta_deg = np.asarray(data["theta_deg"], dtype=float).reshape(-1)
+            phi_deg = np.asarray(data["phi_deg"], dtype=float).reshape(-1)
+            theta_rad = np.deg2rad(theta_deg)
+            phi_rad = np.deg2rad(phi_deg)
+            u0 = np.cos(theta_rad)
+            u1 = np.sin(theta_rad) * np.cos(phi_rad)
+            u2 = np.sin(theta_rad) * np.sin(phi_rad)
+            schema = "theta_phi"
+
+    arrays = [Einc, Eout, u0, u1, u2]
+    n = len(Einc)
+    if n == 0:
+        raise ValueError(f"Joint sampler {path.name!r} contains no events")
+    if any(len(a) != n for a in arrays):
+        raise ValueError(
+            f"Joint sampler {path.name!r} arrays do not have equal length"
+        )
+
+    good = np.ones(n, dtype=bool)
+    for a in arrays:
+        good &= np.isfinite(a)
+    good &= Einc > 0.0
+    good &= Eout > 0.0
+
+    if not np.any(good):
+        raise ValueError(f"Joint sampler {path.name!r} has no valid events")
+
+    Einc = Einc[good]
+    Eout = Eout[good]
+    dirs = np.column_stack((u0[good], u1[good], u2[good]))
+    norms = np.linalg.norm(dirs, axis=1)
+    nonzero = norms > 1.0e-12
+    if not np.all(nonzero):
+        Einc = Einc[nonzero]
+        Eout = Eout[nonzero]
+        dirs = dirs[nonzero]
+        norms = norms[nonzero]
+    if len(Einc) == 0:
+        raise ValueError(
+            f"Joint sampler {path.name!r} has no nonzero direction vectors"
+        )
+    dirs = dirs / norms[:, None]
+
+    Egrid = np.unique(Einc)
+    Egrid.sort()
+    tables = []
+    for E in Egrid:
+        sel = np.isclose(Einc, E, rtol=0.0, atol=1.0e-12)
+        tables.append({
+            "Einc_eV": float(E),
+            "Eout_eV": Eout[sel],
+            "direction_local": dirs[sel],
+        })
+
+    return {
+        "E": Egrid,
+        "tables": tables,
+        "source": path.name,
+        "schema": schema,
+        "n_events": int(len(Einc)),
+        "direction_basis": (
+            "beam_back, toward_sample_normal_in_incidence_plane, side"
+        ),
+    }
+
+
 def load_sample_gun_incidence_model(
     sampler_dir: str | Path,
     incidence_angle_deg: float,
@@ -444,12 +587,12 @@ def load_sample_gun_incidence_model(
 ) -> dict:
     """Load one incidence-specific Cu sample model.
 
-    These JMONSEL tables are a matched set: absolute SEY/BSEY, emitted-energy
-    inverse CDFs, and emitted-polar-angle inverse CDFs.  The polar angle is
-    measured from the fixed direction back toward the gun/drift tube (+X), not
-    from the tilted sample normal and not from a field-deflected impact
-    velocity.  Its azimuth is not tabulated and is sampled later from only the
-    portion of the polar cone that lies in the vacuum half-space.
+    The six incidence-specific tables are a matched set: absolute SEY/BSEY,
+    emitted-energy inverse CDFs, and emitted-polar-angle inverse CDFs.  If the
+    two optional SEEMC ``*JointFromPlaneSampler*.npz`` files are present, they are
+    loaded as the preferred first-generation emission model because they retain
+    the event-by-event E-theta-phi correlation.  Without those files the legacy
+    theta-only model remains available as a backward-compatible fallback.
 
     The returned model is intentionally marked ``gun_only``.  A later cascade
     electron that re-impacts the sample generally has a different incident
@@ -477,13 +620,40 @@ def load_sample_gun_incidence_model(
             + ", ".join(missing)
         )
 
+    joint_paths = {
+        kind: sampler_dir / filename
+        for kind, filename in SAMPLE_GUN_JOINT_FILENAMES.items()
+    }
+    joint_present = {kind: path.is_file() for kind, path in joint_paths.items()}
+    if any(joint_present.values()) and not all(joint_present.values()):
+        missing_joint = [
+            str(joint_paths[kind])
+            for kind, present in joint_present.items()
+            if not present
+        ]
+        raise FileNotFoundError(
+            "Oblique-incidence joint emission sampling requires both SE and "
+            "BSE NPZ files; missing: " + ", ".join(missing_joint)
+        )
+
+    joint_model = None
+    if all(joint_present.values()):
+        joint_model = {
+            kind: load_joint_emission_sampler_npz(path)
+            for kind, path in joint_paths.items()
+        }
+
     model = {
         "incidence_angle_deg": angle,
         "angle_tolerance_deg": tolerance,
         "gun_only": True,
         "polar_axis": "fixed_beam_back_axis",
         "beam_back_axis": SAMPLE_BEAM_BACK_AXIS.copy(),
-        "azimuth_model": "uniform_over_outward_part_of_polar_cone",
+        "azimuth_model": (
+            "joint_emitted_event"
+            if joint_model is not None
+            else "uniform_over_outward_part_of_polar_cone"
+        ),
         "yield": {
             "BSEY": load_yield_curve_csv(paths["BSEY"]),
             "SEY": load_yield_curve_csv(paths["SEY"]),
@@ -496,6 +666,7 @@ def load_sample_gun_incidence_model(
             "BSE": load_theta_sampler_csv(paths["BSE_theta"]),
             "SE": load_theta_sampler_csv(paths["SE_theta"]),
         },
+        "joint": joint_model,
         "source_dir": sampler_dir.name,
     }
 
@@ -519,6 +690,20 @@ def load_sample_gun_incidence_model(
                 f"match {reference_name}"
             )
 
+    if joint_model is not None:
+        for kind in ("BSE", "SE"):
+            joint_grid = np.asarray(joint_model[kind]["E"], dtype=float)
+            if (
+                joint_grid.shape != reference_grid.shape
+                or not np.allclose(
+                    joint_grid, reference_grid, rtol=0.0, atol=1.0e-12
+                )
+            ):
+                raise ValueError(
+                    f"{kind} joint sampler incident-energy grid does not match "
+                    f"the six incidence-specific CSV tables"
+                )
+
     # For incidence alpha and a polar axis back toward the gun, the outward
     # vacuum hemisphere terminates at theta = 90 deg + alpha.  The supplied
     # 75-degree tables therefore end at 165 degrees.  Validate this convention
@@ -540,6 +725,21 @@ def load_sample_gun_incidence_model(
                 f"expected {expected_theta_max:g} deg for {angle:g}-degree "
                 "incidence and a beam-relative polar axis"
             )
+
+    if joint_model is not None:
+        c_alpha = float(np.cos(np.deg2rad(angle)))
+        s_alpha = float(np.sin(np.deg2rad(angle)))
+        for kind in ("BSE", "SE"):
+            for tab in joint_model[kind]["tables"]:
+                d = np.asarray(tab["direction_local"], dtype=float)
+                outward = d[:, 0] * c_alpha + d[:, 1] * s_alpha
+                if np.any(outward <= 1.0e-12):
+                    n_bad = int(np.count_nonzero(outward <= 1.0e-12))
+                    raise ValueError(
+                        f"{kind} joint sampler contains {n_bad} inward/tangent "
+                        f"events at {angle:g} deg. Expected local basis "
+                        "(beam_back, toward_normal, side); check phi convention."
+                    )
 
     return model
 
@@ -862,6 +1062,7 @@ def load_default_surface_models(
     sample_gun_incidence_dir: str | Path | None = None,
     sample_gun_incidence_angle_deg: float = 75.0,
     sample_gun_incidence_tolerance_deg: float = 0.5,
+    require_sample_gun_joint_sampler: bool = False,
 ) -> tuple[dict, dict, dict]:
     """
     Load the same surface models used in the MATLAB setup.
@@ -917,6 +1118,11 @@ def load_default_surface_models(
     sample_gun_incidence_tolerance_deg:
         Allowed difference between the batch sample angle and the sampler
         angle.  The batch runner validates this before launching primaries.
+    require_sample_gun_joint_sampler:
+        If True, fail unless both event-level SE/BSE joint NPZ files are
+        present in ``sample_gun_incidence_dir``.  This is recommended for
+        oblique-incidence production runs because the legacy theta-only path
+        must invent an azimuth and cannot preserve theta-phi correlation.
 
     Returns
     -------
@@ -1131,6 +1337,17 @@ def load_default_surface_models(
             angle_tolerance_deg=sample_gun_incidence_tolerance_deg,
         )
 
+        if incidence_model.get("joint", None) is None:
+            msg = (
+                "sample_gun_incidence_dir has no joint emitted-event NPZ "
+                "samplers; falling back to the legacy theta-only model with "
+                "uniform conditional azimuth. This is not physically complete "
+                "at oblique incidence."
+            )
+            if require_sample_gun_joint_sampler:
+                raise FileNotFoundError(msg)
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
         common = {
             "incidence_angle_deg": incidence_model["incidence_angle_deg"],
             "angle_tolerance_deg": incidence_model["angle_tolerance_deg"],
@@ -1152,6 +1369,7 @@ def load_default_surface_models(
             "polar_axis": incidence_model["polar_axis"],
             "beam_back_axis": incidence_model["beam_back_axis"],
             "azimuth_model": incidence_model["azimuth_model"],
+            "joint": incidence_model.get("joint", None),
             "BSE": incidence_model["theta"]["BSE"],
             "SE": incidence_model["theta"]["SE"],
         }
@@ -1610,6 +1828,57 @@ def sample_theta_from_table(model: dict, Einc: float, rng) -> float:
     return float(f(u))
 
 
+def sample_joint_emission_event(
+    model: dict,
+    Einc: float,
+    rng,
+) -> dict:
+    """Sample one correlated emitted-electron event.
+
+    The incident-energy table is selected with the same stochastic bracketing
+    convention used by the historical theta sampler.  A complete row is then
+    drawn from that table, so emitted energy and all direction components stay
+    coupled.  No independent phi draw is made.
+    """
+    Egrid = np.asarray(model["E"], dtype=float)
+    tables = model["tables"]
+    Equery = float(Einc)
+
+    # Honor exact tabulated energies. The historical theta helper brackets
+    # strict < and > neighbors even at an exact interior grid point; that is
+    # not acceptable for event-level resampling because a 200 eV impact must
+    # draw from the actual 200 eV SEEMC population.
+    exact = np.where(np.isclose(Egrid, Equery, rtol=0.0, atol=1.0e-12))[0]
+    if exact.size:
+        tab = tables[int(exact[0])]
+    else:
+        tab = _choose_sampler_table(model, Equery, rng)
+
+    Eout = np.asarray(tab["Eout_eV"], dtype=float)
+    directions = np.asarray(tab["direction_local"], dtype=float)
+
+    if Eout.ndim != 1 or directions.ndim != 2 or directions.shape[1] != 3:
+        raise ValueError("invalid joint emission sampler table shape")
+    if len(Eout) == 0 or len(Eout) != len(directions):
+        raise ValueError("joint emission sampler table is empty or inconsistent")
+
+    idx = int(rng.integers(0, len(Eout)))
+    d = unit(directions[idx])
+
+    theta = float(np.arccos(np.clip(d[0], -1.0, 1.0)))
+    phi = float(np.arctan2(d[2], d[1]))
+
+    return {
+        "Eout_eV": float(Eout[idx]),
+        "direction_local": d,
+        "theta_rad": theta,
+        "phi_rad": phi,
+        "sampler_Einc_eV": float(tab["Einc_eV"]),
+        "sampler_event_index": idx,
+        "source": model.get("source", "<joint sampler>"),
+    }
+
+
 def sample_surface_energy(
     energy_models: dict,
     surface_name: str,
@@ -1841,6 +2110,57 @@ def launch_sample_electron_beam_relative(
     return speed * direction, float(phi), outward_cosine
 
 
+def launch_sample_electron_joint(
+    direction_local,
+    Eout_eV: float,
+    beam_back_axis,
+    n_out,
+) -> tuple[np.ndarray, float]:
+    """Launch one event from the correlated oblique-incidence sampler.
+
+    ``direction_local`` contains components in the orthonormal basis
+
+        (beam_back, toward_normal, side)
+
+    used by the joint NPZ format.  Unlike the legacy tilted-sample launcher,
+    this function performs no azimuth randomization, rejection, reflection, or
+    clamping.  An event-level sampler represents electrons that already escaped
+    the material, so a reconstructed inward direction indicates a coordinate-
+    convention error and is rejected loudly.
+    """
+    axis = unit(beam_back_axis)
+    n_out = unit(n_out)
+    dloc = unit(np.asarray(direction_local, dtype=float))
+
+    c_alpha = float(np.dot(axis, n_out))
+    if c_alpha < -1.0e-12:
+        raise ValueError(
+            "beam-back axis and sample outward normal point to opposite hemispheres"
+        )
+    c_alpha = float(np.clip(c_alpha, 0.0, 1.0))
+    s_alpha = float(np.sqrt(max(0.0, 1.0 - c_alpha * c_alpha)))
+
+    if s_alpha > 1.0e-14:
+        e1 = unit(n_out - c_alpha * axis)
+    else:
+        tmp = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(tmp, axis))) > 0.9:
+            tmp = np.array([0.0, 1.0, 0.0])
+        e1 = unit(np.cross(axis, tmp))
+    e2 = unit(np.cross(axis, e1))
+
+    direction = unit(dloc[0] * axis + dloc[1] * e1 + dloc[2] * e2)
+    outward_cosine = float(np.dot(direction, n_out))
+    if not outward_cosine > 1.0e-12:
+        raise ValueError(
+            "joint sample emission reconstructed inward/tangent to the Cu "
+            "surface; check the NPZ phi/direction basis convention"
+        )
+
+    speed = speed_from_energy_eV(Eout_eV)
+    return speed * direction, outward_cosine
+
+
 def launch_surface_electron(
     theta_rad: float,
     phi_rad: float,
@@ -1955,6 +2275,9 @@ def generate_surface_emissions(
         "sample_gun_incidence_sampler_angle_deg": np.nan,
         "sample_gun_incidence_sampler_source": None,
         "sample_emission_polar_axis": None,
+        "sample_gun_joint_sampler_used": False,
+        "sample_gun_joint_sampler_source": None,
+        "sample_gun_azimuth_model": None,
     }
 
     surface_name = canonical_surface_name(surface_name)
@@ -1992,6 +2315,7 @@ def generate_surface_emissions(
     sample_yield_override = None
     sample_energy_override = None
     sample_theta_override = None
+    sample_joint_override = None
     sample_yield_reference_angle_deg = 0.0
     use_sample_gun_incidence = False
 
@@ -2029,6 +2353,7 @@ def generate_surface_emissions(
             sample_yield_override = incidence_configs["yield"]
             sample_energy_override = incidence_configs["energy"]
             sample_theta_override = incidence_configs["theta"]
+            sample_joint_override = sample_theta_override.get("joint", None)
             sample_yield_reference_angle_deg = float(angles[0])
             event_info.update({
                 "sample_gun_incidence_sampler_used": True,
@@ -2037,6 +2362,20 @@ def generate_surface_emissions(
                     sample_theta_override.get("source_dir", "<unknown>")
                 ),
                 "sample_emission_polar_axis": "fixed_beam_back_axis",
+                "sample_gun_joint_sampler_used": bool(
+                    sample_joint_override is not None
+                ),
+                "sample_gun_joint_sampler_source": (
+                    None
+                    if sample_joint_override is None
+                    else "; ".join(
+                        str(sample_joint_override[k].get("source", "?"))
+                        for k in ("SE", "BSE")
+                    )
+                ),
+                "sample_gun_azimuth_model": sample_theta_override.get(
+                    "azimuth_model", None
+                ),
             })
 
     if surf == "sample":
@@ -2128,6 +2467,19 @@ def generate_surface_emissions(
             "sample_quantum_reflection_probability": float(R_quantum),
         })
 
+        if (
+            str(origin).lower() == "gun"
+            and sample_joint_override is not None
+            and qr_mode != "disabled"
+        ):
+            raise ValueError(
+                "The joint SEEMC gun-incidence sampler already contains "
+                "vacuum->Cu barrier-reflected primaries. Set "
+                "sample_quantum_reflection_mode='disabled' (recommended), or "
+                "use auto only when it resolves to disabled. The legacy RFA "
+                "reflection branch must not be combined with the joint sampler."
+            )
+
     if surface_name == "sample" and origin == "gun" and qr_mode == "legacy_replace":
         if rng.random() < R_quantum:
             v_reflect = v_in - 2.0 * np.dot(v_in, n_out) * n_out
@@ -2161,156 +2513,236 @@ def generate_surface_emissions(
         event_info["sample_bse_multiplicity_sampled"] = int(Nbse)
 
     for _ in range(Nbse):
-        E_bse = sample_surface_energy(
-            energy_models=energy_models,
-            surface_name=surface_name,
-            kind="BSE",
-            Einc=Einc,
-            rng=rng,
-            model_override=sample_energy_override,
-        )
+        joint_event = None
+        joint_energy_raw = np.nan
+        joint_energy_clipped = False
+
+        if use_sample_gun_incidence and sample_joint_override is not None:
+            joint_event = sample_joint_emission_event(
+                sample_joint_override["BSE"], Einc=Einc, rng=rng
+            )
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            E_bse = float(np.clip(joint_energy_raw, 50.0, Einc))
+            joint_energy_clipped = not np.isclose(
+                E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
+        else:
+            E_bse = sample_surface_energy(
+                energy_models=energy_models,
+                surface_name=surface_name,
+                kind="BSE",
+                Einc=Einc,
+                rng=rng,
+                model_override=sample_energy_override,
+            )
 
         # Optional visualization-only launch of sample electrons below the
         # positive sample-bias escape threshold. The historical physics model
         # omitted these because they cannot escape; when enabled we launch them
         # so the field can visibly turn them back to the sample.
         sub_barrier_bse = bool(surface_name == "sample" and E_bse < Phi_emit)
-        if (not sub_barrier_bse) or track_sub_barrier_sample_emissions:
-            if E_bse > 0:
-                # Preserve the historical physics RNG stream.  The old model
-                # stopped immediately after sampling E_bse for a sub-barrier
-                # electron, so its visualization-only angle/azimuth must come
-                # from an independent RNG.
-                rng_emit = (
-                    visualization_rng
-                    if sub_barrier_bse and visualization_rng is not None
-                    else rng
-                )
-                theta_bs = np.deg2rad(
-                    sample_surface_theta(
-                        theta_models=theta_models,
-                        surface_name=surface_name,
-                        kind="BSE",
-                        Einc=Einc,
-                        rng=rng_emit,
-                        model_override=sample_theta_override,
-                    )
-                )
-
-                # Apply launch-point potential correction to kinetic energy.
-                # Clamp to a small positive value so speed stays real.
-                E_bse_launch = max(E_bse + phi_correction, 1.0e-3)
-
-                if use_sample_gun_incidence:
-                    v_bse, phi_bs, emission_outward_cosine = (
-                        launch_sample_electron_beam_relative(
-                            theta_rad=theta_bs,
-                            Eout_eV=E_bse_launch,
-                            beam_back_axis=sample_theta_override["beam_back_axis"],
-                            n_out=n_out,
-                            rng=rng_emit,
-                        )
-                    )
-                    emission_polar_axis = "fixed_beam_back_axis"
-                    p0_bse = p0_surface
-
-                elif surf in ANALYTIC_MESH_SURFACES:
-                    phi_bs = 2.0 * np.pi * rng_emit.random()
-                    axis_backscatter = -unit(v_in)
-
-                    v_bse = launch_electron_about_axis(
-                        theta_rad=theta_bs,
-                        phi_rad=phi_bs,
-                        Eout_eV=E_bse_launch,
-                        axis=axis_backscatter,
-                    )
-
-                    p0_bse = r_hit + sample_launch_eps * unit(v_bse)
-                    emission_polar_axis = "opposite_incoming_direction"
-                    emission_outward_cosine = float(
-                        np.dot(unit(v_bse), n_out)
-                    )
-
-                else:
-                    phi_bs = 2.0 * np.pi * rng_emit.random()
-                    use_full = is_fullsphere_surface(surface_name)
-
-                    v_bse = launch_surface_electron(
-                        theta_rad=theta_bs,
-                        phi_rad=phi_bs,
-                        Eout_eV=E_bse_launch,
-                        n_out=n_out,
-                        use_full_sphere=use_full,
-                    )
-
-                    p0_bse = p0_surface
-                    emission_polar_axis = "surface_normal"
-                    emission_outward_cosine = float(
-                        np.dot(unit(v_bse), n_out)
-                    )
-
-                emitted.append({
-                    "p0": p0_bse,
-                    "v0": v_bse,
-                    "E_emit_eV": E_bse,        # record physical surface energy
-                    "E_launch_eV": E_bse_launch,
-                    "Phi_emit": Phi_emit,
-                    "kind": "BSE",
-                    "cos_theta": cos_theta,
-                    "emission_theta_deg": float(np.rad2deg(theta_bs)),
-                    "emission_phi_deg": float(np.rad2deg(phi_bs)),
-                    "emission_polar_axis": emission_polar_axis,
-                    "emission_outward_cosine": emission_outward_cosine,
-                    "sample_gun_incidence_sampler_used": bool(
-                        use_sample_gun_incidence
-                    ),
-                    "sub_barrier": sub_barrier_bse,
-                    "escape_eligible": not sub_barrier_bse,
-                    "visualization_only": sub_barrier_bse,
-                })
-
-    for _ in range(Nse):
-        E_se = sample_surface_energy(
-            energy_models=energy_models,
-            surface_name=surface_name,
-            kind="SE",
-            Einc=Einc,
-            rng=rng,
-            model_override=sample_energy_override,
-        )
-
-        # Optional visualization-only launch of sub-barrier sample SEs.
-        sub_barrier_se = bool(surface_name == "sample" and E_se < Phi_emit)
-        if sub_barrier_se and not track_sub_barrier_sample_emissions:
+        if sub_barrier_bse and not track_sub_barrier_sample_emissions:
+            continue
+        if E_bse <= 0.0:
             continue
 
-        if E_se <= 0:
-            continue
-
-        # As above, visualization-only sub-barrier angles must not consume the
-        # main cascade RNG or enabling this figure mode would perturb the
-        # ordinary simulated currents/yields.
+        # In the legacy path, visualization-only angles/azimuths use a separate
+        # RNG so enabling trajectory display does not perturb the physics RNG.
+        # The joint path has already sampled the complete event above, so no
+        # additional random draw is needed for its direction.
         rng_emit = (
             visualization_rng
-            if sub_barrier_se and visualization_rng is not None
+            if (
+                joint_event is None
+                and sub_barrier_bse
+                and visualization_rng is not None
+            )
             else rng
         )
-        theta_se = np.deg2rad(
-            sample_surface_theta(
-                theta_models=theta_models,
+
+        if joint_event is not None:
+            theta_bs = float(joint_event["theta_rad"])
+            phi_bs = float(joint_event["phi_rad"])
+        else:
+            theta_bs = np.deg2rad(
+                sample_surface_theta(
+                    theta_models=theta_models,
+                    surface_name=surface_name,
+                    kind="BSE",
+                    Einc=Einc,
+                    rng=rng_emit,
+                    model_override=sample_theta_override,
+                )
+            )
+
+        # Apply launch-point potential correction to kinetic energy.
+        E_bse_launch = max(E_bse + phi_correction, 1.0e-3)
+
+        if joint_event is not None:
+            v_bse, emission_outward_cosine = launch_sample_electron_joint(
+                direction_local=joint_event["direction_local"],
+                Eout_eV=E_bse_launch,
+                beam_back_axis=sample_theta_override["beam_back_axis"],
+                n_out=n_out,
+            )
+            emission_polar_axis = "fixed_beam_back_axis_joint"
+            p0_bse = p0_surface
+
+        elif use_sample_gun_incidence:
+            v_bse, phi_bs, emission_outward_cosine = (
+                launch_sample_electron_beam_relative(
+                    theta_rad=theta_bs,
+                    Eout_eV=E_bse_launch,
+                    beam_back_axis=sample_theta_override["beam_back_axis"],
+                    n_out=n_out,
+                    rng=rng_emit,
+                )
+            )
+            emission_polar_axis = "fixed_beam_back_axis"
+            p0_bse = p0_surface
+
+        elif surf in ANALYTIC_MESH_SURFACES:
+            phi_bs = 2.0 * np.pi * rng_emit.random()
+            axis_backscatter = -unit(v_in)
+
+            v_bse = launch_electron_about_axis(
+                theta_rad=theta_bs,
+                phi_rad=phi_bs,
+                Eout_eV=E_bse_launch,
+                axis=axis_backscatter,
+            )
+
+            p0_bse = r_hit + sample_launch_eps * unit(v_bse)
+            emission_polar_axis = "opposite_incoming_direction"
+            emission_outward_cosine = float(np.dot(unit(v_bse), n_out))
+
+        else:
+            phi_bs = 2.0 * np.pi * rng_emit.random()
+            use_full = is_fullsphere_surface(surface_name)
+
+            v_bse = launch_surface_electron(
+                theta_rad=theta_bs,
+                phi_rad=phi_bs,
+                Eout_eV=E_bse_launch,
+                n_out=n_out,
+                use_full_sphere=use_full,
+            )
+
+            p0_bse = p0_surface
+            emission_polar_axis = "surface_normal"
+            emission_outward_cosine = float(np.dot(unit(v_bse), n_out))
+
+        dloc = (
+            np.asarray(joint_event["direction_local"], dtype=float)
+            if joint_event is not None
+            else np.full(3, np.nan)
+        )
+        emitted.append({
+            "p0": p0_bse,
+            "v0": v_bse,
+            "E_emit_eV": E_bse,
+            "E_launch_eV": E_bse_launch,
+            "Phi_emit": Phi_emit,
+            "kind": "BSE",
+            "cos_theta": cos_theta,
+            "emission_theta_deg": float(np.rad2deg(theta_bs)),
+            "emission_phi_deg": float(np.rad2deg(phi_bs)),
+            "emission_polar_axis": emission_polar_axis,
+            "emission_outward_cosine": emission_outward_cosine,
+            "emission_mu_beam_back": float(dloc[0]),
+            "emission_mu_toward_normal": float(dloc[1]),
+            "emission_mu_side": float(dloc[2]),
+            "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
+            "sample_gun_joint_sampler_used": bool(joint_event is not None),
+            "sample_gun_joint_sampler_source": (
+                None if joint_event is None else joint_event.get("source", None)
+            ),
+            "joint_sampler_incident_energy_eV": (
+                np.nan
+                if joint_event is None
+                else float(joint_event["sampler_Einc_eV"])
+            ),
+            "joint_sampler_event_index": (
+                -1
+                if joint_event is None
+                else int(joint_event["sampler_event_index"])
+            ),
+            "joint_sampler_Eout_raw_eV": joint_energy_raw,
+            "joint_sampler_energy_clipped": bool(joint_energy_clipped),
+            "sub_barrier": sub_barrier_bse,
+            "escape_eligible": not sub_barrier_bse,
+            "visualization_only": sub_barrier_bse,
+        })
+
+    for _ in range(Nse):
+        joint_event = None
+        joint_energy_raw = np.nan
+        joint_energy_clipped = False
+
+        if use_sample_gun_incidence and sample_joint_override is not None:
+            joint_event = sample_joint_emission_event(
+                sample_joint_override["SE"], Einc=Einc, rng=rng
+            )
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            Ehi = min(50.0, Einc)
+            E_se = float(np.clip(joint_energy_raw, min(0.01, Ehi), Ehi))
+            joint_energy_clipped = not np.isclose(
+                E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
+        else:
+            E_se = sample_surface_energy(
+                energy_models=energy_models,
                 surface_name=surface_name,
                 kind="SE",
                 Einc=Einc,
-                rng=rng_emit,
-                model_override=sample_theta_override,
+                rng=rng,
+                model_override=sample_energy_override,
             )
+
+        sub_barrier_se = bool(surface_name == "sample" and E_se < Phi_emit)
+        if sub_barrier_se and not track_sub_barrier_sample_emissions:
+            continue
+        if E_se <= 0.0:
+            continue
+
+        rng_emit = (
+            visualization_rng
+            if (
+                joint_event is None
+                and sub_barrier_se
+                and visualization_rng is not None
+            )
+            else rng
         )
 
-        # Apply launch-point potential correction to kinetic energy.
-        # Clamp to a small positive value so speed stays real.
+        if joint_event is not None:
+            theta_se = float(joint_event["theta_rad"])
+            phi_se = float(joint_event["phi_rad"])
+        else:
+            theta_se = np.deg2rad(
+                sample_surface_theta(
+                    theta_models=theta_models,
+                    surface_name=surface_name,
+                    kind="SE",
+                    Einc=Einc,
+                    rng=rng_emit,
+                    model_override=sample_theta_override,
+                )
+            )
+
         E_se_launch = max(E_se + phi_correction, 1.0e-3)
 
-        if use_sample_gun_incidence:
+        if joint_event is not None:
+            v_se, emission_outward_cosine = launch_sample_electron_joint(
+                direction_local=joint_event["direction_local"],
+                Eout_eV=E_se_launch,
+                beam_back_axis=sample_theta_override["beam_back_axis"],
+                n_out=n_out,
+            )
+            emission_polar_axis = "fixed_beam_back_axis_joint"
+            p0_se = p0_surface
+
+        elif use_sample_gun_incidence:
             v_se, phi_se, emission_outward_cosine = (
                 launch_sample_electron_beam_relative(
                     theta_rad=theta_se,
@@ -2354,15 +2786,16 @@ def generate_surface_emissions(
             emission_polar_axis = "surface_normal"
             emission_outward_cosine = float(np.dot(unit(v_se), n_out))
 
+        dloc = (
+            np.asarray(joint_event["direction_local"], dtype=float)
+            if joint_event is not None
+            else np.full(3, np.nan)
+        )
         emitted.append({
             "p0": p0_se,
             "v0": v_se,
-            "E_emit_eV": E_se,          # record physical surface energy
+            "E_emit_eV": E_se,
             "E_launch_eV": E_se_launch,
-            # Preserve historical ordinary-SE launch behavior.  Phi_emit is
-            # supplied only for visualization-only sub-barrier SEs so their
-            # kinetic energy is adjusted consistently when moved to the safe
-            # launch point.
             "Phi_emit": (Phi_emit if sub_barrier_se else np.nan),
             "kind": "SE",
             "cos_theta": cos_theta,
@@ -2370,9 +2803,26 @@ def generate_surface_emissions(
             "emission_phi_deg": float(np.rad2deg(phi_se)),
             "emission_polar_axis": emission_polar_axis,
             "emission_outward_cosine": emission_outward_cosine,
-            "sample_gun_incidence_sampler_used": bool(
-                use_sample_gun_incidence
+            "emission_mu_beam_back": float(dloc[0]),
+            "emission_mu_toward_normal": float(dloc[1]),
+            "emission_mu_side": float(dloc[2]),
+            "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
+            "sample_gun_joint_sampler_used": bool(joint_event is not None),
+            "sample_gun_joint_sampler_source": (
+                None if joint_event is None else joint_event.get("source", None)
             ),
+            "joint_sampler_incident_energy_eV": (
+                np.nan
+                if joint_event is None
+                else float(joint_event["sampler_Einc_eV"])
+            ),
+            "joint_sampler_event_index": (
+                -1
+                if joint_event is None
+                else int(joint_event["sampler_event_index"])
+            ),
+            "joint_sampler_Eout_raw_eV": joint_energy_raw,
+            "joint_sampler_energy_clipped": bool(joint_energy_clipped),
             "sub_barrier": sub_barrier_se,
             "escape_eligible": not sub_barrier_se,
             "visualization_only": sub_barrier_se,
