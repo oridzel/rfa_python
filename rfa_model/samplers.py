@@ -1061,6 +1061,8 @@ def load_default_surface_models(
     sample_quantum_reflection_mode: str = "auto",
     sample_gun_incidence_dir: str | Path | None = None,
     sample_gun_incidence_angle_deg: float = 75.0,
+    sample_gun_incidence_dirs: dict[float, str | Path] | None = None,
+    sample_gun_incidence_selection: str = "stochastic_bracket",
     sample_gun_incidence_tolerance_deg: float = 0.5,
     require_sample_gun_joint_sampler: bool = False,
 ) -> tuple[dict, dict, dict]:
@@ -1113,8 +1115,19 @@ def load_default_surface_models(
         the incidence-specific files use the same filenames as the standard
         normal-incidence files.
     sample_gun_incidence_angle_deg:
-        Incidence angle represented by ``sample_gun_incidence_dir``.  The
-        current test data use 75 degrees.
+        Incidence angle represented by ``sample_gun_incidence_dir``.  Retained
+        for backward compatibility with a single incidence-specific library.
+    sample_gun_incidence_dirs:
+        Optional mapping ``{incidence_angle_deg: sampler_directory}`` for a
+        multi-angle first-generation sample library.  The *actual* primary
+        impact angle, computed from ``v_in`` and the physical sample normal, is
+        used to select a library independently for every primary impact.  Do
+        not supply this together with ``sample_gun_incidence_dir``.
+    sample_gun_incidence_selection:
+        Selection rule for a multi-angle catalog. ``"stochastic_bracket"``
+        (default) chooses either neighboring tabulated angle with linear
+        probability, preserving complete joint events while making the mean
+        response continuous in angle. ``"nearest"`` chooses the closest table.
     sample_gun_incidence_tolerance_deg:
         Allowed difference between the batch sample angle and the sampler
         angle.  The batch runner validates this before launching primaries.
@@ -1130,18 +1143,54 @@ def load_default_surface_models(
     """
     model_dir = Path(model_dir)
 
-    if sample_gun_incidence_dir is not None:
-        sample_gun_incidence_dir = Path(sample_gun_incidence_dir)
+    if sample_gun_incidence_dir is not None and sample_gun_incidence_dirs is not None:
+        raise ValueError(
+            "Pass either sample_gun_incidence_dir (single-angle legacy API) or "
+            "sample_gun_incidence_dirs (multi-angle catalog), not both."
+        )
+
+    selection_mode = str(sample_gun_incidence_selection).strip().lower()
+    if selection_mode not in {"nearest", "stochastic_bracket"}:
+        raise ValueError(
+            "sample_gun_incidence_selection must be 'nearest' or "
+            "'stochastic_bracket'"
+        )
+
+    def _validate_incidence_directory(path_like):
+        path = Path(path_like)
         try:
-            same_directory = (
-                sample_gun_incidence_dir.resolve() == model_dir.resolve()
-            )
+            same_directory = path.resolve() == model_dir.resolve()
         except OSError:
             same_directory = False
         if same_directory:
             raise ValueError(
-                "sample_gun_incidence_dir must be separate from model_dir "
-                "because the tilted and normal tables have identical filenames"
+                "incidence-specific sampler directories must be separate from "
+                "model_dir because tilted and normal tables have identical filenames"
+            )
+        return path
+
+    if sample_gun_incidence_dir is not None:
+        sample_gun_incidence_dir = _validate_incidence_directory(
+            sample_gun_incidence_dir
+        )
+
+    normalized_incidence_dirs = None
+    if sample_gun_incidence_dirs is not None:
+        if not isinstance(sample_gun_incidence_dirs, dict) or not sample_gun_incidence_dirs:
+            raise ValueError(
+                "sample_gun_incidence_dirs must be a non-empty dict mapping angle to directory"
+            )
+        normalized_incidence_dirs = {}
+        for angle_key, path_like in sample_gun_incidence_dirs.items():
+            angle_key = float(angle_key)
+            if not np.isfinite(angle_key) or not (0.0 < angle_key < 90.0):
+                raise ValueError(
+                    f"invalid gun-incidence catalog angle {angle_key!r}; expected 0<angle<90"
+                )
+            if angle_key in normalized_incidence_dirs:
+                raise ValueError(f"duplicate gun-incidence catalog angle {angle_key}")
+            normalized_incidence_dirs[angle_key] = _validate_incidence_directory(
+                path_like
             )
 
     if bronstein_dir is None:
@@ -1330,41 +1379,34 @@ def load_default_surface_models(
         },
     }
 
-    if sample_gun_incidence_dir is not None:
-        incidence_model = load_sample_gun_incidence_model(
-            sampler_dir=sample_gun_incidence_dir,
-            incidence_angle_deg=sample_gun_incidence_angle_deg,
-            angle_tolerance_deg=sample_gun_incidence_tolerance_deg,
-        )
-
+    def _split_incidence_model(incidence_model):
         if incidence_model.get("joint", None) is None:
             msg = (
-                "sample_gun_incidence_dir has no joint emitted-event NPZ "
-                "samplers; falling back to the legacy theta-only model with "
-                "uniform conditional azimuth. This is not physically complete "
-                "at oblique incidence."
+                f"Incidence-specific sampler {incidence_model['source_dir']} has no "
+                "joint emitted-event NPZ samplers; falling back to the legacy "
+                "theta-only model with conditional azimuth."
             )
             if require_sample_gun_joint_sampler:
                 raise FileNotFoundError(msg)
             warnings.warn(msg, RuntimeWarning, stacklevel=2)
 
         common = {
-            "incidence_angle_deg": incidence_model["incidence_angle_deg"],
-            "angle_tolerance_deg": incidence_model["angle_tolerance_deg"],
+            "incidence_angle_deg": float(incidence_model["incidence_angle_deg"]),
+            "angle_tolerance_deg": float(incidence_model["angle_tolerance_deg"]),
             "gun_only": True,
             "source_dir": incidence_model["source_dir"],
         }
-        yield_models["sample"]["gun_incidence"] = {
+        ycfg = {
             **common,
             "BSEY": incidence_model["yield"]["BSEY"],
             "SEY": incidence_model["yield"]["SEY"],
         }
-        energy_models["sample"]["gun_incidence"] = {
+        ecfg = {
             **common,
             "BSE": incidence_model["energy"]["BSE"],
             "SE": incidence_model["energy"]["SE"],
         }
-        theta_models["sample"]["gun_incidence"] = {
+        tcfg = {
             **common,
             "polar_axis": incidence_model["polar_axis"],
             "beam_back_axis": incidence_model["beam_back_axis"],
@@ -1373,6 +1415,49 @@ def load_default_surface_models(
             "BSE": incidence_model["theta"]["BSE"],
             "SE": incidence_model["theta"]["SE"],
         }
+        return ycfg, ecfg, tcfg
+
+    if sample_gun_incidence_dir is not None:
+        incidence_model = load_sample_gun_incidence_model(
+            sampler_dir=sample_gun_incidence_dir,
+            incidence_angle_deg=sample_gun_incidence_angle_deg,
+            angle_tolerance_deg=sample_gun_incidence_tolerance_deg,
+        )
+        ycfg, ecfg, tcfg = _split_incidence_model(incidence_model)
+        yield_models["sample"]["gun_incidence"] = ycfg
+        energy_models["sample"]["gun_incidence"] = ecfg
+        theta_models["sample"]["gun_incidence"] = tcfg
+
+    if normalized_incidence_dirs is not None:
+        ycatalog = {}
+        ecatalog = {}
+        tcatalog = {}
+        for catalog_angle in sorted(normalized_incidence_dirs):
+            incidence_model = load_sample_gun_incidence_model(
+                sampler_dir=normalized_incidence_dirs[catalog_angle],
+                incidence_angle_deg=catalog_angle,
+                angle_tolerance_deg=sample_gun_incidence_tolerance_deg,
+            )
+            ycfg, ecfg, tcfg = _split_incidence_model(incidence_model)
+            ycatalog[float(catalog_angle)] = ycfg
+            ecatalog[float(catalog_angle)] = ecfg
+            tcatalog[float(catalog_angle)] = tcfg
+
+        catalog_meta = {
+            "selection": selection_mode,
+            "angle_tolerance_deg": float(sample_gun_incidence_tolerance_deg),
+            "available_angles_deg": tuple(sorted(ycatalog)),
+        }
+        yield_models["sample"]["gun_incidence_catalog"] = {
+            **catalog_meta, "models": ycatalog
+        }
+        energy_models["sample"]["gun_incidence_catalog"] = {
+            **catalog_meta, "models": ecatalog
+        }
+        theta_models["sample"]["gun_incidence_catalog"] = {
+            **catalog_meta, "models": tcatalog
+        }
+
 
     return yield_models, energy_models, theta_models
 
@@ -2221,6 +2306,129 @@ def sample_effective_wire_normal_for_grid_hit(n_grid, v_in, rng):
 
 
 # ============================================================
+# Gun-incidence catalog selection
+# ============================================================
+
+def _select_sample_gun_incidence_configs(
+    yield_models: dict,
+    energy_models: dict,
+    theta_models: dict,
+    actual_angle_deg: float,
+    rng,
+):
+    """Select one internally consistent first-generation sample model.
+
+    A multi-angle catalog is selected from the *actual* primary impact angle.
+    ``stochastic_bracket`` mixes neighboring complete tables rather than
+    interpolating individual E/theta/phi events, preserving all within-event
+    correlations while giving a continuous ensemble mean.
+    """
+    sample_sets = [yield_models.get("sample", {}),
+                   energy_models.get("sample", {}),
+                   theta_models.get("sample", {})]
+    catalogs = [m.get("gun_incidence_catalog", None) for m in sample_sets]
+    singles = [m.get("gun_incidence", None) for m in sample_sets]
+
+    if any(c is not None for c in catalogs):
+        if not all(c is not None for c in catalogs):
+            raise ValueError(
+                "sample gun-incidence catalog must be present in yield, energy, "
+                "and theta model dictionaries"
+            )
+        angle_lists = [tuple(float(a) for a in c["available_angles_deg"]) for c in catalogs]
+        if not (angle_lists[0] == angle_lists[1] == angle_lists[2]):
+            raise ValueError("sample gun-incidence catalog angles are inconsistent")
+        modes = [str(c.get("selection", "stochastic_bracket")) for c in catalogs]
+        if not (modes[0] == modes[1] == modes[2]):
+            raise ValueError("sample gun-incidence catalog selection modes are inconsistent")
+        tolerances = [float(c.get("angle_tolerance_deg", 0.5)) for c in catalogs]
+        if not np.allclose(tolerances, tolerances[0], rtol=0.0, atol=1.0e-12):
+            raise ValueError("sample gun-incidence catalog tolerances are inconsistent")
+
+        angles = np.asarray(angle_lists[0], dtype=float)
+        theta = float(actual_angle_deg)
+        tol = float(tolerances[0])
+        if theta < angles[0] - tol or theta > angles[-1] + tol:
+            raise ValueError(
+                f"actual sample impact angle {theta:.6f} deg lies outside the "
+                f"gun-incidence sampler catalog [{angles[0]:.3f}, {angles[-1]:.3f}] "
+                f"by more than the {tol:.3f} deg tolerance"
+            )
+
+        # Endpoint tolerance permits a small field-deflection excursion beyond
+        # the catalog without extrapolating to a fictitious angle.
+        if theta <= angles[0]:
+            selected = float(angles[0])
+            lo = hi = selected
+            hi_weight = 0.0
+        elif theta >= angles[-1]:
+            selected = float(angles[-1])
+            lo = hi = selected
+            hi_weight = 0.0
+        else:
+            hi_idx = int(np.searchsorted(angles, theta, side="left"))
+            if np.isclose(theta, angles[hi_idx], rtol=0.0, atol=1.0e-12):
+                selected = float(angles[hi_idx])
+                lo = hi = selected
+                hi_weight = 0.0
+            else:
+                lo = float(angles[hi_idx - 1])
+                hi = float(angles[hi_idx])
+                hi_weight = float((theta - lo) / (hi - lo))
+                if modes[0] == "nearest":
+                    selected = lo if (theta - lo) <= (hi - theta) else hi
+                else:
+                    selected = hi if rng.random() < hi_weight else lo
+
+        configs = tuple(c["models"][float(selected)] for c in catalogs)
+        delta = abs(theta - selected)
+        return configs, {
+            "actual_angle_deg": theta,
+            "selected_angle_deg": selected,
+            "selected_delta_deg": delta,
+            "bracket_low_deg": lo,
+            "bracket_high_deg": hi,
+            "bracket_high_weight": hi_weight,
+            "selection": modes[0],
+            "available_angles_deg": tuple(float(a) for a in angles),
+        }
+
+    configured = [cfg is not None for cfg in singles]
+    if any(configured) and not all(configured):
+        raise ValueError(
+            "sample gun-incidence model must be present in yield, energy, "
+            "and theta model dictionaries"
+        )
+    if all(configured):
+        angles = np.asarray([float(cfg["incidence_angle_deg"]) for cfg in singles])
+        tolerances = np.asarray([float(cfg["angle_tolerance_deg"]) for cfg in singles])
+        if not np.allclose(angles, angles[0], rtol=0.0, atol=1.0e-12):
+            raise ValueError("sample gun-incidence model angles are inconsistent")
+        if not np.allclose(tolerances, tolerances[0], rtol=0.0, atol=1.0e-12):
+            raise ValueError("sample gun-incidence model tolerances are inconsistent")
+        theta = float(actual_angle_deg)
+        delta = abs(theta - float(angles[0]))
+        if delta > float(tolerances[0]):
+            raise ValueError(
+                f"actual sample impact angle {theta:.6f} deg differs from the "
+                f"configured sampler angle {float(angles[0]):.6f} deg by "
+                f"{delta:.6f} deg, exceeding tolerance {float(tolerances[0]):.6f} deg"
+            )
+        return tuple(singles), {
+            "actual_angle_deg": theta,
+            "selected_angle_deg": float(angles[0]),
+            "selected_delta_deg": delta,
+            "bracket_low_deg": float(angles[0]),
+            "bracket_high_deg": float(angles[0]),
+            "bracket_high_weight": 0.0,
+            "selection": "single",
+            "available_angles_deg": (float(angles[0]),),
+        }
+
+    return None, None
+
+
+# ============================================================
 # Surface-emission generation
 # ============================================================
 
@@ -2272,7 +2480,13 @@ def generate_surface_emissions(
         "sample_quantum_reflection_probability": np.nan,
         "sample_quantum_reflection_applied": False,
         "sample_gun_incidence_sampler_used": False,
+        "sample_gun_incidence_actual_angle_deg": np.nan,
         "sample_gun_incidence_sampler_angle_deg": np.nan,
+        "sample_gun_incidence_sampler_delta_deg": np.nan,
+        "sample_gun_incidence_bracket_low_deg": np.nan,
+        "sample_gun_incidence_bracket_high_deg": np.nan,
+        "sample_gun_incidence_bracket_high_weight": np.nan,
+        "sample_gun_incidence_selection": None,
         "sample_gun_incidence_sampler_source": None,
         "sample_emission_polar_axis": None,
         "sample_gun_joint_sampler_used": False,
@@ -2320,48 +2534,64 @@ def generate_surface_emissions(
     use_sample_gun_incidence = False
 
     if surf == "sample" and str(origin).lower() == "gun":
-        incidence_configs = {
-            "yield": yield_models.get("sample", {}).get("gun_incidence", None),
-            "energy": energy_models.get("sample", {}).get("gun_incidence", None),
-            "theta": theta_models.get("sample", {}).get("gun_incidence", None),
-        }
-        configured = [cfg is not None for cfg in incidence_configs.values()]
-        if any(configured) and not all(configured):
-            raise ValueError(
-                "sample gun-incidence model must be present in yield, energy, "
-                "and theta model dictionaries"
+        actual_incidence_angle_deg = float(
+            np.degrees(np.arccos(np.clip(cos_theta, 0.0, 1.0)))
+        )
+        selected_configs, selection_info = _select_sample_gun_incidence_configs(
+            yield_models=yield_models,
+            energy_models=energy_models,
+            theta_models=theta_models,
+            actual_angle_deg=actual_incidence_angle_deg,
+            rng=rng,
+        )
+        if selected_configs is not None:
+            sample_yield_override, sample_energy_override, sample_theta_override = (
+                selected_configs
             )
-        if all(configured):
-            angles = np.asarray([
-                float(cfg["incidence_angle_deg"])
-                for cfg in incidence_configs.values()
-            ])
-            tolerances = np.asarray([
-                float(cfg["angle_tolerance_deg"])
-                for cfg in incidence_configs.values()
-            ])
-            if not np.allclose(angles, angles[0], rtol=0.0, atol=1.0e-12):
-                raise ValueError("sample gun-incidence model angles are inconsistent")
-            if not np.allclose(
-                tolerances, tolerances[0], rtol=0.0, atol=1.0e-12
-            ):
-                raise ValueError(
-                    "sample gun-incidence model angle tolerances are inconsistent"
-                )
-
             use_sample_gun_incidence = True
-            sample_yield_override = incidence_configs["yield"]
-            sample_energy_override = incidence_configs["energy"]
-            sample_theta_override = incidence_configs["theta"]
             sample_joint_override = sample_theta_override.get("joint", None)
-            sample_yield_reference_angle_deg = float(angles[0])
+            # For stochastic angle bracketing the absolute yield table is part
+            # of the same selected joint population. Do not apply a second
+            # angular-yield correction on top of that selection: averaging the
+            # lower/upper absolute tables already provides the angle
+            # interpolation. The legacy single/nearest modes retain the small
+            # angular-gain correction from the selected reference angle.
+            if selection_info["selection"] == "stochastic_bracket":
+                sample_yield_reference_angle_deg = float(
+                    selection_info["actual_angle_deg"]
+                )
+            else:
+                sample_yield_reference_angle_deg = float(
+                    selection_info["selected_angle_deg"]
+                )
             event_info.update({
                 "sample_gun_incidence_sampler_used": True,
-                "sample_gun_incidence_sampler_angle_deg": float(angles[0]),
+                "sample_gun_incidence_actual_angle_deg": float(
+                    selection_info["actual_angle_deg"]
+                ),
+                "sample_gun_incidence_sampler_angle_deg": float(
+                    selection_info["selected_angle_deg"]
+                ),
+                "sample_gun_incidence_sampler_delta_deg": float(
+                    selection_info["selected_delta_deg"]
+                ),
+                "sample_gun_incidence_bracket_low_deg": float(
+                    selection_info["bracket_low_deg"]
+                ),
+                "sample_gun_incidence_bracket_high_deg": float(
+                    selection_info["bracket_high_deg"]
+                ),
+                "sample_gun_incidence_bracket_high_weight": float(
+                    selection_info["bracket_high_weight"]
+                ),
+                "sample_gun_incidence_selection": str(selection_info["selection"]),
                 "sample_gun_incidence_sampler_source": str(
                     sample_theta_override.get("source_dir", "<unknown>")
                 ),
-                "sample_emission_polar_axis": "fixed_beam_back_axis",
+                # The stored joint coordinates are beam-relative. Reconstruct
+                # them about the *actual* incoming primary direction after
+                # electrostatic deflection, not the nominal mechanical beam axis.
+                "sample_emission_polar_axis": "actual_primary_beam_back_axis",
                 "sample_gun_joint_sampler_used": bool(
                     sample_joint_override is not None
                 ),
@@ -2377,6 +2607,7 @@ def generate_surface_emissions(
                     "azimuth_model", None
                 ),
             })
+
 
     if surf == "sample":
         sample_sey_gain, sample_bsey_gain, sample_theta_deg, sample_model = (
@@ -2582,10 +2813,10 @@ def generate_surface_emissions(
             v_bse, emission_outward_cosine = launch_sample_electron_joint(
                 direction_local=joint_event["direction_local"],
                 Eout_eV=E_bse_launch,
-                beam_back_axis=sample_theta_override["beam_back_axis"],
+                beam_back_axis=-vhat,
                 n_out=n_out,
             )
-            emission_polar_axis = "fixed_beam_back_axis_joint"
+            emission_polar_axis = "actual_primary_beam_back_axis_joint"
             p0_bse = p0_surface
 
         elif use_sample_gun_incidence:
@@ -2593,12 +2824,12 @@ def generate_surface_emissions(
                 launch_sample_electron_beam_relative(
                     theta_rad=theta_bs,
                     Eout_eV=E_bse_launch,
-                    beam_back_axis=sample_theta_override["beam_back_axis"],
+                    beam_back_axis=-vhat,
                     n_out=n_out,
                     rng=rng_emit,
                 )
             )
-            emission_polar_axis = "fixed_beam_back_axis"
+            emission_polar_axis = "actual_primary_beam_back_axis"
             p0_bse = p0_surface
 
         elif surf in ANALYTIC_MESH_SURFACES:
@@ -2653,6 +2884,18 @@ def generate_surface_emissions(
             "emission_mu_toward_normal": float(dloc[1]),
             "emission_mu_side": float(dloc[2]),
             "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
+            "sample_gun_incidence_actual_angle_deg": event_info.get(
+                "sample_gun_incidence_actual_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_angle_deg": event_info.get(
+                "sample_gun_incidence_sampler_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_delta_deg": event_info.get(
+                "sample_gun_incidence_sampler_delta_deg", np.nan
+            ),
+            "sample_gun_incidence_selection": event_info.get(
+                "sample_gun_incidence_selection", None
+            ),
             "sample_gun_joint_sampler_used": bool(joint_event is not None),
             "sample_gun_joint_sampler_source": (
                 None if joint_event is None else joint_event.get("source", None)
@@ -2736,10 +2979,10 @@ def generate_surface_emissions(
             v_se, emission_outward_cosine = launch_sample_electron_joint(
                 direction_local=joint_event["direction_local"],
                 Eout_eV=E_se_launch,
-                beam_back_axis=sample_theta_override["beam_back_axis"],
+                beam_back_axis=-vhat,
                 n_out=n_out,
             )
-            emission_polar_axis = "fixed_beam_back_axis_joint"
+            emission_polar_axis = "actual_primary_beam_back_axis_joint"
             p0_se = p0_surface
 
         elif use_sample_gun_incidence:
@@ -2747,12 +2990,12 @@ def generate_surface_emissions(
                 launch_sample_electron_beam_relative(
                     theta_rad=theta_se,
                     Eout_eV=E_se_launch,
-                    beam_back_axis=sample_theta_override["beam_back_axis"],
+                    beam_back_axis=-vhat,
                     n_out=n_out,
                     rng=rng_emit,
                 )
             )
-            emission_polar_axis = "fixed_beam_back_axis"
+            emission_polar_axis = "actual_primary_beam_back_axis"
             p0_se = p0_surface
 
         elif surf in ANALYTIC_MESH_SURFACES:
@@ -2807,6 +3050,18 @@ def generate_surface_emissions(
             "emission_mu_toward_normal": float(dloc[1]),
             "emission_mu_side": float(dloc[2]),
             "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
+            "sample_gun_incidence_actual_angle_deg": event_info.get(
+                "sample_gun_incidence_actual_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_angle_deg": event_info.get(
+                "sample_gun_incidence_sampler_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_delta_deg": event_info.get(
+                "sample_gun_incidence_sampler_delta_deg", np.nan
+            ),
+            "sample_gun_incidence_selection": event_info.get(
+                "sample_gun_incidence_selection", None
+            ),
             "sample_gun_joint_sampler_used": bool(joint_event is not None),
             "sample_gun_joint_sampler_source": (
                 None if joint_event is None else joint_event.get("source", None)
