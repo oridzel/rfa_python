@@ -692,7 +692,7 @@ def integrate_one_electron(
                         "KE_hit_eV": kinetic_energy_eV_from_velocity(v),
                         "v_in": np.asarray(v, dtype=float).copy(),
                     }
-                    if traj is not None and len(traj) >= 2:
+                    if len(traj) >= 2:
                         _sample_hit["p_before"] = np.asarray(
                             traj[-2], dtype=float
                         ).copy()
@@ -700,19 +700,10 @@ def integrate_one_electron(
                     return {
                         "reason": "hit_sample",
                         "hit_info": _sample_hit,
-                        "traj": (
-                            np.asarray(traj, dtype=float)
-                            if traj is not None
-                            else None
-                        ),
-                        "vel": (
-                            np.asarray(vel, dtype=float)
-                            if vel is not None
-                            else None
-                        ),
+                        "traj": np.asarray(traj),
+                        "vel": np.asarray(vel),
                         "steps": step,
                         "grid_events": grid_events,
-                        "events": grid_events,
                     }
 
                 # Still in physical vacuum (or outside the finite sample face):
