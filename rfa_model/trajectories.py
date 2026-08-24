@@ -344,6 +344,107 @@ def drifttube_escape_result(p, v, traj, vel, step, grid_events=None, extra=None)
         extra=payload,
     )
 
+
+
+def ballistic_continue_to_drifttube_exit(
+    p,
+    v,
+    field,
+    intersector,
+    face_owner,
+    collision_mesh,
+    *,
+    exit_epsilon: float = 1.0e-9,
+):
+    """Continue a +X drift-tube escape candidate to the real STL exit.
+
+    The electrostatic field is unavailable beyond the solved domain, but the
+    remaining section of the grounded drift tube is treated as field-free.
+    The electron is therefore propagated ballistically from the field boundary
+    to the physical +X end of the drift-tube bore.  The continuation segment is
+    tested against the same STL collision mesh used by the normal integrator.
+
+    Returns a dict with ``status`` equal to:
+
+    ``"hit_stl"``
+        The continuation intersects physical CAD before exiting.
+
+    ``"escaped"``
+        The continuation reaches the physical drift-tube exit without a hit.
+
+    ``"unavailable"``
+        Real drift-tube bore metadata is not present; callers should preserve
+        legacy boundary behavior.
+    """
+    from .collisions import drifttube_bore_from_field
+
+    p = np.asarray(p, dtype=float)
+    v = np.asarray(v, dtype=float)
+
+    bore = drifttube_bore_from_field(field)
+    if bore is None:
+        return {"status": "unavailable"}
+
+    if p.shape != (3,) or v.shape != (3,):
+        return {"status": "unavailable"}
+    if not np.all(np.isfinite(p)) or not np.all(np.isfinite(v)):
+        return {"status": "unavailable"}
+
+    direction = unit(v)
+    if direction[0] <= 0.0:
+        return {"status": "unavailable"}
+
+    x_exit = float(bore["x_exit"])
+
+    # If the field domain already reaches or exceeds the physical tube exit,
+    # there is nothing left to continue ballistically.
+    if p[0] >= x_exit - float(exit_epsilon):
+        return {
+            "status": "escaped",
+            "p_exit": p.copy(),
+            "physical_x_exit": x_exit,
+            "continuation_distance_m": 0.0,
+            "ballistic_continuation": False,
+        }
+
+    path_length = (x_exit - p[0]) / direction[0]
+    if path_length <= 0.0 or not np.isfinite(path_length):
+        return {"status": "unavailable"}
+
+    # Extend a tiny amount beyond the nominal exit plane so that an annular
+    # end face / lip at x_exit is included in the segment collision test.
+    p_exit = p + path_length * direction
+    p_test_end = p + (path_length + float(exit_epsilon)) * direction
+
+    hit = first_segment_hit(
+        p,
+        p_test_end,
+        intersector,
+        face_owner,
+        collision_mesh,
+    )
+
+    if hit is not None:
+        return {
+            "status": "hit_stl",
+            "hit_info": dict(hit),
+            "p_exit": p_exit.copy(),
+            "physical_x_exit": x_exit,
+            "continuation_distance_m": float(
+                np.linalg.norm(np.asarray(hit["location"], dtype=float) - p)
+            ),
+            "ballistic_continuation": True,
+        }
+
+    return {
+        "status": "escaped",
+        "p_exit": p_exit.copy(),
+        "physical_x_exit": x_exit,
+        "continuation_distance_m": float(path_length),
+        "ballistic_continuation": True,
+    }
+
+
 # ============================================================
 # Adaptive timestep
 # ============================================================
@@ -603,6 +704,74 @@ def integrate_one_electron(
             np.asarray(vel, dtype=float) if track_points else None,
         )
 
+    def finalize_drifttube_boundary_escape(position, velocity, terminal_step, extra=None):
+        """Resolve a field-boundary DT candidate against the remaining STL."""
+        continuation = ballistic_continue_to_drifttube_exit(
+            p=position,
+            v=velocity,
+            field=field,
+            intersector=intersector,
+            face_owner=face_owner,
+            collision_mesh=collision_mesh,
+        )
+
+        if continuation.get("status") == "hit_stl":
+            hit = dict(continuation["hit_info"])
+            hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(velocity)
+            hit["v_in"] = np.asarray(velocity, dtype=float).copy()
+            hit["p_before"] = np.asarray(position, dtype=float).copy()
+            hit["ballistic_drifttube_continuation"] = True
+            hit["continuation_distance_m"] = continuation.get(
+                "continuation_distance_m", np.nan
+            )
+            hit["physical_x_exit"] = continuation.get(
+                "physical_x_exit", np.nan
+            )
+
+            append_track(hit["location"], velocity, force=True)
+            traj_out, vel_out = packed_track()
+            return {
+                "reason": "hit_stl",
+                "hit_info": hit,
+                "traj": traj_out,
+                "vel": vel_out,
+                "grid_events": grid_events,
+                "events": grid_events,
+                "steps": terminal_step,
+                "ballistic_drifttube_continuation": True,
+            }
+
+        # Legacy behavior if real bore metadata is unavailable.
+        p_escape = np.asarray(
+            continuation.get("p_exit", position), dtype=float
+        )
+        append_track(p_escape, velocity, force=True)
+
+        payload = {
+            "ballistic_drifttube_continuation": bool(
+                continuation.get("ballistic_continuation", False)
+            ),
+            "continuation_distance_m": continuation.get(
+                "continuation_distance_m", 0.0
+            ),
+            "physical_x_exit": continuation.get(
+                "physical_x_exit", np.nan
+            ),
+            "field_boundary_p": np.asarray(position, dtype=float).copy(),
+        }
+        if extra:
+            payload.update(extra)
+
+        return drifttube_escape_result(
+            p=p_escape,
+            v=velocity,
+            traj=traj,
+            vel=vel,
+            step=terminal_step,
+            grid_events=grid_events,
+            extra=payload,
+        )
+
     grid_events = []
     ignore_sphere_owners = set()
 
@@ -847,14 +1016,10 @@ def integrate_one_electron(
 
             if cls["status"] in {"left_grid", "left_update_region"}:
                 if is_drifttube_escape_candidate(p, v, field):
-                    append_track(p, v, force=True)
-                    return drifttube_escape_result(
-                        p=p,
-                        v=v,
-                        traj=traj,
-                        vel=vel,
-                        step=step,
-                        grid_events=grid_events,
+                    return finalize_drifttube_boundary_escape(
+                        position=p,
+                        velocity=v,
+                        terminal_step=step,
                         extra={"original_grid_status": cls["status"]},
                     )
 
@@ -896,14 +1061,10 @@ def integrate_one_electron(
 
         if not np.all(np.isfinite(p_new)) or not np.all(np.isfinite(v_new)):
             if is_drifttube_escape_candidate(p, v, field):
-                append_track(p, v, force=True)
-                return drifttube_escape_result(
-                    p=p,
-                    v=v,
-                    traj=traj,
-                    vel=vel,
-                    step=step + 1,
-                    grid_events=grid_events,
+                return finalize_drifttube_boundary_escape(
+                    position=p,
+                    velocity=v,
+                    terminal_step=step + 1,
                     extra={
                         "p_before": p.copy(),
                         "v_before": v.copy(),
