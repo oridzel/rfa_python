@@ -1116,6 +1116,11 @@ def integrate_one_electron(
                 intersector,
                 face_owner,
                 collision_mesh,
+                exclude_owners=(
+                    {"sample"}
+                    if sample_plane_return and sample_geometry is not None
+                    else None
+                ),
             )
 
         hit_grid = first_analytic_grid_hit(

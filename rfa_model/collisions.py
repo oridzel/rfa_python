@@ -242,11 +242,16 @@ def first_segment_hit(
     collision_mesh,
     eps: float = 1e-12,
     min_distance: float = 1e-9,
+    exclude_owners=None,
 ):
     """
-    Find first STL hit along finite segment p0 -> p1.
+    Find first valid STL hit along finite segment p0 -> p1.
 
-    Returns None if no valid hit occurs within the segment.
+    Parameters
+    ----------
+    exclude_owners:
+        Optional iterable of owner names to ignore.  When supplied we request
+        all ray intersections and select the nearest non-excluded one.
     """
     p0 = np.asarray(p0, dtype=float)
     p1 = np.asarray(p1, dtype=float)
@@ -265,48 +270,65 @@ def first_segment_hit(
     if not _is_finite_vec(direction):
         return None
 
+    excluded = {
+        canonical_collision_owner_name(x)
+        for x in (exclude_owners or ())
+    }
+
     try:
         locations, ray_ids, tri_ids = intersector.intersects_location(
             ray_origins=p0.reshape(1, 3),
             ray_directions=direction.reshape(1, 3),
-            multiple_hits=False,
+            multiple_hits=bool(excluded),
         )
     except Exception:
-        # Avoid letting rare rtree/trimesh failures kill a whole batch.
-        # Usually caused by invalid numerical ray state.
         return None
 
     if len(locations) == 0:
         return None
 
-    location = locations[0]
+    best = None
 
-    if not _is_finite_vec(location):
+    for location, tri_id in zip(locations, tri_ids):
+        if not _is_finite_vec(location):
+            continue
+
+        tri_id = int(tri_id)
+
+        owner = canonical_collision_owner_name(
+            face_owner[tri_id]
+        )
+
+        if owner in excluded:
+            continue
+
+        distance = np.linalg.norm(location - p0)
+
+        if (
+            not np.isfinite(distance)
+            or distance <= min_distance
+            or distance > seg_len + eps
+        ):
+            continue
+
+        if best is None or distance < best[0]:
+            best = (distance, location, tri_id, owner)
+
+    if best is None:
         return None
 
-    tri_id = int(tri_ids[0])
-
-    distance = np.linalg.norm(location - p0)
-
-    if (not np.isfinite(distance)) or distance <= min_distance:
-        return None
-
-    if distance > seg_len + eps:
-        return None
-
-    owner = face_owner[tri_id]
+    distance, location, tri_id, owner = best
     normal = collision_mesh.face_normals[tri_id]
 
     hit = {
         "kind": "stl",
-        "location": location,
-        "distance": distance,
+        "location": np.asarray(location, dtype=float),
+        "distance": float(distance),
         "face_id": tri_id,
         "owner": owner,
         "normal": normal,
     }
 
-    # If you added add_owner_metadata earlier, use it:
     if "add_owner_metadata" in globals():
         hit = add_owner_metadata(hit, owner_name=owner)
 

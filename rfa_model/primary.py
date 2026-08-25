@@ -374,6 +374,12 @@ def fly_primary_to_sample(
         traj = None
         vel = None
 
+    # With analytical sample geometry active, the STL sample is dimensional
+    # metadata only and must never compete with the physical analytical face.
+    stl_exclude_owners = (
+        {"sample"} if sample_geometry is not None else None
+    )
+
     # Physics/collision logic occasionally needs the immediately preceding
     # vacuum point.  Keep it independently of optional trajectory storage.
     p_previous = None
@@ -472,11 +478,12 @@ def fly_primary_to_sample(
                         )
                     ):
                         hit_stl_bypass = first_segment_hit(
-                            artifact_point,
+                            p,
                             bypass_end,
                             intersector,
                             face_owner,
                             collision_mesh,
+                            exclude_owners=stl_exclude_owners,
                         )
 
                     artifact_terminal_hit = (
@@ -654,6 +661,7 @@ def fly_primary_to_sample(
                 intersector,
                 face_owner,
                 collision_mesh,
+                exclude_owners=stl_exclude_owners,
             )
 
         hit = nearest_hit(hit_sample, hit_stl)
