@@ -40,6 +40,9 @@ from .trajectories import (
     classify_grid_point,
     classify_effective_vacuum_point,
     advance_through_sample_voxel_artifact,
+    advance_through_fixed_owner_voxel_artifact,
+    fixed_owner_name,
+    fixed_owner_has_stl_geometry,
     choose_adaptive_dt_with_surfaces,
     integrate_one_electron,
 )
@@ -478,7 +481,7 @@ def fly_primary_to_sample(
                         )
                     ):
                         hit_stl_bypass = first_segment_hit(
-                            p,
+                            artifact_point,
                             bypass_end,
                             intersector,
                             face_owner,
@@ -611,6 +614,162 @@ def fly_primary_to_sample(
                     "vel": vel_out,
                     "steps": step,
                 }
+
+            # CONTINUOUS_STL_FIXED_VOXEL_RESOLUTION_V1
+            # ---------------------------------------------------------------
+            # A fixed voxel is an electrostatic boundary condition, not an
+            # authoritative physical collision surface. For owners that also
+            # exist in the continuous STL collision mesh, resolve the local
+            # voxel staircase against the real geometry before terminating.
+            if cls["status"] == "hit_fixed":
+                fixed_owner_id = cls.get("owner_id", None)
+                fixed_owner = fixed_owner_name(
+                    fixed_owner_id,
+                    field=field,
+                )
+
+                if fixed_owner_has_stl_geometry(
+                    fixed_owner,
+                    face_owner,
+                ):
+                    artifact_start = p.copy()
+
+                    bypass = advance_through_fixed_owner_voxel_artifact(
+                        p=p,
+                        v=v,
+                        field=field,
+                        owner_id=fixed_owner_id,
+                    )
+                    bypass_end = np.asarray(
+                        bypass["point"],
+                        dtype=float,
+                    )
+
+                    # The physical sample plane remains authoritative if this
+                    # local segment happens to cross it.
+                    hit_sample_bypass = segment_hits_sample_plane(
+                        artifact_start,
+                        bypass_end,
+                        x_sample=x_sample,
+                        sample_y_bounds=sample_y_bounds,
+                        sample_z_bounds=sample_z_bounds,
+                        sample_geometry=sample_geometry,
+                    )
+
+                    # Test the ENTIRE bypass segment against continuous CAD.
+                    # With analytic sample geometry enabled, the translated
+                    # sample STL remains excluded exactly as in normal steps.
+                    hit_stl_bypass = None
+                    if (
+                        stl_boxes is None
+                        or segment_near_any_stl_box(
+                            artifact_start,
+                            bypass_end,
+                            stl_boxes,
+                        )
+                    ):
+                        hit_stl_bypass = first_segment_hit(
+                            artifact_start,
+                            bypass_end,
+                            intersector,
+                            face_owner,
+                            collision_mesh,
+                            exclude_owners=stl_exclude_owners,
+                        )
+
+                    hit_bypass = nearest_hit(
+                        hit_sample_bypass,
+                        hit_stl_bypass,
+                    )
+
+                    if hit_bypass is not None:
+                        hit = dict(hit_bypass)
+                        hit["fixed_voxel_artifact_resolution"] = True
+                        hit["fixed_voxel_artifact_owner"] = fixed_owner
+                        hit["fixed_voxel_artifact_owner_id"] = fixed_owner_id
+                        hit["fixed_voxel_artifact_attempts"] = bypass["attempts"]
+                        hit["fixed_voxel_artifact_distance_m"] = bypass["distance_m"]
+                        hit["grid_classification"] = dict(cls)
+
+                        # The bypass is deliberately local and ballistic.
+                        v_hit = v.copy()
+
+                        if hit.get("kind") == "sample_plane":
+                            hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_hit)
+                            hit["v_in"] = v_hit.copy()
+                            hit["p_before"] = artifact_start.copy()
+                            reason = "hit_sample"
+                        elif hit.get("kind") == "stl":
+                            if _stl_owner_is_sample(hit):
+                                hit = _finalize_sample_stl_hit(
+                                    hit,
+                                    v_hit=v_hit,
+                                    p_before=artifact_start,
+                                    sample_geometry=sample_geometry,
+                                )
+                                reason = "hit_sample"
+                            else:
+                                hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_hit)
+                                hit["v_in"] = v_hit.copy()
+                                hit["p_before"] = artifact_start.copy()
+                                reason = "hit_stl"
+                        else:
+                            reason = "hit_stl"
+
+                        append_track(hit["location"], v_hit, force=True)
+                        traj_out, vel_out = packed_track()
+                        return {
+                            "reason": reason,
+                            "hit_info": hit,
+                            "traj": traj_out,
+                            "vel": vel_out,
+                            "steps": step,
+                        }
+
+                    final_cls = dict(
+                        classify_grid_point(bypass_end, field)
+                    )
+
+                    # If the same fixed owner was cleared without crossing a
+                    # continuous surface, this was a pure voxel staircase.
+                    # If the endpoint lands in another fixed owner, continue so
+                    # the next loop iteration resolves that owner separately.
+                    same_fixed_owner = (
+                        final_cls.get("status") == "hit_fixed"
+                        and final_cls.get("owner_id", None) is not None
+                        and fixed_owner_id is not None
+                        and int(final_cls["owner_id"]) == int(fixed_owner_id)
+                    )
+
+                    if bypass["status"] == "cleared" and not same_fixed_owner:
+                        p_previous = artifact_start.copy()
+                        p = bypass_end
+                        append_track(p, v, force=True)
+                        continue
+
+                    # Never silently tunnel through an STL-backed boundary if
+                    # the local search cannot clear it.
+                    fail_info = dict(cls)
+                    fail_info.update({
+                        "kind": "fixed_voxel_artifact",
+                        "owner": fixed_owner,
+                        "owner_name": fixed_owner,
+                        "owner_id": fixed_owner_id,
+                        "location": bypass_end.copy(),
+                        "fixed_voxel_artifact_attempts": bypass["attempts"],
+                        "fixed_voxel_artifact_distance_m": bypass["distance_m"],
+                        "fixed_voxel_artifact_last_status": bypass["status"],
+                    })
+
+                    append_track(bypass_end, v, force=True)
+                    traj_out, vel_out = packed_track()
+                    return {
+                        "reason": "fixed_voxel_artifact_failed",
+                        "hit_info": fail_info,
+                        "traj": traj_out,
+                        "vel": vel_out,
+                        "steps": step,
+                    }
 
             append_track(p, v, force=True)
             traj_out, vel_out = packed_track()

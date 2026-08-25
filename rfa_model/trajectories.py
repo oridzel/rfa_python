@@ -251,6 +251,114 @@ def advance_through_sample_voxel_artifact(
     }
 
 
+
+def advance_through_fixed_owner_voxel_artifact(
+    p,
+    v,
+    field,
+    owner_id: int,
+    max_tries: int = 160,
+    step_fraction_of_h: float = 0.05,
+):
+    """Traverse a local fixed-voxel staircase for an STL-backed solid.
+
+    Fixed voxels are required by the electrostatic field solve, but their
+    staircase boundary is not the physical collision surface. Starting at a
+    point classified inside one owner's fixed voxels, walk ballistically along
+    the current trajectory direction until that same-owner voxel layer clears.
+
+    This helper does NOT decide whether the electron physically hit the solid.
+    The caller must test the complete bypass segment against continuous STL
+    geometry (and any analytic surfaces) before accepting the bypass.
+
+    The search is deliberately local. If the same fixed owner cannot be
+    cleared within the configured distance, return ``"failed"`` rather than
+    silently tunnelling through geometry.
+    """
+    if owner_id is None:
+        raise ValueError("owner_id is required")
+    if max_tries <= 0:
+        raise ValueError("max_tries must be positive")
+    if step_fraction_of_h <= 0.0:
+        raise ValueError("step_fraction_of_h must be positive")
+
+    p0 = np.asarray(p, dtype=float).copy()
+    direction = unit(np.asarray(v, dtype=float))
+    h = float(field["h"])
+    ds = float(step_fraction_of_h) * h
+
+    last_point = p0.copy()
+    last_cls = dict(classify_grid_point(p0, field))
+
+    for attempt in range(1, int(max_tries) + 1):
+        candidate = p0 + attempt * ds * direction
+        cls = dict(classify_grid_point(candidate, field))
+        last_point = candidate
+        last_cls = cls
+
+        candidate_owner_id = cls.get("owner_id", None)
+        still_same_owner = (
+            cls.get("status") == "hit_fixed"
+            and candidate_owner_id is not None
+            and int(candidate_owner_id) == int(owner_id)
+        )
+
+        if not still_same_owner:
+            return {
+                "status": "cleared",
+                "point": candidate.copy(),
+                "classification": cls,
+                "attempts": attempt,
+                "distance_m": float(np.linalg.norm(candidate - p0)),
+            }
+
+    return {
+        "status": "failed",
+        "point": last_point.copy(),
+        "classification": last_cls,
+        "attempts": int(max_tries),
+        "distance_m": float(np.linalg.norm(last_point - p0)),
+    }
+
+
+def _canonical_stl_fixed_owner_name(name):
+    """Collapse frame-part aliases onto fixed-owner names used by the field."""
+    if name is None:
+        return None
+
+    name = str(name).strip().lower()
+    aliases = {
+        "g1_low_frame": "g1frame",
+        "g1_upper_frame": "g1frame",
+        "g2_low_frame": "g2frame",
+        "g2_upper_frame": "g2frame",
+        "g3_low_frame": "g3frame",
+        "g3_upper_frame": "g3frame",
+    }
+    return aliases.get(name, name)
+
+
+def fixed_owner_has_stl_geometry(owner_name, face_owner) -> bool:
+    """Return True when a fixed-grid owner also has continuous STL geometry.
+
+    This is the safety gate for fixed-voxel bypassing: only owners represented
+    in the physical collision mesh may have their voxel staircase ignored.
+    """
+    owner = _canonical_stl_fixed_owner_name(owner_name)
+    if owner is None or face_owner is None:
+        return False
+
+    try:
+        owners = {
+            _canonical_stl_fixed_owner_name(x)
+            for x in np.asarray(face_owner, dtype=object).ravel()
+        }
+    except Exception:
+        return False
+
+    return owner in owners
+
+
 def is_drifttube_escape_candidate(p, v, field, aperture_radius=None):
     """Return True when a trajectory is leaving through the +X DT aperture.
 
@@ -939,6 +1047,7 @@ def integrate_one_electron(
                             intersector,
                             face_owner,
                             collision_mesh,
+                            exclude_owners={"sample"},
                         )
 
                     hit = stl_hit if stl_hit is not None else sample_hit
