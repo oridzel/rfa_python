@@ -128,6 +128,12 @@ def attach_rfa_metadata(
         field["grid_frame_opening_radius"],
     )
 
+    # Backward-compatible fallback only.  New field builds that include the
+    # aligned rod STL replace this fixed on-axis circle with per-shell
+    # STL-derived opening geometry in ``field["rod_openings"]`` before the
+    # analytic shell masks are created.
+    field.setdefault("rod_opening_radius", 0.011)
+
     attach_default_owner_name_map(field)
 
     return field
@@ -149,6 +155,14 @@ def validate_field_metadata(field: dict) -> None:
 
     if missing:
         raise KeyError(f"Field is missing required keys: {missing}")
+
+    if field.get("rod_opening_geometry") == "stl_per_shell":
+        rod_openings = field.get("rod_openings", None)
+        if not isinstance(rod_openings, dict):
+            raise KeyError(
+                "Field says rod_opening_geometry='stl_per_shell' but "
+                "field['rod_openings'] is missing or invalid."
+            )
 
     # Ex/Ey/Ez are present only after calculate_electric_field().
     if all(key in field for key in ["Ex", "Ey", "Ez"]):
@@ -907,6 +921,69 @@ def _set_fixed_mask(
     return field
 
 
+
+def _rod_opening_mask_for_shell(
+    field: dict,
+    owner: str,
+    X,
+    Y,
+    Z,
+    rho_xy,
+    legacy_r_rod: float,
+):
+    """
+    Return the support-rod opening mask for one analytic spherical shell.
+
+    Preferred geometry comes from ``field["rod_openings"][owner]``, fitted
+    once from the aligned physical rod STL by
+    :func:`rfa_model.collisions.compute_rod_opening_geometry`.  This is the
+    same metadata consumed later by trajectory collision/opening logic, so
+    electrostatic boundary construction and particle transport describe the
+    same opening.
+
+    If ``field["rod_openings"]`` is absent, retain the legacy on-axis
+    ``radius=legacy_r_rod`` lower-hemisphere circle for compatibility with
+    old notebooks and synthetic tests.  A present dictionary with
+    ``owner -> None`` means the rod does not cross that shell, so no opening
+    is removed there.
+    """
+    rod_openings = field.get("rod_openings", None)
+
+    if rod_openings is None:
+        return (rho_xy <= float(legacy_r_rod)) & (Z <= 0.0)
+
+    geom = rod_openings.get(owner, None)
+
+    if geom is None:
+        # Scalar False broadcasts cleanly against the shell mask.
+        return False
+
+    try:
+        x0, y0 = geom["center_xy"]
+        r_eff = float(geom["radius"])
+        z_ref = float(geom["z_ref"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid rod opening geometry for {owner!r}: {geom!r}"
+        ) from exc
+
+    if not (
+        np.isfinite(float(x0))
+        and np.isfinite(float(y0))
+        and np.isfinite(r_eff)
+        and r_eff > 0.0
+        and np.isfinite(z_ref)
+    ):
+        raise ValueError(
+            f"Non-finite rod opening geometry for {owner!r}: {geom!r}"
+        )
+
+    rho_local = np.sqrt((X - float(x0))**2 + (Y - float(y0))**2)
+    same_side = (Z <= 0.0) if z_ref <= 0.0 else (Z >= 0.0)
+
+    return (rho_local <= r_eff) & same_side
+
+
 def make_analytic_rfa_boundary_masks(
     field: dict,
     R_g1: float,
@@ -981,14 +1058,31 @@ def make_analytic_rfa_boundary_masks(
     col_bdry = col_bdry & ~drift_axis_open
 
     # --------------------------------------------------------
-    # Rod holes through shells
+    # Rod openings through shells
     # --------------------------------------------------------
-    rod_axis = (rho_xy <= r_rod) & (Z <= 0.0)
+    # IMPORTANT: use the same per-shell STL-derived opening geometry later
+    # used by collisions.sphere_crossing_is_opening().  The previous field
+    # solver removed one fixed 11 mm on-axis circle from every shell while
+    # trajectory collisions used off-axis, shell-specific openings.  That
+    # inconsistency altered the electrostatic field precisely in the
+    # rod/collector region whose current partition we are trying to model.
+    g1_rod_open = _rod_opening_mask_for_shell(
+        field, "g1_shell", X, Y, Z, rho_xy, r_rod
+    )
+    g2_rod_open = _rod_opening_mask_for_shell(
+        field, "g2_shell", X, Y, Z, rho_xy, r_rod
+    )
+    g3_rod_open = _rod_opening_mask_for_shell(
+        field, "g3_shell", X, Y, Z, rho_xy, r_rod
+    )
+    col_rod_open = _rod_opening_mask_for_shell(
+        field, "collector_shell", X, Y, Z, rho_xy, r_rod
+    )
 
-    g1_bdry = g1_bdry & ~rod_axis
-    g2_bdry = g2_bdry & ~rod_axis
-    g3_bdry = g3_bdry & ~rod_axis
-    col_bdry = col_bdry & ~rod_axis
+    g1_bdry = g1_bdry & ~g1_rod_open
+    g2_bdry = g2_bdry & ~g2_rod_open
+    g3_bdry = g3_bdry & ~g3_rod_open
+    col_bdry = col_bdry & ~col_rod_open
 
     # --------------------------------------------------------
     # Side spherical cap openings
@@ -1783,6 +1877,10 @@ def build_rfa_field(
     taichi_restore_best_on_max_iter: bool = True,
     taichi_record_history: bool = False,
     verbose: bool = True,
+    rod_opening_clearance_m: float = 1.0e-3,
+    rod_opening_band_thickness_m: float = 2.0e-3,
+    rod_opening_n_samples: int = 200_000,
+    rod_opening_seed: int = 0,
 ) -> dict:
     """
     Build and solve a complete RFA electrostatic field.
@@ -1791,6 +1889,21 @@ def build_rfa_field(
     ``pitch=h`` and used as the only drift-tube conductor.  The legacy
     analytic cylinder is disabled automatically.  A fresh call to this
     function is therefore required after changing the drift-tube alignment.
+
+    If ``meshes`` contains ``"rod"``, the support-rod footprint is sampled
+    from that aligned STL before analytic grid/collector boundaries are
+    created.  Per-shell openings for G1, G2, G3 and the collector are stored
+    in ``field["rod_openings"]`` and used both by the electrostatic boundary
+    masks and later by trajectory collision/opening logic.  This removes the
+    old inconsistency where the field used one fixed on-axis 11 mm circle
+    while collisions used shell-specific STL-derived openings.  Because the
+    electrostatic solution changes, old field NPZ files must be rebuilt to
+    obtain the corrected geometry.
+
+    ``rod_opening_clearance_m``, ``rod_opening_band_thickness_m``,
+    ``rod_opening_n_samples`` and ``rod_opening_seed`` are forwarded to
+    ``compute_rod_opening_geometry``.  The default seed makes the fitted
+    openings deterministic.
 
     Select ``solver="taichi_sor"`` for the optional Taichi red-black SOR
     backend.  Its validation default is CPU/f64.  On macOS, request
@@ -1813,6 +1926,18 @@ def build_rfa_field(
             "Vc": 50.0,
             "Vdt": 0.0,
         }
+
+    rod_opening_clearance_m = float(rod_opening_clearance_m)
+    rod_opening_band_thickness_m = float(rod_opening_band_thickness_m)
+    rod_opening_n_samples = int(rod_opening_n_samples)
+    rod_opening_seed = int(rod_opening_seed)
+
+    if rod_opening_clearance_m < 0.0:
+        raise ValueError("rod_opening_clearance_m must be non-negative")
+    if rod_opening_band_thickness_m <= 0.0:
+        raise ValueError("rod_opening_band_thickness_m must be positive")
+    if rod_opening_n_samples < 1:
+        raise ValueError("rod_opening_n_samples must be at least 1")
 
     t_total = time.perf_counter()
 
@@ -1841,6 +1966,82 @@ def build_rfa_field(
         R_g3=R_g3,
         R_col=R_col,
     )
+
+    # ------------------------------------------------------------
+    # Single source of truth for the support-rod shell openings.
+    # Compute this BEFORE analytic shell masks are created so the solved
+    # electrostatic field and later trajectory collision logic use exactly
+    # the same geometry.
+    # ------------------------------------------------------------
+    has_rod_stl = bool(
+        meshes is not None
+        and "rod" in meshes
+        and meshes["rod"] is not None
+    )
+
+    if has_rod_stl:
+        from .collisions import compute_rod_opening_geometry
+
+        shell_radii = {
+            "g1_shell": float(R_g1),
+            "g2_shell": float(R_g2),
+            "g3_shell": float(R_g3),
+            "collector_shell": float(R_col),
+        }
+
+        field["rod_openings"] = compute_rod_opening_geometry(
+            rod_mesh=meshes["rod"],
+            shell_radii=shell_radii,
+            clearance_m=float(rod_opening_clearance_m),
+            band_thickness_m=float(rod_opening_band_thickness_m),
+            n_samples=int(rod_opening_n_samples),
+            seed=int(rod_opening_seed),
+        )
+        field["rod_opening_geometry"] = "stl_per_shell"
+        field["rod_opening_clearance_m"] = float(rod_opening_clearance_m)
+        field["rod_opening_band_thickness_m"] = float(
+            rod_opening_band_thickness_m
+        )
+        field["rod_opening_n_samples"] = int(rod_opening_n_samples)
+        field["rod_opening_seed"] = int(rod_opening_seed)
+
+        _log(verbose, "Using aligned rod STL for per-shell openings:")
+        missing_rod_shells = []
+        for owner_name, geom in field["rod_openings"].items():
+            if geom is None:
+                missing_rod_shells.append(owner_name)
+                _log(verbose, f"  {owner_name}: no rod crossing detected")
+                continue
+
+            x0, y0 = geom["center_xy"]
+            _log(
+                verbose,
+                f"  {owner_name}: center_xy="
+                f"({1e3 * float(x0):.3f}, {1e3 * float(y0):.3f}) mm, "
+                f"radius={1e3 * float(geom['radius']):.3f} mm, "
+                f"z_ref={1e3 * float(geom['z_ref']):.3f} mm, "
+                f"n={int(geom.get('n_points', 0)):,}",
+            )
+
+        if missing_rod_shells:
+            _log(
+                verbose,
+                "  WARNING: no STL-derived rod opening was found for "
+                + ", ".join(missing_rod_shells)
+                + ". Those shells remain solid at the rod location.",
+            )
+    else:
+        # Preserve the documented legacy fallback for synthetic fields or
+        # setups that genuinely have no rod STL.
+        field["rod_opening_geometry"] = "legacy_fixed_circle"
+        field["rod_opening_radius"] = float(
+            field.get("rod_opening_radius", 0.011)
+        )
+        _log(
+            verbose,
+            "No aligned rod STL supplied; using legacy on-axis "
+            f"rod opening radius = {1e3 * field['rod_opening_radius']:.3f} mm.",
+        )
 
     has_drifttube_stl = bool(
         meshes is not None

@@ -541,9 +541,16 @@ def compute_rod_opening_geometry(
     clearance_m to leave physical clearance between the rod and the grid
     wire / collector material around it.
 
-    Call this ONCE at setup time (alongside computing R_g1/R_g2/R_g3/R_col)
-    and store the result as field["rod_openings"]; is_in_rod_opening() then
-    just does a fast lookup + point-in-circle test per trajectory step.
+    ``build_rfa_field()`` now calls this automatically whenever the aligned
+    ``meshes["rod"]`` STL is supplied, *before* the electrostatic shell masks
+    are created.  The resulting dictionary is stored as
+    ``field["rod_openings"]`` and later consumed here by
+    :func:`is_in_rod_opening`.  This makes the field boundary and trajectory
+    collision logic share one geometry.
+
+    Do not recompute and attach different rod openings only after a field has
+    already been solved: that would make particle collisions disagree with the
+    electrostatic boundary again.  Rebuild the field instead.
 
     Parameters
     ----------
@@ -817,8 +824,10 @@ def is_in_rod_opening(
     Check whether point p, known to lie on analytic shell `owner`, falls
     within that shell's rod opening.
 
-    Uses field["rod_openings"][owner] - precomputed once from the real rod
-    STL mesh via compute_rod_opening_geometry() - rather than a single
+    Uses field["rod_openings"][owner] - normally precomputed by
+    ``build_rfa_field()`` from the real rod STL via
+    ``compute_rod_opening_geometry()`` before the field is solved - rather
+    than a single
     fixed radius=11mm circle centered at the origin. The real rod is
     measurably off-axis (by several mm at some shells) and not perfectly
     circular, so a shared fixed circle either clips real rod-bound
