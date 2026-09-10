@@ -590,15 +590,31 @@ def generate_cascade_emissions_from_hit(
     """
     surface_name = cascade_surface_name(surface_name)
 
-    n_out = estimate_surface_normal(
-        surface_name,
-        r_hit=r_hit,
-        v_in=v_in,
-        hit_info=hit_info,
-        sample_normal=(
-            None if sample_geometry is None else sample_geometry.get("normal", None)
-        ),
-    )
+    # For first-generation gun -> sample emission, the incidence-specific
+    # joint sampler is defined in the basis of the *analytic mechanical sample
+    # face*.  At very grazing incidence (e.g. 89 deg), a voxel/STL fallback
+    # hit normal can differ dramatically from that face normal and can make a
+    # perfectly valid near-tangent SEEMC event reconstruct as inward.
+    #
+    # Therefore use the authoritative analytic sample normal for gun impacts.
+    # Later cascade re-impacts retain the ordinary hit-local normal logic.
+    if (
+        surface_name == "sample"
+        and str(origin).lower() == "gun"
+        and sample_geometry is not None
+        and sample_geometry.get("normal", None) is not None
+    ):
+        n_out = unit(np.asarray(sample_geometry["normal"], dtype=float))
+    else:
+        n_out = estimate_surface_normal(
+            surface_name,
+            r_hit=r_hit,
+            v_in=v_in,
+            hit_info=hit_info,
+            sample_normal=(
+                None if sample_geometry is None else sample_geometry.get("normal", None)
+            ),
+        )
 
     # Use very small normal offset in generate_surface_emissions; the safe
     # launch point is found by make_emissions_safe_to_launch() using the
@@ -823,8 +839,17 @@ def run_one_primary_with_cascade(
         "sample_gun_incidence_sampler_used": first_emission_event_info.get(
             "sample_gun_incidence_sampler_used", False
         ),
+        "sample_gun_incidence_actual_angle_deg": first_emission_event_info.get(
+            "sample_gun_incidence_actual_angle_deg", np.nan
+        ),
         "sample_gun_incidence_sampler_angle_deg": first_emission_event_info.get(
             "sample_gun_incidence_sampler_angle_deg", np.nan
+        ),
+        "sample_gun_incidence_sampler_delta_deg": first_emission_event_info.get(
+            "sample_gun_incidence_sampler_delta_deg", np.nan
+        ),
+        "sample_gun_incidence_selection": first_emission_event_info.get(
+            "sample_gun_incidence_selection", None
         ),
         "sample_gun_incidence_sampler_source": first_emission_event_info.get(
             "sample_gun_incidence_sampler_source", None
@@ -972,6 +997,18 @@ def run_one_primary_with_cascade(
         res["sample_gun_incidence_sampler_used"] = bool(
             e.get("sample_gun_incidence_sampler_used", False)
         )
+        res["sample_gun_incidence_actual_angle_deg"] = e.get(
+            "sample_gun_incidence_actual_angle_deg", np.nan
+        )
+        res["sample_gun_incidence_sampler_angle_deg"] = e.get(
+            "sample_gun_incidence_sampler_angle_deg", np.nan
+        )
+        res["sample_gun_incidence_sampler_delta_deg"] = e.get(
+            "sample_gun_incidence_sampler_delta_deg", np.nan
+        )
+        res["sample_gun_incidence_selection"] = e.get(
+            "sample_gun_incidence_selection", None
+        )
         res["sample_gun_joint_sampler_used"] = bool(
             e.get("sample_gun_joint_sampler_used", False)
         )
@@ -1023,6 +1060,18 @@ def run_one_primary_with_cascade(
             ),
             "sample_gun_incidence_sampler_used": bool(
                 e.get("sample_gun_incidence_sampler_used", False)
+            ),
+            "sample_gun_incidence_actual_angle_deg": e.get(
+                "sample_gun_incidence_actual_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_angle_deg": e.get(
+                "sample_gun_incidence_sampler_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_delta_deg": e.get(
+                "sample_gun_incidence_sampler_delta_deg", np.nan
+            ),
+            "sample_gun_incidence_selection": e.get(
+                "sample_gun_incidence_selection", None
             ),
             "sample_gun_joint_sampler_used": bool(
                 e.get("sample_gun_joint_sampler_used", False)
@@ -1282,8 +1331,17 @@ def run_one_primary_with_cascade(
             "sample_gun_incidence_sampler_used": emission_event_info.get(
                 "sample_gun_incidence_sampler_used", False
             ),
+            "sample_gun_incidence_actual_angle_deg": emission_event_info.get(
+                "sample_gun_incidence_actual_angle_deg", np.nan
+            ),
             "sample_gun_incidence_sampler_angle_deg": emission_event_info.get(
                 "sample_gun_incidence_sampler_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_delta_deg": emission_event_info.get(
+                "sample_gun_incidence_sampler_delta_deg", np.nan
+            ),
+            "sample_gun_incidence_selection": emission_event_info.get(
+                "sample_gun_incidence_selection", None
             ),
             "sample_gun_incidence_sampler_source": emission_event_info.get(
                 "sample_gun_incidence_sampler_source", None
@@ -1428,6 +1486,18 @@ def cascade_results_to_dataframe(
             ),
             "sample_gun_incidence_sampler_used": bool(
                 res.get("sample_gun_incidence_sampler_used", False)
+            ),
+            "sample_gun_incidence_actual_angle_deg": res.get(
+                "sample_gun_incidence_actual_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_angle_deg": res.get(
+                "sample_gun_incidence_sampler_angle_deg", np.nan
+            ),
+            "sample_gun_incidence_sampler_delta_deg": res.get(
+                "sample_gun_incidence_sampler_delta_deg", np.nan
+            ),
+            "sample_gun_incidence_selection": res.get(
+                "sample_gun_incidence_selection", None
             ),
             "sample_gun_joint_sampler_used": bool(
                 res.get("sample_gun_joint_sampler_used", False)
@@ -2001,6 +2071,59 @@ def run_cascade_batch_parallel(
                     "    WARNING: no joint emitted-event sampler loaded; "
                     "oblique azimuth is still the legacy conditional-uniform model"
                 )
+
+    # Multi-angle catalog: unlike the legacy single-angle API, do not compare
+    # sampler angle to the mechanical sample rotation here.  The electrostatic
+    # field can deflect a grazing primary appreciably before impact, so
+    # generate_surface_emissions() selects/brackets the catalog per actual hit.
+    sample_gun_catalogs = {
+        "yield": yield_models.get("sample", {}).get("gun_incidence_catalog", None),
+        "energy": energy_models.get("sample", {}).get("gun_incidence_catalog", None),
+        "theta": theta_models.get("sample", {}).get("gun_incidence_catalog", None),
+    }
+    catalog_configured = [cfg is not None for cfg in sample_gun_catalogs.values()]
+    if any(catalog_configured):
+        if not all(catalog_configured):
+            raise ValueError(
+                "sample gun-incidence catalog must be present in yield, energy, "
+                "and theta model dictionaries"
+            )
+        catalog_angles = [
+            tuple(float(a) for a in cfg.get("available_angles_deg", ()))
+            for cfg in sample_gun_catalogs.values()
+        ]
+        if not (catalog_angles[0] == catalog_angles[1] == catalog_angles[2]):
+            raise ValueError("sample gun-incidence catalog angles are inconsistent")
+        catalog_modes = [
+            str(cfg.get("selection", "stochastic_bracket"))
+            for cfg in sample_gun_catalogs.values()
+        ]
+        if not (catalog_modes[0] == catalog_modes[1] == catalog_modes[2]):
+            raise ValueError(
+                "sample gun-incidence catalog selection modes are inconsistent"
+            )
+        catalog_tolerances = [
+            float(cfg.get("angle_tolerance_deg", 0.5))
+            for cfg in sample_gun_catalogs.values()
+        ]
+        if not np.allclose(
+            catalog_tolerances, catalog_tolerances[0], rtol=0.0, atol=1.0e-12
+        ):
+            raise ValueError(
+                "sample gun-incidence catalog tolerances are inconsistent"
+            )
+        if verbose:
+            print(
+                "[cascade] sample gun-incidence catalog: "
+                f"angles={catalog_angles[0]}, "
+                f"selection={catalog_modes[0]}, "
+                f"endpoint tolerance={catalog_tolerances[0]:g} deg"
+            )
+            print(
+                "    selection uses actual primary impact angle after field "
+                "deflection; joint directions are reconstructed about the "
+                "actual primary beam-back axis"
+            )
 
     sample_x = float(field.get("sample_x", 0.0))
     explicit_face_center = field.get("sample_face_center", None)
