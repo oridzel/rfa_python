@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import os
 import warnings
 
 import numpy as np
@@ -190,6 +191,19 @@ SAMPLE_GUN_JOINT_FILENAMES = {
     "BSE": "BSEJointFromPlaneSampler_uncoatedCuFPA.npz",
     "SE": "SEJointFromPlaneSampler_uncoatedCuFPA.npz",
 }
+
+# Optional SEEMC replacement models for RFA hardware. These are deliberately
+# opt-in so legacy runs are unchanged unless the corresponding directory is
+# supplied to load_default_surface_models().
+SEEMC_PLANE_SEY_FILENAME = "SEYFromPlane_SEVaccum_t0nmCuFPA.csv"
+SEEMC_PLANE_BSEY_FILENAME = "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"
+
+# Joint NPZ files are large (the complete Ti library can be several GB). Do
+# not load all incidence angles into every joblib worker. Each worker lazily
+# loads only the NPZ files it actually touches and retains a tiny LRU cache.
+JOINT_SAMPLER_CACHE_MAX_FILES = 2
+_JOINT_SAMPLER_CACHE = {}
+_JOINT_SAMPLER_CACHE_ORDER = []
 
 # The RFA coordinate convention has +X pointing from the sample toward the
 # drift tube/electron gun.  The tilted JMONSEL theta tables are explicitly
@@ -578,6 +592,276 @@ def load_joint_emission_sampler_npz(path: str | Path) -> dict:
             "beam_back, toward_sample_normal_in_incidence_plane, side"
         ),
     }
+
+
+
+def _resolve_generated_plane_file(directory: str | Path, kind: str) -> Path:
+    """Resolve one generated SEEMC plane-sampler file robustly.
+
+    Historical generators kept ``CuFPA`` in several filenames even when
+    the material was Ti or C. Newer joint files may be material-aware.
+    """
+    directory = Path(directory)
+    kind = str(kind).upper()
+
+    if kind == "SEY":
+        path = directory / SEEMC_PLANE_SEY_FILENAME
+        if path.is_file():
+            return path
+        matches = sorted(directory.glob("SEYFromPlane*.csv"))
+    elif kind == "BSEY":
+        path = directory / SEEMC_PLANE_BSEY_FILENAME
+        if path.is_file():
+            return path
+        matches = sorted(directory.glob("BSEYFromPlane*.csv"))
+    elif kind == "SE_JOINT":
+        matches = sorted(directory.glob("SEJointFromPlaneSampler*.npz"))
+    elif kind == "BSE_JOINT":
+        matches = sorted(directory.glob("BSEJointFromPlaneSampler*.npz"))
+    else:
+        raise ValueError(f"unknown generated plane file kind: {kind}")
+
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"Expected exactly one {kind} file in {directory}; found "
+            f"{[m.name for m in matches]}"
+        )
+    return matches[0]
+
+
+def _parse_alpha_directory_name(name: str) -> float | None:
+    """Return incidence angle encoded by alpha_75deg / alpha_7p5deg."""
+    name = str(name)
+    if not (name.startswith("alpha_") and name.endswith("deg")):
+        return None
+    token = name[len("alpha_"):-len("deg")].replace("p", ".")
+    try:
+        angle = float(token)
+    except ValueError:
+        return None
+    if not np.isfinite(angle) or angle < 0.0 or angle >= 90.0:
+        return None
+    return angle
+
+
+def _tag_curve_source(
+    model: dict,
+    source: str,
+    geometry: str | None = None,
+) -> dict:
+    out = dict(model)
+    out["source"] = str(source)
+    if geometry is not None:
+        out["geometry"] = str(geometry)
+    return out
+
+
+def load_ti_receiver_joint_library(sampler_root: str | Path) -> dict:
+    """Load yields/paths for the angle-resolved Ti receiver library.
+
+    Joint NPZ contents are intentionally not loaded here because the full
+    Ti library can be several GB. Only paths are kept in the model passed
+    to workers; individual NPZ files are loaded lazily when first needed.
+    """
+    root = Path(sampler_root)
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"Ti receiver sampler directory not found: {root}"
+        )
+
+    angle_models = []
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir():
+            continue
+        angle = _parse_alpha_directory_name(directory.name)
+        if angle is None:
+            continue
+
+        sey_path = _resolve_generated_plane_file(directory, "SEY")
+        bsey_path = _resolve_generated_plane_file(directory, "BSEY")
+        se_joint_path = _resolve_generated_plane_file(directory, "SE_JOINT")
+        bse_joint_path = _resolve_generated_plane_file(directory, "BSE_JOINT")
+
+        sey = load_yield_curve_csv(sey_path)
+        bsey = load_yield_curve_csv(bsey_path)
+        if sey["E"].shape != bsey["E"].shape or not np.allclose(
+            sey["E"], bsey["E"], rtol=0.0, atol=1.0e-12
+        ):
+            raise ValueError(
+                f"Ti SEY/BSEY energy grids do not match in {directory}"
+            )
+
+        angle_models.append({
+            "angle_deg": float(angle),
+            "source_dir": directory.name,
+            "yield": {
+                "SEY": _tag_curve_source(
+                    sey,
+                    f"{root.name}/{directory.name}/{sey_path.name}",
+                    geometry="angle_resolved_joint",
+                ),
+                "BSEY": _tag_curve_source(
+                    bsey,
+                    f"{root.name}/{directory.name}/{bsey_path.name}",
+                    geometry="angle_resolved_joint",
+                ),
+            },
+            "joint_paths": {
+                "SE": se_joint_path,
+                "BSE": bse_joint_path,
+            },
+        })
+
+    if not angle_models:
+        raise FileNotFoundError(
+            f"No alpha_*deg sampler folders found in {root}"
+        )
+
+    angle_models.sort(key=lambda m: m["angle_deg"])
+    angles = np.asarray(
+        [m["angle_deg"] for m in angle_models], dtype=float
+    )
+    if np.any(np.diff(angles) <= 0.0):
+        raise ValueError(
+            "Ti receiver sampler angles must be strictly increasing"
+        )
+    if not np.isclose(angles[0], 0.0, rtol=0.0, atol=1.0e-12):
+        raise ValueError(
+            "Ti receiver sampler library must contain alpha_0deg"
+        )
+
+    return {
+        "material": "Ti",
+        "angles_deg": angles,
+        "angle_models": angle_models,
+        "source_root": str(root),
+        "angle_interpolation": (
+            "linear_yield_stochastic_joint_mixture"
+        ),
+        "joint_loading": "lazy_LRU",
+    }
+
+
+def _load_joint_sampler_cached(path: str | Path) -> dict:
+    """Load one large joint NPZ with a process-local tiny LRU cache."""
+    path = Path(path)
+    try:
+        key = str(path.resolve())
+    except OSError:
+        key = str(path)
+
+    if key in _JOINT_SAMPLER_CACHE:
+        if key in _JOINT_SAMPLER_CACHE_ORDER:
+            _JOINT_SAMPLER_CACHE_ORDER.remove(key)
+        _JOINT_SAMPLER_CACHE_ORDER.append(key)
+        return _JOINT_SAMPLER_CACHE[key]
+
+    model = load_joint_emission_sampler_npz(path)
+    _JOINT_SAMPLER_CACHE[key] = model
+    _JOINT_SAMPLER_CACHE_ORDER.append(key)
+
+    while len(_JOINT_SAMPLER_CACHE_ORDER) > JOINT_SAMPLER_CACHE_MAX_FILES:
+        old = _JOINT_SAMPLER_CACHE_ORDER.pop(0)
+        _JOINT_SAMPLER_CACHE.pop(old, None)
+
+    return model
+
+
+def _receiver_angle_bracket(library: dict, theta_deg: float):
+    angles = np.asarray(library["angles_deg"], dtype=float)
+    models = library["angle_models"]
+    theta = float(np.clip(float(theta_deg), angles[0], angles[-1]))
+
+    ihi = int(np.searchsorted(angles, theta, side="left"))
+    if ihi <= 0:
+        return models[0], models[0], 0.0
+    if ihi >= len(angles):
+        return models[-1], models[-1], 0.0
+    if np.isclose(theta, angles[ihi], rtol=0.0, atol=1.0e-12):
+        return models[ihi], models[ihi], 0.0
+
+    ilo = ihi - 1
+    w = float(
+        (theta - angles[ilo]) / (angles[ihi] - angles[ilo])
+    )
+    return models[ilo], models[ihi], w
+
+
+def interp_ti_receiver_yield(
+    library: dict,
+    Einc: float,
+    theta_deg: float,
+    kind: str,
+) -> float:
+    """Interpolate Ti receiver SEY/BSEY in angle and incident energy."""
+    kind = str(kind).upper()
+    if kind not in ("SEY", "BSEY"):
+        raise ValueError(f"unknown Ti receiver yield kind: {kind}")
+
+    lo, hi, w = _receiver_angle_bracket(library, theta_deg)
+    ylo = interp_yield_model(lo["yield"][kind], Einc)
+    if hi is lo:
+        return max(0.0, float(ylo))
+    yhi = interp_yield_model(hi["yield"][kind], Einc)
+    return max(0.0, float((1.0 - w) * ylo + w * yhi))
+
+
+def sample_ti_receiver_joint_event(
+    library: dict,
+    Einc: float,
+    theta_deg: float,
+    kind: str,
+    rng,
+) -> dict:
+    """Draw one Ti joint event from the bracketing alpha folders.
+
+    Mixing complete events stochastically preserves the E-theta-phi
+    correlation; individual direction/energy components are never
+    interpolated independently.
+    """
+    kind = str(kind).upper()
+    if kind not in ("SE", "BSE"):
+        raise ValueError(f"unknown Ti receiver emission kind: {kind}")
+
+    lo, hi, w = _receiver_angle_bracket(library, theta_deg)
+    chosen = hi if (hi is not lo and rng.random() < w) else lo
+    joint = _load_joint_sampler_cached(chosen["joint_paths"][kind])
+    event = dict(sample_joint_emission_event(joint, Einc=Einc, rng=rng))
+    event["sampler_incidence_angle_deg"] = float(chosen["angle_deg"])
+    event["sampler_angle_source_dir"] = str(chosen["source_dir"])
+    return event
+
+
+def load_seemc_carbon_yield_pair(
+    yield_dir: str | Path,
+) -> tuple[dict, dict]:
+    """Load the new SEEMC carbon normal-incidence yields only.
+
+    Existing RFA carbon emitted-energy and emitted-angle distributions are
+    intentionally left untouched for this first sensitivity test.
+    """
+    directory = Path(yield_dir)
+    if not directory.is_dir():
+        raise FileNotFoundError(
+            f"carbon SEEMC yield directory not found: {directory}"
+        )
+    sey_path = _resolve_generated_plane_file(directory, "SEY")
+    bsey_path = _resolve_generated_plane_file(directory, "BSEY")
+    sey = load_yield_curve_csv(sey_path)
+    bsey = load_yield_curve_csv(bsey_path)
+    source_prefix = f"SEEMC C yields {directory.name}"
+    return (
+        _tag_curve_source(
+            sey,
+            f"{source_prefix}/{sey_path.name}",
+            geometry="plane",
+        ),
+        _tag_curve_source(
+            bsey,
+            f"{source_prefix}/{bsey_path.name}",
+            geometry="plane",
+        ),
+    )
 
 
 def load_sample_gun_incidence_model(
@@ -1049,6 +1333,8 @@ def load_default_surface_models(
     sample_gun_incidence_angle_deg: float = 75.0,
     sample_gun_incidence_tolerance_deg: float = 0.5,
     require_sample_gun_joint_sampler: bool = False,
+    receiver_ti_sampler_dir: str | Path | None = None,
+    carbon_seemc_yield_dir: str | Path | None = None,
 ) -> tuple[dict, dict, dict]:
     """
     Load the same surface models used in the MATLAB setup.
@@ -1109,12 +1395,34 @@ def load_default_surface_models(
         present in ``sample_gun_incidence_dir``.  This is recommended for
         oblique-incidence production runs because the legacy theta-only path
         must invent an azimuth and cannot preserve theta-phi correlation.
+    receiver_ti_sampler_dir:
+        Optional root of the new angle-resolved Ti receiver library containing
+        ``alpha_*deg`` folders. When supplied, receiver SEY/BSEY and correlated
+        E/theta/phi distributions come from this library over the full incident
+        energy/angle range. Large joint NPZs are loaded lazily per worker.
+    carbon_seemc_yield_dir:
+        Optional directory containing the new normal-incidence SEEMC carbon
+        SEY/BSEY CSVs. When supplied, these yields replace the carbon-coated
+        grid meshes, grid frames, collector, rod and drift-tube yields. Their
+        existing JMONSEL emitted-energy and emitted-angle distributions remain
+        unchanged. This option takes precedence over measured-carbon switches.
 
     Returns
     -------
     yield_models, energy_models, theta_models
     """
     model_dir = Path(model_dir)
+
+    # Environment-variable activation is useful for existing runners that do
+    # not yet pass the two new keyword arguments. Explicit args take priority.
+    if receiver_ti_sampler_dir is None:
+        receiver_ti_sampler_dir = (
+            os.environ.get("RFA_TI_RECEIVER_SAMPLER_DIR") or None
+        )
+    if carbon_seemc_yield_dir is None:
+        carbon_seemc_yield_dir = (
+            os.environ.get("RFA_CARBON_SEEMC_YIELD_DIR") or None
+        )
 
     if sample_gun_incidence_dir is not None:
         sample_gun_incidence_dir = Path(sample_gun_incidence_dir)
@@ -1203,7 +1511,11 @@ def load_default_surface_models(
         model_dir / "SEYFromPlane_glassyCarbon_t150000nmCuFPA.csv"
     )
 
-    if use_measured_carbon_coating:
+    if carbon_seemc_yield_dir is not None:
+        collector_sey, collector_bsey = load_seemc_carbon_yield_pair(
+            carbon_seemc_yield_dir
+        )
+    elif use_measured_carbon_coating:
         measured_carbon_bsey = load_yield_curve_csv(
             model_dir / MEASURED_CARBON_BSEY_FILENAME
         )
@@ -1249,7 +1561,14 @@ def load_default_surface_models(
     grid_bsey_jmonsel = dict(grid_bsey_jmonsel, geometry="wire")
     grid_sey_jmonsel = dict(grid_sey_jmonsel, geometry="wire")
 
-    if use_measured_carbon_for_grids:
+    if carbon_seemc_yield_dir is not None:
+        # New SEEMC carbon yields provide only the absolute yield magnitude.
+        # Keep all existing carbon energy/theta distributions unchanged.
+        grid_bsey = dict(collector_bsey, geometry="plane")
+        grid_sey = dict(collector_sey, geometry="plane")
+        gridframe_bsey = dict(collector_bsey, geometry="plane")
+        gridframe_sey = dict(collector_sey, geometry="plane")
+    elif use_measured_carbon_for_grids:
         if not use_measured_carbon_coating:
             raise ValueError(
                 "use_measured_carbon_for_grids=True requires "
@@ -1315,6 +1634,15 @@ def load_default_surface_models(
             "SEY": collector_sey,
         },
     }
+
+    if receiver_ti_sampler_dir is not None:
+        ti_library = load_ti_receiver_joint_library(receiver_ti_sampler_dir)
+        zero_model = ti_library["angle_models"][0]
+        yield_models["receiver"] = {
+            "SEY": dict(zero_model["yield"]["SEY"]),
+            "BSEY": dict(zero_model["yield"]["BSEY"]),
+            "ti_joint_library": ti_library,
+        }
 
     if sample_gun_incidence_dir is not None:
         incidence_model = load_sample_gun_incidence_model(
@@ -1622,6 +1950,28 @@ def sample_surface_event(
     else:
         sey_mdl = yield_models[model_key]["SEY"]
         bsey_mdl = yield_models[model_key]["BSEY"]
+
+    # The Ti receiver library already contains incidence-angle dependence and
+    # the low-energy reflection branch. Do not add the generic secant gain or
+    # apply the legacy Einc <= 50 eV BSE suppression on this path.
+    ti_receiver_library = (
+        yield_models.get("receiver", {}).get("ti_joint_library", None)
+        if surf == "receiver"
+        else None
+    )
+    if ti_receiver_library is not None:
+        theta_deg = float(np.degrees(np.arccos(
+            np.clip(float(cos_theta), 0.0, 1.0)
+        )))
+        sey_val = interp_ti_receiver_yield(
+            ti_receiver_library, Einc, theta_deg, "SEY"
+        )
+        bsey_val = interp_ti_receiver_yield(
+            ti_receiver_library, Einc, theta_deg, "BSEY"
+        )
+        Nbse = _sample_integer_count_from_mean(bsey_val, rng)
+        Nse = int(rng.poisson(max(0.0, float(sey_val))))
+        return int(Nbse), int(Nse)
 
     sey_base = interp_yield_model(sey_mdl, Einc)
     bsey_base = interp_yield_model(bsey_mdl, Einc)
@@ -2134,6 +2484,27 @@ def launch_sample_electron_joint(
     return speed * direction, outward_cosine
 
 
+
+def launch_generic_surface_electron_joint(
+    direction_local,
+    Eout_eV: float,
+    v_in,
+    n_out,
+) -> tuple[np.ndarray, float]:
+    """Rotate one plane-library joint event onto an arbitrary RFA surface.
+
+    The joint files use the basis (beam_back, toward_normal, side), where
+    beam_back is opposite the incident ray. Rebuilding that basis from the
+    actual impact preserves the correlated emitted energy and direction.
+    """
+    return launch_sample_electron_joint(
+        direction_local=direction_local,
+        Eout_eV=Eout_eV,
+        beam_back_axis=-unit(v_in),
+        n_out=n_out,
+    )
+
+
 def launch_surface_electron(
     theta_rad: float,
     phi_rad: float,
@@ -2251,6 +2622,12 @@ def generate_surface_emissions(
         "sample_gun_joint_sampler_used": False,
         "sample_gun_joint_sampler_source": None,
         "sample_gun_azimuth_model": None,
+        "receiver_ti_joint_sampler_used": False,
+        "receiver_ti_incidence_angle_deg": np.nan,
+        "receiver_ti_sampler_angle_deg": np.nan,
+        "receiver_ti_joint_sampler_source": None,
+        "receiver_ti_sey_mean_used": np.nan,
+        "receiver_ti_bsey_mean_used": np.nan,
     }
 
     surface_name = canonical_surface_name(surface_name)
@@ -2284,6 +2661,30 @@ def generate_surface_emissions(
     # angular_yield_gain() is already capped safely, while the Cu sample now
     # needs the actual angle to query the JMONSEL angular table.
     cos_theta = float(np.clip(-float(np.dot(vhat, n_out)), 0.0, 1.0))
+
+    receiver_ti_library = (
+        yield_models.get("receiver", {}).get("ti_joint_library", None)
+        if surf == "receiver"
+        else None
+    )
+    receiver_incidence_theta_deg = float(np.degrees(np.arccos(cos_theta)))
+    if receiver_ti_library is not None:
+        event_info.update({
+            "receiver_ti_joint_sampler_used": True,
+            "receiver_ti_incidence_angle_deg": receiver_incidence_theta_deg,
+            "receiver_ti_sey_mean_used": interp_ti_receiver_yield(
+                receiver_ti_library,
+                Einc,
+                receiver_incidence_theta_deg,
+                "SEY",
+            ),
+            "receiver_ti_bsey_mean_used": interp_ti_receiver_yield(
+                receiver_ti_library,
+                Einc,
+                receiver_incidence_theta_deg,
+                "BSEY",
+            ),
+        })
 
     sample_yield_override = None
     sample_energy_override = None
@@ -2477,7 +2878,22 @@ def generate_surface_emissions(
         joint_energy_raw = np.nan
         joint_energy_clipped = False
 
-        if use_sample_gun_incidence and sample_joint_override is not None:
+        if receiver_ti_library is not None:
+            joint_event = sample_ti_receiver_joint_event(
+                receiver_ti_library,
+                Einc=Einc,
+                theta_deg=receiver_incidence_theta_deg,
+                kind="BSE",
+                rng=rng,
+            )
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            E_bse = float(np.clip(
+                joint_energy_raw, min(50.0, Einc), Einc
+            ))
+            joint_energy_clipped = not np.isclose(
+                E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
+        elif use_sample_gun_incidence and sample_joint_override is not None:
             joint_event = sample_joint_emission_event(
                 sample_joint_override["BSE"], Einc=Einc, rng=rng
             )
@@ -2538,7 +2954,55 @@ def generate_surface_emissions(
         # Apply launch-point potential correction to kinetic energy.
         E_bse_launch = max(E_bse + phi_correction, 1.0e-3)
 
-        if joint_event is not None:
+        if joint_event is not None and receiver_ti_library is not None:
+            # Stochastic angle interpolation can select a neighboring alpha
+            # folder. A rare near-tangent event may then become inward at the
+            # actual incidence angle; resample the complete correlated event
+            # (including its energy) rather than reflecting or clamping it.
+            for _joint_try in range(64):
+                joint_energy_raw = float(joint_event["Eout_eV"])
+                E_bse = float(np.clip(
+                    joint_energy_raw, min(50.0, Einc), Einc
+                ))
+                joint_energy_clipped = not np.isclose(
+                    E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
+                )
+                E_bse_launch = max(E_bse + phi_correction, 1.0e-3)
+                theta_bs = float(joint_event["theta_rad"])
+                phi_bs = float(joint_event["phi_rad"])
+                try:
+                    v_bse, emission_outward_cosine = (
+                        launch_generic_surface_electron_joint(
+                            direction_local=joint_event["direction_local"],
+                            Eout_eV=E_bse_launch,
+                            v_in=v_in,
+                            n_out=n_out,
+                        )
+                    )
+                    break
+                except ValueError:
+                    joint_event = sample_ti_receiver_joint_event(
+                        receiver_ti_library,
+                        Einc=Einc,
+                        theta_deg=receiver_incidence_theta_deg,
+                        kind="BSE",
+                        rng=rng,
+                    )
+            else:
+                raise RuntimeError(
+                    "could not draw an outward Ti receiver BSE joint event "
+                    "after 64 attempts"
+                )
+            emission_polar_axis = "receiver_incident_beam_back_joint"
+            p0_bse = p0_surface
+            event_info["receiver_ti_sampler_angle_deg"] = float(
+                joint_event["sampler_incidence_angle_deg"]
+            )
+            event_info["receiver_ti_joint_sampler_source"] = str(
+                joint_event.get("source", "<joint sampler>")
+            )
+
+        elif joint_event is not None:
             v_bse, emission_outward_cosine = launch_sample_electron_joint(
                 direction_local=joint_event["direction_local"],
                 Eout_eV=E_bse_launch,
@@ -2613,9 +3077,23 @@ def generate_surface_emissions(
             "emission_mu_toward_normal": float(dloc[1]),
             "emission_mu_side": float(dloc[2]),
             "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
-            "sample_gun_joint_sampler_used": bool(joint_event is not None),
+            "sample_gun_joint_sampler_used": bool(
+                joint_event is not None and receiver_ti_library is None
+            ),
             "sample_gun_joint_sampler_source": (
-                None if joint_event is None else joint_event.get("source", None)
+                None
+                if (joint_event is None or receiver_ti_library is not None)
+                else joint_event.get("source", None)
+            ),
+            "receiver_ti_joint_sampler_used": bool(
+                joint_event is not None and receiver_ti_library is not None
+            ),
+            "receiver_ti_sampler_angle_deg": (
+                np.nan if receiver_ti_library is None else float(
+                    joint_event.get(
+                        "sampler_incidence_angle_deg", np.nan
+                    )
+                )
             ),
             "joint_sampler_incident_energy_eV": (
                 np.nan
@@ -2639,7 +3117,23 @@ def generate_surface_emissions(
         joint_energy_raw = np.nan
         joint_energy_clipped = False
 
-        if use_sample_gun_incidence and sample_joint_override is not None:
+        if receiver_ti_library is not None:
+            joint_event = sample_ti_receiver_joint_event(
+                receiver_ti_library,
+                Einc=Einc,
+                theta_deg=receiver_incidence_theta_deg,
+                kind="SE",
+                rng=rng,
+            )
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            Ehi = min(50.0, Einc)
+            E_se = float(np.clip(
+                joint_energy_raw, min(0.01, Ehi), Ehi
+            ))
+            joint_energy_clipped = not np.isclose(
+                E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
+        elif use_sample_gun_incidence and sample_joint_override is not None:
             joint_event = sample_joint_emission_event(
                 sample_joint_override["SE"], Einc=Einc, rng=rng
             )
@@ -2692,7 +3186,52 @@ def generate_surface_emissions(
 
         E_se_launch = max(E_se + phi_correction, 1.0e-3)
 
-        if joint_event is not None:
+        if joint_event is not None and receiver_ti_library is not None:
+            for _joint_try in range(64):
+                joint_energy_raw = float(joint_event["Eout_eV"])
+                Ehi = min(50.0, Einc)
+                E_se = float(np.clip(
+                    joint_energy_raw, min(0.01, Ehi), Ehi
+                ))
+                joint_energy_clipped = not np.isclose(
+                    E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+                )
+                E_se_launch = max(E_se + phi_correction, 1.0e-3)
+                theta_se = float(joint_event["theta_rad"])
+                phi_se = float(joint_event["phi_rad"])
+                try:
+                    v_se, emission_outward_cosine = (
+                        launch_generic_surface_electron_joint(
+                            direction_local=joint_event["direction_local"],
+                            Eout_eV=E_se_launch,
+                            v_in=v_in,
+                            n_out=n_out,
+                        )
+                    )
+                    break
+                except ValueError:
+                    joint_event = sample_ti_receiver_joint_event(
+                        receiver_ti_library,
+                        Einc=Einc,
+                        theta_deg=receiver_incidence_theta_deg,
+                        kind="SE",
+                        rng=rng,
+                    )
+            else:
+                raise RuntimeError(
+                    "could not draw an outward Ti receiver SE joint event "
+                    "after 64 attempts"
+                )
+            emission_polar_axis = "receiver_incident_beam_back_joint"
+            p0_se = p0_surface
+            event_info["receiver_ti_sampler_angle_deg"] = float(
+                joint_event["sampler_incidence_angle_deg"]
+            )
+            event_info["receiver_ti_joint_sampler_source"] = str(
+                joint_event.get("source", "<joint sampler>")
+            )
+
+        elif joint_event is not None:
             v_se, emission_outward_cosine = launch_sample_electron_joint(
                 direction_local=joint_event["direction_local"],
                 Eout_eV=E_se_launch,
@@ -2767,9 +3306,23 @@ def generate_surface_emissions(
             "emission_mu_toward_normal": float(dloc[1]),
             "emission_mu_side": float(dloc[2]),
             "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
-            "sample_gun_joint_sampler_used": bool(joint_event is not None),
+            "sample_gun_joint_sampler_used": bool(
+                joint_event is not None and receiver_ti_library is None
+            ),
             "sample_gun_joint_sampler_source": (
-                None if joint_event is None else joint_event.get("source", None)
+                None
+                if (joint_event is None or receiver_ti_library is not None)
+                else joint_event.get("source", None)
+            ),
+            "receiver_ti_joint_sampler_used": bool(
+                joint_event is not None and receiver_ti_library is not None
+            ),
+            "receiver_ti_sampler_angle_deg": (
+                np.nan if receiver_ti_library is None else float(
+                    joint_event.get(
+                        "sampler_incidence_angle_deg", np.nan
+                    )
+                )
             ),
             "joint_sampler_incident_energy_eV": (
                 np.nan
@@ -2817,6 +3370,7 @@ def describe_surface_yields(
         ("drifttube", "drift tube"),
         ("sample", "sample"),
         ("holder", "holder"),
+        ("receiver", "Ti receiver"),
     ]
 
     c_macro = float(np.clip(cos_theta, 0.0, 1.0))
