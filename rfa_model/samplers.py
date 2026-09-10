@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import os
 import warnings
 
 import numpy as np
@@ -193,8 +192,8 @@ SAMPLE_GUN_JOINT_FILENAMES = {
 }
 
 # Optional SEEMC replacement models for RFA hardware. These are deliberately
-# opt-in so legacy runs are unchanged unless the corresponding directory is
-# supplied to load_default_surface_models().
+# opt-in so legacy runs are unchanged unless ``sampler_library_dir`` (or an
+# explicit per-material directory) is supplied to load_default_surface_models().
 SEEMC_PLANE_SEY_FILENAME = "SEYFromPlane_SEVaccum_t0nmCuFPA.csv"
 SEEMC_PLANE_BSEY_FILENAME = "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"
 
@@ -1333,6 +1332,7 @@ def load_default_surface_models(
     sample_gun_incidence_angle_deg: float = 75.0,
     sample_gun_incidence_tolerance_deg: float = 0.5,
     require_sample_gun_joint_sampler: bool = False,
+    sampler_library_dir: str | Path | None = None,
     receiver_ti_sampler_dir: str | Path | None = None,
     carbon_seemc_yield_dir: str | Path | None = None,
 ) -> tuple[dict, dict, dict]:
@@ -1395,17 +1395,30 @@ def load_default_surface_models(
         present in ``sample_gun_incidence_dir``.  This is recommended for
         oblique-incidence production runs because the legacy theta-only path
         must invent an azimuth and cannot preserve theta-phi correlation.
+    sampler_library_dir:
+        Optional root of the generated sampler library. With the directory
+        layout used by the current project, this automatically activates:
+
+            sampler_library/Ti/alpha_*deg
+                -> full angle-resolved Ti receiver yields + joint E/direction
+
+            sampler_library/C/alpha_0deg
+                -> new normal-incidence carbon SEY/BSEY only
+
+        Carbon emitted-energy and emitted-angle distributions continue to come
+        from ``model_dir`` (the historical JMONSEL tables). Cu/sample behavior
+        is not changed by this option.
     receiver_ti_sampler_dir:
-        Optional root of the new angle-resolved Ti receiver library containing
-        ``alpha_*deg`` folders. When supplied, receiver SEY/BSEY and correlated
-        E/theta/phi distributions come from this library over the full incident
-        energy/angle range. Large joint NPZs are loaded lazily per worker.
+        Optional explicit override for the Ti root. If omitted and
+        ``sampler_library_dir`` is supplied, ``sampler_library_dir / "Ti"`` is
+        used. The Ti joint NPZs are loaded lazily per worker.
     carbon_seemc_yield_dir:
-        Optional directory containing the new normal-incidence SEEMC carbon
-        SEY/BSEY CSVs. When supplied, these yields replace the carbon-coated
-        grid meshes, grid frames, collector, rod and drift-tube yields. Their
-        existing JMONSEL emitted-energy and emitted-angle distributions remain
-        unchanged. This option takes precedence over measured-carbon switches.
+        Optional explicit override for the carbon normal-incidence yield folder.
+        If omitted and ``sampler_library_dir`` is supplied,
+        ``sampler_library_dir / "C" / "alpha_0deg"`` is used. Only SEY/BSEY
+        are replaced; existing JMONSEL carbon emitted-energy and emitted-angle
+        distributions remain unchanged. These yields apply to grid meshes, grid
+        frames, collector, rod and drift tube.
 
     Returns
     -------
@@ -1413,16 +1426,25 @@ def load_default_surface_models(
     """
     model_dir = Path(model_dir)
 
-    # Environment-variable activation is useful for existing runners that do
-    # not yet pass the two new keyword arguments. Explicit args take priority.
-    if receiver_ti_sampler_dir is None:
-        receiver_ti_sampler_dir = (
-            os.environ.get("RFA_TI_RECEIVER_SAMPLER_DIR") or None
-        )
-    if carbon_seemc_yield_dir is None:
-        carbon_seemc_yield_dir = (
-            os.environ.get("RFA_CARBON_SEEMC_YIELD_DIR") or None
-        )
+    # Clean project-level activation.  The generated libraries live beside the
+    # historical JMONSEL folder and are discovered from one root path.  Explicit
+    # per-material paths remain available as overrides, but no environment
+    # variables or hard-coded absolute paths are required.
+    if sampler_library_dir is not None:
+        sampler_library_dir = Path(sampler_library_dir)
+        if not sampler_library_dir.is_dir():
+            raise FileNotFoundError(
+                f"sampler library directory not found: {sampler_library_dir}"
+            )
+        if receiver_ti_sampler_dir is None:
+            receiver_ti_sampler_dir = sampler_library_dir / "Ti"
+        if carbon_seemc_yield_dir is None:
+            carbon_seemc_yield_dir = sampler_library_dir / "C" / "alpha_0deg"
+
+    if receiver_ti_sampler_dir is not None:
+        receiver_ti_sampler_dir = Path(receiver_ti_sampler_dir)
+    if carbon_seemc_yield_dir is not None:
+        carbon_seemc_yield_dir = Path(carbon_seemc_yield_dir)
 
     if sample_gun_incidence_dir is not None:
         sample_gun_incidence_dir = Path(sample_gun_incidence_dir)
