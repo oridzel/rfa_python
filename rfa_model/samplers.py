@@ -3454,6 +3454,11 @@ def generate_surface_emissions(
             "sample_cu_joint_sampler_used": bool(
                 joint_event is not None and surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence
             ),
+            "sample_cu_incidence_angle_deg": (
+                float(sample_incidence_theta_deg)
+                if (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
+                else np.nan
+            ),
             "sample_cu_sampler_angle_deg": (
                 np.nan
                 if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
@@ -3463,6 +3468,11 @@ def generate_surface_emissions(
                 None
                 if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
                 else joint_event.get("source", None)
+            ),
+            "sample_cu_sampler_folder": (
+                None
+                if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
+                else joint_event.get("sampler_angle_source_dir", None)
             ),
             "receiver_ti_joint_sampler_used": bool(
                 joint_event is not None and receiver_ti_library is not None
@@ -3761,6 +3771,11 @@ def generate_surface_emissions(
             "sample_cu_joint_sampler_used": bool(
                 joint_event is not None and surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence
             ),
+            "sample_cu_incidence_angle_deg": (
+                float(sample_incidence_theta_deg)
+                if (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
+                else np.nan
+            ),
             "sample_cu_sampler_angle_deg": (
                 np.nan
                 if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
@@ -3770,6 +3785,11 @@ def generate_surface_emissions(
                 None
                 if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
                 else joint_event.get("source", None)
+            ),
+            "sample_cu_sampler_folder": (
+                None
+                if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
+                else joint_event.get("sampler_angle_source_dir", None)
             ),
             "receiver_ti_joint_sampler_used": bool(
                 joint_event is not None and receiver_ti_library is not None

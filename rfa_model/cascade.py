@@ -866,6 +866,18 @@ def run_one_primary_with_cascade(
         "sample_gun_azimuth_model": first_emission_event_info.get(
             "sample_gun_azimuth_model", None
         ),
+        "sample_cu_joint_sampler_used": first_emission_event_info.get(
+            "sample_cu_joint_sampler_used", False
+        ),
+        "sample_cu_incidence_angle_deg": first_emission_event_info.get(
+            "sample_cu_incidence_angle_deg", np.nan
+        ),
+        "sample_cu_sey_mean_used": first_emission_event_info.get(
+            "sample_cu_sey_mean_used", np.nan
+        ),
+        "sample_cu_bsey_mean_used": first_emission_event_info.get(
+            "sample_cu_bsey_mean_used", np.nan
+        ),
     })
 
     for failed in first_launch_failures:
@@ -1015,6 +1027,21 @@ def run_one_primary_with_cascade(
         res["sample_gun_joint_sampler_source"] = e.get(
             "sample_gun_joint_sampler_source", None
         )
+        res["sample_cu_joint_sampler_used"] = bool(
+            e.get("sample_cu_joint_sampler_used", False)
+        )
+        res["sample_cu_incidence_angle_deg"] = e.get(
+            "sample_cu_incidence_angle_deg", np.nan
+        )
+        res["sample_cu_sampler_angle_deg"] = e.get(
+            "sample_cu_sampler_angle_deg", np.nan
+        )
+        res["sample_cu_sampler_folder"] = e.get(
+            "sample_cu_sampler_folder", None
+        )
+        res["sample_cu_joint_sampler_source"] = e.get(
+            "sample_cu_joint_sampler_source", None
+        )
         res["joint_sampler_incident_energy_eV"] = e.get(
             "joint_sampler_incident_energy_eV", np.nan
         )
@@ -1078,6 +1105,21 @@ def run_one_primary_with_cascade(
             ),
             "sample_gun_joint_sampler_source": e.get(
                 "sample_gun_joint_sampler_source", None
+            ),
+            "sample_cu_joint_sampler_used": bool(
+                e.get("sample_cu_joint_sampler_used", False)
+            ),
+            "sample_cu_incidence_angle_deg": e.get(
+                "sample_cu_incidence_angle_deg", np.nan
+            ),
+            "sample_cu_sampler_angle_deg": e.get(
+                "sample_cu_sampler_angle_deg", np.nan
+            ),
+            "sample_cu_sampler_folder": e.get(
+                "sample_cu_sampler_folder", None
+            ),
+            "sample_cu_joint_sampler_source": e.get(
+                "sample_cu_joint_sampler_source", None
             ),
             "joint_sampler_incident_energy_eV": e.get(
                 "joint_sampler_incident_energy_eV", np.nan
@@ -1504,6 +1546,21 @@ def cascade_results_to_dataframe(
             ),
             "sample_gun_joint_sampler_source": res.get(
                 "sample_gun_joint_sampler_source", None
+            ),
+            "sample_cu_joint_sampler_used": bool(
+                res.get("sample_cu_joint_sampler_used", False)
+            ),
+            "sample_cu_incidence_angle_deg": res.get(
+                "sample_cu_incidence_angle_deg", np.nan
+            ),
+            "sample_cu_sampler_angle_deg": res.get(
+                "sample_cu_sampler_angle_deg", np.nan
+            ),
+            "sample_cu_sampler_folder": res.get(
+                "sample_cu_sampler_folder", None
+            ),
+            "sample_cu_joint_sampler_source": res.get(
+                "sample_cu_joint_sampler_source", None
             ),
             "joint_sampler_incident_energy_eV": res.get(
                 "joint_sampler_incident_energy_eV", np.nan
