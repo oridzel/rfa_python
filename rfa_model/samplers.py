@@ -938,6 +938,93 @@ def interp_cu_sample_yield(
 
 
 
+def _cu_joint_event_is_exact_specular(
+    event: dict,
+    sampler_alpha_deg: float,
+) -> bool:
+    """Identify the delta-like specular barrier-reflection branch.
+
+    In the generated plane samplers an exact reflected primary has
+
+        Eout == sampler incident energy
+        direction_local ==
+            (cos(2*alpha), sin(2*alpha), 0)
+
+    in the (beam_back, toward_normal, side) basis.
+
+    This branch must be treated specially when stochastic angle bracketing
+    selects a neighboring alpha folder: the *probability* can be mixed between
+    neighboring folders, but the delta-function specular direction must be
+    reconstructed at the actual RFA incidence angle rather than copied from
+    the selected folder.
+    """
+    alpha = float(sampler_alpha_deg)
+    Etable = float(event["sampler_Einc_eV"])
+    Eout = float(event["Eout_eV"])
+
+    energy_atol = max(1.0e-10, 1.0e-10 * max(1.0, abs(Etable)))
+    if not np.isclose(Eout, Etable, rtol=0.0, atol=energy_atol):
+        return False
+
+    a = np.deg2rad(alpha)
+    expected = np.array([
+        np.cos(2.0 * a),
+        np.sin(2.0 * a),
+        0.0,
+    ], dtype=float)
+    d = unit(np.asarray(event["direction_local"], dtype=float))
+
+    return bool(np.linalg.norm(d - expected) <= 1.0e-8)
+
+
+def _reconstruct_cu_specular_event(
+    event: dict,
+    actual_Einc_eV: float,
+    actual_theta_deg: float,
+) -> dict:
+    """Move a sampled Cu specular event onto the actual RFA collision.
+
+    The stochastic alpha-folder choice is retained as the Monte-Carlo draw
+    controlling the branch probability.  Only the delta-like reflected
+    primary's energy and direction are reconstructed:
+
+        Eout = actual incident energy
+        mu = (cos(2*theta), sin(2*theta), 0)
+
+    The generic joint launcher then rotates this local vector using the actual
+    incoming trajectory and actual surface normal, which is exactly equivalent
+    to v_ref = v_in - 2 (v_in dot n) n.
+    """
+    out = dict(event)
+
+    theta = float(np.clip(float(actual_theta_deg), 0.0, 90.0))
+    a = np.deg2rad(theta)
+    d = unit(np.array([
+        np.cos(2.0 * a),
+        np.sin(2.0 * a),
+        0.0,
+    ], dtype=float))
+
+    sampler_alpha = float(out["sampler_incidence_angle_deg"])
+
+    out["cu_specular_reconstructed"] = True
+    out["cu_specular_sampler_Eout_original_eV"] = float(out["Eout_eV"])
+    out["cu_specular_sampler_direction_original"] = np.asarray(
+        out["direction_local"], dtype=float
+    ).copy()
+    out["cu_specular_actual_incidence_angle_deg"] = theta
+    out["cu_specular_direction_correction_deg"] = float(
+        2.0 * abs(theta - sampler_alpha)
+    )
+
+    out["Eout_eV"] = float(actual_Einc_eV)
+    out["direction_local"] = d
+    out["theta_rad"] = float(np.arccos(np.clip(d[0], -1.0, 1.0)))
+    out["phi_rad"] = float(np.arctan2(d[2], d[1]))
+
+    return out
+
+
 def sample_cu_sample_joint_event(
     library: dict,
     Einc: float,
@@ -945,7 +1032,18 @@ def sample_cu_sample_joint_event(
     kind: str,
     rng,
 ) -> dict:
-    """Draw one Cu joint event from the bracketing alpha folders."""
+    """Draw one Cu joint event from the bracketing alpha folders.
+
+    Non-specular emitted events are used exactly as sampled from the selected
+    neighboring alpha folder.
+
+    Exact specular reflected-primary events are different: their branch
+    probability is still obtained from the stochastic neighboring-folder
+    mixture, but their energy/direction are reconstructed at the *actual*
+    incidence angle and incident energy.  This prevents a 52-degree collision,
+    for example, from being launched at the exact 45- or 60-degree specular
+    direction merely because that neighboring folder happened to be selected.
+    """
     kind = str(kind).upper()
     if kind not in ("SE", "BSE"):
         raise ValueError(f"unknown Cu sample emission kind: {kind}")
@@ -953,9 +1051,23 @@ def sample_cu_sample_joint_event(
     lo, hi, w = _receiver_angle_bracket(library, theta_deg)
     chosen = hi if (hi is not lo and rng.random() < w) else lo
     joint = _load_joint_sampler_cached(chosen["joint_paths"][kind])
+
     event = dict(sample_joint_emission_event(joint, Einc=Einc, rng=rng))
     event["sampler_incidence_angle_deg"] = float(chosen["angle_deg"])
     event["sampler_angle_source_dir"] = str(chosen["source_dir"])
+    event["cu_specular_reconstructed"] = False
+    event["cu_specular_direction_correction_deg"] = 0.0
+
+    if _cu_joint_event_is_exact_specular(
+        event,
+        sampler_alpha_deg=chosen["angle_deg"],
+    ):
+        event = _reconstruct_cu_specular_event(
+            event,
+            actual_Einc_eV=Einc,
+            actual_theta_deg=theta_deg,
+        )
+
     return event
 
 
