@@ -1335,6 +1335,7 @@ def load_default_surface_models(
     sampler_library_dir: str | Path | None = None,
     receiver_ti_sampler_dir: str | Path | None = None,
     carbon_seemc_yield_dir: str | Path | None = None,
+    cu_seemc_yield_dir: str | Path | None = None,
 ) -> tuple[dict, dict, dict]:
     """
     Load the same surface models used in the MATLAB setup.
@@ -1405,9 +1406,16 @@ def load_default_surface_models(
             sampler_library/C/alpha_0deg
                 -> new normal-incidence carbon SEY/BSEY only
 
+            sampler_library/Cu/alpha_0deg
+                -> new normal-incidence Cu SEY/BSEY only, when present
+
         Carbon emitted-energy and emitted-angle distributions continue to come
-        from ``model_dir`` (the historical JMONSEL tables). Cu/sample behavior
-        is not changed by this option.
+        from ``model_dir`` (the historical JMONSEL tables). For Cu, only the
+        absolute normal-incidence SEY/BSEY curves are replaced at this stage;
+        the existing Cu energy/theta distributions and angular-yield gain table
+        remain active. Thus a 0-degree gun run uses the new Cu yield exactly,
+        while oblique re-impacts use the old angular gain on top of that new
+        normal-incidence normalization.
     receiver_ti_sampler_dir:
         Optional explicit override for the Ti root. If omitted and
         ``sampler_library_dir`` is supplied, ``sampler_library_dir / "Ti"`` is
@@ -1419,6 +1427,12 @@ def load_default_surface_models(
         are replaced; existing JMONSEL carbon emitted-energy and emitted-angle
         distributions remain unchanged. These yields apply to grid meshes, grid
         frames, collector, rod and drift tube.
+    cu_seemc_yield_dir:
+        Optional explicit override for a generated normal-incidence Cu yield
+        folder. If omitted and ``sampler_library_dir / "Cu" / "alpha_0deg"``
+        exists, that folder is used automatically. Only the Cu sample SEY/BSEY
+        normalization is replaced. Existing JMONSEL Cu emitted-energy/theta
+        distributions and the existing incidence-angle gain table remain in use.
 
     Returns
     -------
@@ -1440,11 +1454,19 @@ def load_default_surface_models(
             receiver_ti_sampler_dir = sampler_library_dir / "Ti"
         if carbon_seemc_yield_dir is None:
             carbon_seemc_yield_dir = sampler_library_dir / "C" / "alpha_0deg"
+        if cu_seemc_yield_dir is None:
+            auto_cu_dir = sampler_library_dir / "Cu" / "alpha_0deg"
+            # Cu is intentionally optional while its generated library is being
+            # built. As soon as alpha_0deg exists, use its new yields.
+            if auto_cu_dir.is_dir():
+                cu_seemc_yield_dir = auto_cu_dir
 
     if receiver_ti_sampler_dir is not None:
         receiver_ti_sampler_dir = Path(receiver_ti_sampler_dir)
     if carbon_seemc_yield_dir is not None:
         carbon_seemc_yield_dir = Path(carbon_seemc_yield_dir)
+    if cu_seemc_yield_dir is not None:
+        cu_seemc_yield_dir = Path(cu_seemc_yield_dir)
 
     if sample_gun_incidence_dir is not None:
         sample_gun_incidence_dir = Path(sample_gun_incidence_dir)
@@ -1613,10 +1635,52 @@ def load_default_surface_models(
             f"{sorted(SAMPLE_QUANTUM_REFLECTION_MODES)}, got {sample_quantum_reflection_mode!r}"
         )
 
+    # Cu sample absolute normal-incidence yield normalization.  When a newly
+    # generated alpha_0deg Cu folder is available, use its SEEMC yields while
+    # deliberately retaining the historical JMONSEL emitted-energy/theta
+    # distributions and the existing angular-yield gain table. This mirrors the
+    # staged carbon-yield test and makes the new 0-degree Cu data immediately
+    # usable without requiring a complete Cu angular joint catalog.
+    if cu_seemc_yield_dir is not None:
+        if not cu_seemc_yield_dir.is_dir():
+            raise FileNotFoundError(
+                f"Cu SEEMC yield directory not found: {cu_seemc_yield_dir}"
+            )
+        cu_bsey_path = _resolve_generated_plane_file(cu_seemc_yield_dir, "BSEY")
+        cu_sey_path = _resolve_generated_plane_file(cu_seemc_yield_dir, "SEY")
+        cu_bsey = _tag_curve_source(
+            load_yield_curve_csv(cu_bsey_path),
+            f"Cu/{cu_seemc_yield_dir.name}/{cu_bsey_path.name}",
+            geometry="plane",
+        )
+        cu_sey = _tag_curve_source(
+            load_yield_curve_csv(cu_sey_path),
+            f"Cu/{cu_seemc_yield_dir.name}/{cu_sey_path.name}",
+            geometry="plane",
+        )
+        if cu_sey["E"].shape != cu_bsey["E"].shape or not np.allclose(
+            cu_sey["E"], cu_bsey["E"], rtol=0.0, atol=1.0e-12
+        ):
+            raise ValueError(
+                f"Cu SEY/BSEY energy grids do not match in {cu_seemc_yield_dir}"
+            )
+    else:
+        cu_bsey = load_yield_curve_csv(
+            model_dir / "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"
+        )
+        cu_sey = load_yield_curve_csv(
+            model_dir / "SEYFromPlane_SEVaccum_t0nmCuFPA.csv"
+        )
+
     sample_yield_models = {
-        "BSEY": load_yield_curve_csv(model_dir / "BSEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
-        "SEY": load_yield_curve_csv(model_dir / "SEYFromPlane_SEVaccum_t0nmCuFPA.csv"),
+        "BSEY": cu_bsey,
+        "SEY": cu_sey,
         "quantum_reflection_mode": requested_qr_mode,
+        "absolute_yield_model": (
+            "SEEMC_Cu_alpha_0deg"
+            if cu_seemc_yield_dir is not None
+            else "legacy_model_dir_Cu"
+        ),
     }
 
     if use_sample_angle_dependent_yields:
