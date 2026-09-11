@@ -831,6 +831,134 @@ def sample_ti_receiver_joint_event(
     return event
 
 
+def load_cu_sample_joint_library(sampler_root: str | Path) -> dict:
+    """Load yields/paths for the angle-resolved Cu sample library.
+
+    Like the Ti receiver library, the joint NPZ contents are loaded lazily.
+    The returned model is used for every Cu sample impact (gun or cascade),
+    bracketed by the actual incidence angle at the surface.
+    """
+    root = Path(sampler_root)
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"Cu sample sampler directory not found: {root}"
+        )
+
+    angle_models = []
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir():
+            continue
+        angle = _parse_alpha_directory_name(directory.name)
+        if angle is None:
+            continue
+
+        sey_path = _resolve_generated_plane_file(directory, "SEY")
+        bsey_path = _resolve_generated_plane_file(directory, "BSEY")
+        se_joint_path = _resolve_generated_plane_file(directory, "SE_JOINT")
+        bse_joint_path = _resolve_generated_plane_file(directory, "BSE_JOINT")
+
+        sey = load_yield_curve_csv(sey_path)
+        bsey = load_yield_curve_csv(bsey_path)
+        if sey["E"].shape != bsey["E"].shape or not np.allclose(
+            sey["E"], bsey["E"], rtol=0.0, atol=1.0e-12
+        ):
+            raise ValueError(
+                f"Cu SEY/BSEY energy grids do not match in {directory}"
+            )
+
+        angle_models.append({
+            "angle_deg": float(angle),
+            "source_dir": directory.name,
+            "yield": {
+                "SEY": _tag_curve_source(
+                    sey,
+                    f"{root.name}/{directory.name}/{sey_path.name}",
+                    geometry="angle_resolved_joint",
+                ),
+                "BSEY": _tag_curve_source(
+                    bsey,
+                    f"{root.name}/{directory.name}/{bsey_path.name}",
+                    geometry="angle_resolved_joint",
+                ),
+            },
+            "joint_paths": {
+                "SE": se_joint_path,
+                "BSE": bse_joint_path,
+            },
+        })
+
+    if not angle_models:
+        raise FileNotFoundError(
+            f"No alpha_*deg sampler folders found in {root}"
+        )
+
+    angle_models.sort(key=lambda m: m["angle_deg"])
+    angles = np.asarray(
+        [m["angle_deg"] for m in angle_models], dtype=float
+    )
+    if np.any(np.diff(angles) <= 0.0):
+        raise ValueError(
+            "Cu sample sampler angles must be strictly increasing"
+        )
+    if not np.isclose(angles[0], 0.0, rtol=0.0, atol=1.0e-12):
+        raise ValueError(
+            "Cu sample sampler library must contain alpha_0deg"
+        )
+
+    return {
+        "material": "Cu",
+        "angles_deg": angles,
+        "angle_models": angle_models,
+        "source_root": str(root),
+        "angle_interpolation": (
+            "linear_yield_stochastic_joint_mixture"
+        ),
+        "joint_loading": "lazy_LRU",
+    }
+
+
+
+def interp_cu_sample_yield(
+    library: dict,
+    Einc: float,
+    theta_deg: float,
+    kind: str,
+) -> float:
+    """Interpolate Cu sample SEY/BSEY in angle and incident energy."""
+    kind = str(kind).upper()
+    if kind not in ("SEY", "BSEY"):
+        raise ValueError(f"unknown Cu sample yield kind: {kind}")
+
+    lo, hi, w = _receiver_angle_bracket(library, theta_deg)
+    ylo = interp_yield_model(lo["yield"][kind], Einc)
+    if hi is lo:
+        return max(0.0, float(ylo))
+    yhi = interp_yield_model(hi["yield"][kind], Einc)
+    return max(0.0, float((1.0 - w) * ylo + w * yhi))
+
+
+
+def sample_cu_sample_joint_event(
+    library: dict,
+    Einc: float,
+    theta_deg: float,
+    kind: str,
+    rng,
+) -> dict:
+    """Draw one Cu joint event from the bracketing alpha folders."""
+    kind = str(kind).upper()
+    if kind not in ("SE", "BSE"):
+        raise ValueError(f"unknown Cu sample emission kind: {kind}")
+
+    lo, hi, w = _receiver_angle_bracket(library, theta_deg)
+    chosen = hi if (hi is not lo and rng.random() < w) else lo
+    joint = _load_joint_sampler_cached(chosen["joint_paths"][kind])
+    event = dict(sample_joint_emission_event(joint, Einc=Einc, rng=rng))
+    event["sampler_incidence_angle_deg"] = float(chosen["angle_deg"])
+    event["sampler_angle_source_dir"] = str(chosen["source_dir"])
+    return event
+
+
 def load_seemc_carbon_yield_pair(
     yield_dir: str | Path,
 ) -> tuple[dict, dict]:
@@ -1235,7 +1363,10 @@ def resolve_sample_quantum_reflection_mode(yield_models: dict) -> str:
     if requested == "auto":
         return (
             "disabled"
-            if sample_models.get("angular_yields", None) is not None
+            if (
+                sample_models.get("angular_yields", None) is not None
+                or sample_models.get("cu_joint_library", None) is not None
+            )
             else "legacy_replace"
         )
 
@@ -1336,6 +1467,7 @@ def load_default_surface_models(
     receiver_ti_sampler_dir: str | Path | None = None,
     carbon_seemc_yield_dir: str | Path | None = None,
     cu_seemc_yield_dir: str | Path | None = None,
+    cu_sampler_dir: str | Path | None = None,
 ) -> tuple[dict, dict, dict]:
     """
     Load the same surface models used in the MATLAB setup.
@@ -1406,16 +1538,16 @@ def load_default_surface_models(
             sampler_library/C/alpha_0deg
                 -> new normal-incidence carbon SEY/BSEY only
 
-            sampler_library/Cu/alpha_0deg
-                -> new normal-incidence Cu SEY/BSEY only, when present
+            sampler_library/Cu/alpha_*deg
+                -> full angle-resolved Cu sample yields + joint E/direction,
+                   when present
 
         Carbon emitted-energy and emitted-angle distributions continue to come
-        from ``model_dir`` (the historical JMONSEL tables). For Cu, only the
-        absolute normal-incidence SEY/BSEY curves are replaced at this stage;
-        the existing Cu energy/theta distributions and angular-yield gain table
-        remain active. Thus a 0-degree gun run uses the new Cu yield exactly,
-        while oblique re-impacts use the old angular gain on top of that new
-        normal-incidence normalization.
+        from ``model_dir`` (the historical JMONSEL tables). If a full Cu
+        generated library is available, it is used for every Cu sample impact
+        (gun and cascade) by bracketing the actual incidence angle and drawing
+        correlated emitted events from the corresponding joint NPZ files.
+        This replaces the earlier yield-only hybrid.
     receiver_ti_sampler_dir:
         Optional explicit override for the Ti root. If omitted and
         ``sampler_library_dir`` is supplied, ``sampler_library_dir / "Ti"`` is
@@ -1428,11 +1560,15 @@ def load_default_surface_models(
         distributions remain unchanged. These yields apply to grid meshes, grid
         frames, collector, rod and drift tube.
     cu_seemc_yield_dir:
-        Optional explicit override for a generated normal-incidence Cu yield
-        folder. If omitted and ``sampler_library_dir / "Cu" / "alpha_0deg"``
-        exists, that folder is used automatically. Only the Cu sample SEY/BSEY
-        normalization is replaced. Existing JMONSEL Cu emitted-energy/theta
-        distributions and the existing incidence-angle gain table remain in use.
+        Legacy optional override for a generated normal-incidence Cu yield
+        folder. This is retained only for backward compatibility with the
+        earlier yield-only hybrid.
+    cu_sampler_dir:
+        Optional explicit override for the full generated Cu sample library
+        root containing ``alpha_*deg`` folders. If omitted and
+        ``sampler_library_dir / "Cu"`` exists, that root is used automatically.
+        When active, the sample uses the new angle-resolved Cu SEY/BSEY and the
+        full joint emitted-event samplers for every Cu impact.
 
     Returns
     -------
@@ -1454,10 +1590,13 @@ def load_default_surface_models(
             receiver_ti_sampler_dir = sampler_library_dir / "Ti"
         if carbon_seemc_yield_dir is None:
             carbon_seemc_yield_dir = sampler_library_dir / "C" / "alpha_0deg"
-        if cu_seemc_yield_dir is None:
+        if cu_sampler_dir is None:
+            auto_cu_root = sampler_library_dir / "Cu"
+            if auto_cu_root.is_dir():
+                cu_sampler_dir = auto_cu_root
+        if cu_seemc_yield_dir is None and cu_sampler_dir is None:
             auto_cu_dir = sampler_library_dir / "Cu" / "alpha_0deg"
-            # Cu is intentionally optional while its generated library is being
-            # built. As soon as alpha_0deg exists, use its new yields.
+            # Backward-compatibility fallback for the earlier yield-only Cu test.
             if auto_cu_dir.is_dir():
                 cu_seemc_yield_dir = auto_cu_dir
 
@@ -1467,6 +1606,8 @@ def load_default_surface_models(
         carbon_seemc_yield_dir = Path(carbon_seemc_yield_dir)
     if cu_seemc_yield_dir is not None:
         cu_seemc_yield_dir = Path(cu_seemc_yield_dir)
+    if cu_sampler_dir is not None:
+        cu_sampler_dir = Path(cu_sampler_dir)
 
     if sample_gun_incidence_dir is not None:
         sample_gun_incidence_dir = Path(sample_gun_incidence_dir)
@@ -1635,13 +1776,16 @@ def load_default_surface_models(
             f"{sorted(SAMPLE_QUANTUM_REFLECTION_MODES)}, got {sample_quantum_reflection_mode!r}"
         )
 
-    # Cu sample absolute normal-incidence yield normalization.  When a newly
-    # generated alpha_0deg Cu folder is available, use its SEEMC yields while
-    # deliberately retaining the historical JMONSEL emitted-energy/theta
-    # distributions and the existing angular-yield gain table. This mirrors the
-    # staged carbon-yield test and makes the new 0-degree Cu data immediately
-    # usable without requiring a complete Cu angular joint catalog.
-    if cu_seemc_yield_dir is not None:
+    # Cu sample models. Prefer the full generated angle-resolved joint library
+    # when available. Fall back to the earlier normal-incidence yield-only
+    # hybrid only for backward compatibility.
+    cu_joint_library = None
+    if cu_sampler_dir is not None:
+        cu_joint_library = load_cu_sample_joint_library(cu_sampler_dir)
+        zero_model = cu_joint_library["angle_models"][0]
+        cu_bsey = dict(zero_model["yield"]["BSEY"])
+        cu_sey = dict(zero_model["yield"]["SEY"])
+    elif cu_seemc_yield_dir is not None:
         if not cu_seemc_yield_dir.is_dir():
             raise FileNotFoundError(
                 f"Cu SEEMC yield directory not found: {cu_seemc_yield_dir}"
@@ -1677,13 +1821,19 @@ def load_default_surface_models(
         "SEY": cu_sey,
         "quantum_reflection_mode": requested_qr_mode,
         "absolute_yield_model": (
-            "SEEMC_Cu_alpha_0deg"
-            if cu_seemc_yield_dir is not None
-            else "legacy_model_dir_Cu"
+            "SEEMC_Cu_full_joint_library"
+            if cu_joint_library is not None
+            else (
+                "SEEMC_Cu_alpha_0deg"
+                if cu_seemc_yield_dir is not None
+                else "legacy_model_dir_Cu"
+            )
         ),
     }
+    if cu_joint_library is not None:
+        sample_yield_models["cu_joint_library"] = cu_joint_library
 
-    if use_sample_angle_dependent_yields:
+    if use_sample_angle_dependent_yields and cu_joint_library is None:
         angular_path = model_dir / sample_angular_yield_filename
         if not angular_path.exists():
             raise FileNotFoundError(
@@ -2054,6 +2204,25 @@ def sample_surface_event(
         )
         bsey_val = interp_ti_receiver_yield(
             ti_receiver_library, Einc, theta_deg, "BSEY"
+        )
+        Nbse = _sample_integer_count_from_mean(bsey_val, rng)
+        Nse = int(rng.poisson(max(0.0, float(sey_val))))
+        return int(Nbse), int(Nse)
+
+    cu_sample_library = (
+        yield_models.get("sample", {}).get("cu_joint_library", None)
+        if surf == "sample" and sample_yield_override is None
+        else None
+    )
+    if cu_sample_library is not None:
+        theta_deg = float(np.degrees(np.arccos(
+            np.clip(float(cos_theta), 0.0, 1.0)
+        )))
+        sey_val = interp_cu_sample_yield(
+            cu_sample_library, Einc, theta_deg, "SEY"
+        )
+        bsey_val = interp_cu_sample_yield(
+            cu_sample_library, Einc, theta_deg, "BSEY"
         )
         Nbse = _sample_integer_count_from_mean(bsey_val, rng)
         Nse = int(rng.poisson(max(0.0, float(sey_val))))
@@ -2708,6 +2877,12 @@ def generate_surface_emissions(
         "sample_gun_joint_sampler_used": False,
         "sample_gun_joint_sampler_source": None,
         "sample_gun_azimuth_model": None,
+        "sample_cu_joint_sampler_used": False,
+        "sample_cu_incidence_angle_deg": np.nan,
+        "sample_cu_sampler_angle_deg": np.nan,
+        "sample_cu_joint_sampler_source": None,
+        "sample_cu_sey_mean_used": np.nan,
+        "sample_cu_bsey_mean_used": np.nan,
         "receiver_ti_joint_sampler_used": False,
         "receiver_ti_incidence_angle_deg": np.nan,
         "receiver_ti_sampler_angle_deg": np.nan,
@@ -2768,6 +2943,30 @@ def generate_surface_emissions(
                 receiver_ti_library,
                 Einc,
                 receiver_incidence_theta_deg,
+                "BSEY",
+            ),
+        })
+
+    cu_sample_library = (
+        yield_models.get("sample", {}).get("cu_joint_library", None)
+        if surf == "sample"
+        else None
+    )
+    sample_incidence_theta_deg = float(np.degrees(np.arccos(cos_theta)))
+    if cu_sample_library is not None:
+        event_info.update({
+            "sample_cu_joint_sampler_used": True,
+            "sample_cu_incidence_angle_deg": sample_incidence_theta_deg,
+            "sample_cu_sey_mean_used": interp_cu_sample_yield(
+                cu_sample_library,
+                Einc,
+                sample_incidence_theta_deg,
+                "SEY",
+            ),
+            "sample_cu_bsey_mean_used": interp_cu_sample_yield(
+                cu_sample_library,
+                Einc,
+                sample_incidence_theta_deg,
                 "BSEY",
             ),
         })
@@ -2839,31 +3038,49 @@ def generate_surface_emissions(
             })
 
     if surf == "sample":
-        sample_sey_gain, sample_bsey_gain, sample_theta_deg, sample_model = (
-            sample_angle_dependent_yield_gains(
-                yield_models=yield_models,
-                Einc=Einc,
-                cos_theta=cos_theta,
-                reference_theta_deg=sample_yield_reference_angle_deg,
+        if cu_sample_library is not None and sample_yield_override is None:
+            sample_theta_deg = sample_incidence_theta_deg
+            sample_sey_gain = 1.0
+            sample_bsey_gain = 1.0
+            sample_sey_mean = max(
+                0.0,
+                interp_cu_sample_yield(
+                    cu_sample_library, Einc, sample_theta_deg, "SEY"
+                ),
             )
-        )
-        sample_absolute_yields = (
-            sample_yield_override
-            if sample_yield_override is not None
-            else yield_models["sample"]
-        )
-        sample_sey_mean = max(
-            0.0,
-            interp_yield_model(sample_absolute_yields["SEY"], Einc)
-            * float(sample_sey_gain),
-        )
-        sample_bsey_mean = max(
-            0.0,
-            interp_yield_model(sample_absolute_yields["BSEY"], Einc)
-            * float(sample_bsey_gain),
-        )
-        if yield_models.get("sample", {}).get("angular_yields", None) is None:
-            sample_bsey_mean = min(sample_bsey_mean, 0.99)
+            sample_bsey_mean = max(
+                0.0,
+                interp_cu_sample_yield(
+                    cu_sample_library, Einc, sample_theta_deg, "BSEY"
+                ),
+            )
+            sample_model = "SEEMC_Cu_joint_library"
+        else:
+            sample_sey_gain, sample_bsey_gain, sample_theta_deg, sample_model = (
+                sample_angle_dependent_yield_gains(
+                    yield_models=yield_models,
+                    Einc=Einc,
+                    cos_theta=cos_theta,
+                    reference_theta_deg=sample_yield_reference_angle_deg,
+                )
+            )
+            sample_absolute_yields = (
+                sample_yield_override
+                if sample_yield_override is not None
+                else yield_models["sample"]
+            )
+            sample_sey_mean = max(
+                0.0,
+                interp_yield_model(sample_absolute_yields["SEY"], Einc)
+                * float(sample_sey_gain),
+            )
+            sample_bsey_mean = max(
+                0.0,
+                interp_yield_model(sample_absolute_yields["BSEY"], Einc)
+                * float(sample_bsey_gain),
+            )
+            if yield_models.get("sample", {}).get("angular_yields", None) is None:
+                sample_bsey_mean = min(sample_bsey_mean, 0.99)
 
         event_info.update({
             "sample_incidence_theta_deg": float(sample_theta_deg),
@@ -2988,6 +3205,19 @@ def generate_surface_emissions(
             joint_energy_clipped = not np.isclose(
                 E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
             )
+        elif surf == "sample" and cu_sample_library is not None:
+            joint_event = sample_cu_sample_joint_event(
+                cu_sample_library,
+                Einc=Einc,
+                theta_deg=sample_incidence_theta_deg,
+                kind="BSE",
+                rng=rng,
+            )
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            E_bse = float(np.clip(joint_energy_raw, min(50.0, Einc), Einc))
+            joint_energy_clipped = not np.isclose(
+                E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
         else:
             E_bse = sample_surface_energy(
                 energy_models=energy_models,
@@ -3088,6 +3318,50 @@ def generate_surface_emissions(
                 joint_event.get("source", "<joint sampler>")
             )
 
+        elif joint_event is not None and surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence:
+            for _joint_try in range(64):
+                joint_energy_raw = float(joint_event["Eout_eV"])
+                E_bse = float(np.clip(
+                    joint_energy_raw, min(50.0, Einc), Einc
+                ))
+                joint_energy_clipped = not np.isclose(
+                    E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
+                )
+                E_bse_launch = max(E_bse + phi_correction, 1.0e-3)
+                theta_bs = float(joint_event["theta_rad"])
+                phi_bs = float(joint_event["phi_rad"])
+                try:
+                    v_bse, emission_outward_cosine = (
+                        launch_generic_surface_electron_joint(
+                            direction_local=joint_event["direction_local"],
+                            Eout_eV=E_bse_launch,
+                            v_in=v_in,
+                            n_out=n_out,
+                        )
+                    )
+                    break
+                except ValueError:
+                    joint_event = sample_cu_sample_joint_event(
+                        cu_sample_library,
+                        Einc=Einc,
+                        theta_deg=sample_incidence_theta_deg,
+                        kind="BSE",
+                        rng=rng,
+                    )
+            else:
+                raise RuntimeError(
+                    "could not draw an outward Cu sample BSE joint event "
+                    "after 64 attempts"
+                )
+            emission_polar_axis = "sample_incident_beam_back_joint"
+            p0_bse = p0_surface
+            event_info["sample_cu_sampler_angle_deg"] = float(
+                joint_event["sampler_incidence_angle_deg"]
+            )
+            event_info["sample_cu_joint_sampler_source"] = str(
+                joint_event.get("source", "<joint sampler>")
+            )
+
         elif joint_event is not None:
             v_bse, emission_outward_cosine = launch_sample_electron_joint(
                 direction_local=joint_event["direction_local"],
@@ -3164,11 +3438,30 @@ def generate_surface_emissions(
             "emission_mu_side": float(dloc[2]),
             "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
             "sample_gun_joint_sampler_used": bool(
-                joint_event is not None and receiver_ti_library is None
+                joint_event is not None and receiver_ti_library is None and not (
+                    surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence
+                )
             ),
             "sample_gun_joint_sampler_source": (
                 None
-                if (joint_event is None or receiver_ti_library is not None)
+                if (
+                    joint_event is None
+                    or receiver_ti_library is not None
+                    or (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
+                )
+                else joint_event.get("source", None)
+            ),
+            "sample_cu_joint_sampler_used": bool(
+                joint_event is not None and surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence
+            ),
+            "sample_cu_sampler_angle_deg": (
+                np.nan
+                if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
+                else float(joint_event.get("sampler_incidence_angle_deg", np.nan))
+            ),
+            "sample_cu_joint_sampler_source": (
+                None
+                if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
                 else joint_event.get("source", None)
             ),
             "receiver_ti_joint_sampler_used": bool(
@@ -3222,6 +3515,20 @@ def generate_surface_emissions(
         elif use_sample_gun_incidence and sample_joint_override is not None:
             joint_event = sample_joint_emission_event(
                 sample_joint_override["SE"], Einc=Einc, rng=rng
+            )
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            Ehi = min(50.0, Einc)
+            E_se = float(np.clip(joint_energy_raw, min(0.01, Ehi), Ehi))
+            joint_energy_clipped = not np.isclose(
+                E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
+        elif surf == "sample" and cu_sample_library is not None:
+            joint_event = sample_cu_sample_joint_event(
+                cu_sample_library,
+                Einc=Einc,
+                theta_deg=sample_incidence_theta_deg,
+                kind="SE",
+                rng=rng,
             )
             joint_energy_raw = float(joint_event["Eout_eV"])
             Ehi = min(50.0, Einc)
@@ -3317,6 +3624,51 @@ def generate_surface_emissions(
                 joint_event.get("source", "<joint sampler>")
             )
 
+        elif joint_event is not None and surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence:
+            for _joint_try in range(64):
+                joint_energy_raw = float(joint_event["Eout_eV"])
+                Ehi = min(50.0, Einc)
+                E_se = float(np.clip(
+                    joint_energy_raw, min(0.01, Ehi), Ehi
+                ))
+                joint_energy_clipped = not np.isclose(
+                    E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+                )
+                E_se_launch = max(E_se + phi_correction, 1.0e-3)
+                theta_se = float(joint_event["theta_rad"])
+                phi_se = float(joint_event["phi_rad"])
+                try:
+                    v_se, emission_outward_cosine = (
+                        launch_generic_surface_electron_joint(
+                            direction_local=joint_event["direction_local"],
+                            Eout_eV=E_se_launch,
+                            v_in=v_in,
+                            n_out=n_out,
+                        )
+                    )
+                    break
+                except ValueError:
+                    joint_event = sample_cu_sample_joint_event(
+                        cu_sample_library,
+                        Einc=Einc,
+                        theta_deg=sample_incidence_theta_deg,
+                        kind="SE",
+                        rng=rng,
+                    )
+            else:
+                raise RuntimeError(
+                    "could not draw an outward Cu sample SE joint event "
+                    "after 64 attempts"
+                )
+            emission_polar_axis = "sample_incident_beam_back_joint"
+            p0_se = p0_surface
+            event_info["sample_cu_sampler_angle_deg"] = float(
+                joint_event["sampler_incidence_angle_deg"]
+            )
+            event_info["sample_cu_joint_sampler_source"] = str(
+                joint_event.get("source", "<joint sampler>")
+            )
+
         elif joint_event is not None:
             v_se, emission_outward_cosine = launch_sample_electron_joint(
                 direction_local=joint_event["direction_local"],
@@ -3393,11 +3745,30 @@ def generate_surface_emissions(
             "emission_mu_side": float(dloc[2]),
             "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
             "sample_gun_joint_sampler_used": bool(
-                joint_event is not None and receiver_ti_library is None
+                joint_event is not None and receiver_ti_library is None and not (
+                    surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence
+                )
             ),
             "sample_gun_joint_sampler_source": (
                 None
-                if (joint_event is None or receiver_ti_library is not None)
+                if (
+                    joint_event is None
+                    or receiver_ti_library is not None
+                    or (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
+                )
+                else joint_event.get("source", None)
+            ),
+            "sample_cu_joint_sampler_used": bool(
+                joint_event is not None and surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence
+            ),
+            "sample_cu_sampler_angle_deg": (
+                np.nan
+                if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
+                else float(joint_event.get("sampler_incidence_angle_deg", np.nan))
+            ),
+            "sample_cu_joint_sampler_source": (
+                None
+                if not (surf == "sample" and cu_sample_library is not None and not use_sample_gun_incidence)
                 else joint_event.get("source", None)
             ),
             "receiver_ti_joint_sampler_used": bool(
