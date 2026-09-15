@@ -2029,14 +2029,6 @@ def load_default_surface_models(
 
     if receiver_ti_sampler_dir is not None:
         receiver_ti_sampler_dir = Path(receiver_ti_sampler_dir)
-    # Attach the full carbon joint library only after yield_models exists.
-    # rod and drifttube route through the "collector" model family, so
-    # attaching to grid / gridframe / collector covers every carbon-coated
-    # surface.
-    if carbon_joint_library is not None:
-        for carbon_key in ("grid", "gridframe", "collector"):
-            yield_models[carbon_key]["carbon_joint_library"] = carbon_joint_library
-
     if holder_mo_sampler_dir is not None:
         holder_mo_sampler_dir = Path(holder_mo_sampler_dir)
     if carbon_seemc_yield_dir is not None:
@@ -2321,6 +2313,13 @@ def load_default_surface_models(
             "SEY": collector_sey,
         },
     }
+
+    # Full carbon joint library is attached only after yield_models exists.
+    # rod and drifttube use the collector model family, so these three keys
+    # cover every carbon-coated surface.
+    if carbon_joint_library is not None:
+        for carbon_key in ("grid", "gridframe", "collector"):
+            yield_models[carbon_key]["carbon_joint_library"] = carbon_joint_library
 
     if holder_mo_sampler_dir is not None:
         mo_library = load_mo_holder_joint_library(holder_mo_sampler_dir)
