@@ -909,6 +909,152 @@ def sample_ti_receiver_joint_event(
     return event
 
 
+
+def load_carbon_joint_library(sampler_root: str | Path) -> dict:
+    """Load the angle-resolved joint sampler library for carbon coatings.
+
+    This library is shared by all carbon-coated RFA hardware:
+      * analytic grid meshes (using the sampled local cylindrical-wire normal),
+      * grid support frames,
+      * collector,
+      * rod,
+      * drift tube.
+
+    Joint NPZ contents are loaded lazily through the shared LRU cache.
+    """
+    root = Path(sampler_root)
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"carbon sampler directory not found: {root}"
+        )
+
+    angle_models = []
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir():
+            continue
+        angle = _parse_alpha_directory_name(directory.name)
+        if angle is None:
+            continue
+
+        sey_path = _resolve_generated_plane_file(directory, "SEY")
+        bsey_path = _resolve_generated_plane_file(directory, "BSEY")
+        se_joint_path = _resolve_generated_plane_file(directory, "SE_JOINT")
+        bse_joint_path = _resolve_generated_plane_file(directory, "BSE_JOINT")
+
+        sey = load_yield_curve_csv(sey_path)
+        bsey = load_yield_curve_csv(bsey_path)
+        if sey["E"].shape != bsey["E"].shape or not np.allclose(
+            sey["E"], bsey["E"], rtol=0.0, atol=1.0e-12
+        ):
+            raise ValueError(
+                f"carbon SEY/BSEY energy grids do not match in {directory}"
+            )
+
+        angle_models.append({
+            "angle_deg": float(angle),
+            "source_dir": directory.name,
+            "yield": {
+                "SEY": _tag_curve_source(
+                    sey,
+                    f"{root.name}/{directory.name}/{sey_path.name}",
+                    geometry="angle_resolved_joint",
+                ),
+                "BSEY": _tag_curve_source(
+                    bsey,
+                    f"{root.name}/{directory.name}/{bsey_path.name}",
+                    geometry="angle_resolved_joint",
+                ),
+            },
+            "joint_paths": {
+                "SE": se_joint_path,
+                "BSE": bse_joint_path,
+            },
+        })
+
+    if not angle_models:
+        raise FileNotFoundError(
+            f"No alpha_*deg sampler folders found in {root}"
+        )
+
+    angle_models.sort(key=lambda m: m["angle_deg"])
+    angles = np.asarray([m["angle_deg"] for m in angle_models], dtype=float)
+    if np.any(np.diff(angles) <= 0.0):
+        raise ValueError("carbon sampler angles must be strictly increasing")
+    if not np.isclose(angles[0], 0.0, rtol=0.0, atol=1.0e-12):
+        raise ValueError("carbon sampler library must contain alpha_0deg")
+
+    return {
+        "material": "C",
+        "angles_deg": angles,
+        "angle_models": angle_models,
+        "source_root": str(root),
+        "angle_interpolation": "linear_yield_stochastic_joint_mixture",
+        "joint_loading": "lazy_LRU",
+    }
+
+
+def interp_carbon_yield(
+    library: dict,
+    Einc: float,
+    theta_deg: float,
+    kind: str,
+) -> float:
+    """Interpolate carbon SEY/BSEY in incidence angle and incident energy."""
+    kind = str(kind).upper()
+    if kind not in ("SEY", "BSEY"):
+        raise ValueError(f"unknown carbon yield kind: {kind}")
+
+    lo, hi, w = _receiver_angle_bracket(library, theta_deg)
+    ylo = interp_yield_model(lo["yield"][kind], Einc)
+    if hi is lo:
+        return max(0.0, float(ylo))
+    yhi = interp_yield_model(hi["yield"][kind], Einc)
+    return max(0.0, float((1.0 - w) * ylo + w * yhi))
+
+
+def sample_carbon_joint_event(
+    library: dict,
+    Einc: float,
+    theta_deg: float,
+    kind: str,
+    rng,
+) -> dict:
+    """Draw one carbon joint event from neighboring alpha folders.
+
+    Exact specular reflected-primary events are reconstructed at the actual
+    RFA incidence angle and incident energy after stochastic angle-folder
+    selection, exactly as for Cu and Mo.
+    """
+    kind = str(kind).upper()
+    if kind not in ("SE", "BSE"):
+        raise ValueError(f"unknown carbon emission kind: {kind}")
+
+    lo, hi, w = _receiver_angle_bracket(library, theta_deg)
+    chosen = hi if (hi is not lo and rng.random() < w) else lo
+    joint = _load_joint_sampler_cached(chosen["joint_paths"][kind])
+
+    event = dict(sample_joint_emission_event(joint, Einc=Einc, rng=rng))
+    event["sampler_incidence_angle_deg"] = float(chosen["angle_deg"])
+    event["sampler_angle_source_dir"] = str(chosen["source_dir"])
+    event["carbon_specular_reconstructed"] = False
+    event["carbon_specular_direction_correction_deg"] = 0.0
+
+    if _joint_event_is_exact_specular(
+        event, sampler_alpha_deg=chosen["angle_deg"]
+    ):
+        event = _reconstruct_exact_specular_event(
+            event,
+            actual_Einc_eV=Einc,
+            actual_theta_deg=theta_deg,
+        )
+        event["carbon_specular_reconstructed"] = True
+        event["carbon_specular_direction_correction_deg"] = float(
+            event.get("cu_specular_direction_correction_deg", 0.0)
+        )
+
+    return event
+
+
 def load_cu_sample_joint_library(sampler_root: str | Path) -> dict:
     """Load yields/paths for the angle-resolved Cu sample library.
 
@@ -1718,6 +1864,7 @@ def load_default_surface_models(
     receiver_ti_sampler_dir: str | Path | None = None,
     holder_mo_sampler_dir: str | Path | None = None,
     carbon_seemc_yield_dir: str | Path | None = None,
+    carbon_sampler_dir: str | Path | None = None,
     cu_seemc_yield_dir: str | Path | None = None,
     cu_sampler_dir: str | Path | None = None,
 ) -> tuple[dict, dict, dict]:
@@ -1790,15 +1937,17 @@ def load_default_surface_models(
             sampler_library/Mo/alpha_*deg
                 -> full angle-resolved Mo holder yields + joint E/direction
 
-            sampler_library/C/alpha_0deg
-                -> new normal-incidence carbon SEY/BSEY only
+            sampler_library/C/alpha_*deg
+                -> full angle-resolved carbon yields + joint E/direction
+                   for grids, grid frames, collector, rod and drift tube
 
             sampler_library/Cu/alpha_*deg
                 -> full angle-resolved Cu sample yields + joint E/direction,
                    when present
 
-        Carbon emitted-energy and emitted-angle distributions continue to come
-        from ``model_dir`` (the historical JMONSEL tables). If a full Cu
+        When a full carbon generated library is available, it replaces both
+        the carbon yield-only model and the historical independent carbon
+        energy/angle samplers on all carbon-coated surfaces. If a full Cu
         generated library is available, it is used for every Cu sample impact
         (gun and cascade) by bracketing the actual incidence angle and drawing
         correlated emitted events from the corresponding joint NPZ files.
@@ -1813,12 +1962,15 @@ def load_default_surface_models(
         used when present. The full angle-resolved SEY/BSEY and joint emitted
         events are then used for every holder impact; large NPZs load lazily.
     carbon_seemc_yield_dir:
-        Optional explicit override for the carbon normal-incidence yield folder.
-        If omitted and ``sampler_library_dir`` is supplied,
-        ``sampler_library_dir / "C" / "alpha_0deg"`` is used. Only SEY/BSEY
-        are replaced; existing JMONSEL carbon emitted-energy and emitted-angle
-        distributions remain unchanged. These yields apply to grid meshes, grid
-        frames, collector, rod and drift tube.
+        Legacy optional override for the carbon normal-incidence yield-only
+        folder. Retained for backward compatibility.
+    carbon_sampler_dir:
+        Optional explicit override for the full carbon joint-library root
+        containing ``alpha_*deg`` folders. If omitted and a multi-angle
+        ``sampler_library_dir / "C"`` library exists, it is activated
+        automatically. The full angle-resolved SEY/BSEY and correlated emitted
+        events are then used on grid meshes, grid frames, collector, rod and
+        drift tube.
     cu_seemc_yield_dir:
         Legacy optional override for a generated normal-incidence Cu yield
         folder. This is retained only for backward compatibility with the
@@ -1852,7 +2004,18 @@ def load_default_surface_models(
             auto_mo_root = sampler_library_dir / "Mo"
             if auto_mo_root.is_dir():
                 holder_mo_sampler_dir = auto_mo_root
-        if carbon_seemc_yield_dir is None:
+        if carbon_sampler_dir is None:
+            auto_c_root = sampler_library_dir / "C"
+            if auto_c_root.is_dir():
+                auto_c_angles = [
+                    d for d in auto_c_root.iterdir()
+                    if d.is_dir() and _parse_alpha_directory_name(d.name) is not None
+                ]
+                # Prefer the full joint library once multiple angular folders
+                # exist. A lone alpha_0deg folder remains the yield-only fallback.
+                if len(auto_c_angles) >= 2:
+                    carbon_sampler_dir = auto_c_root
+        if carbon_seemc_yield_dir is None and carbon_sampler_dir is None:
             carbon_seemc_yield_dir = sampler_library_dir / "C" / "alpha_0deg"
         if cu_sampler_dir is None:
             auto_cu_root = sampler_library_dir / "Cu"
@@ -1866,10 +2029,16 @@ def load_default_surface_models(
 
     if receiver_ti_sampler_dir is not None:
         receiver_ti_sampler_dir = Path(receiver_ti_sampler_dir)
+    if carbon_joint_library is not None:
+        for carbon_key in ("grid", "gridframe", "collector"):
+            yield_models[carbon_key]["carbon_joint_library"] = carbon_joint_library
+
     if holder_mo_sampler_dir is not None:
         holder_mo_sampler_dir = Path(holder_mo_sampler_dir)
     if carbon_seemc_yield_dir is not None:
         carbon_seemc_yield_dir = Path(carbon_seemc_yield_dir)
+    if carbon_sampler_dir is not None:
+        carbon_sampler_dir = Path(carbon_sampler_dir)
     if cu_seemc_yield_dir is not None:
         cu_seemc_yield_dir = Path(cu_seemc_yield_dir)
     if cu_sampler_dir is not None:
@@ -1955,6 +2124,10 @@ def load_default_surface_models(
         "SE": energy_models["sample"]["SE"],
     }
 
+    carbon_joint_library = None
+    if carbon_sampler_dir is not None:
+        carbon_joint_library = load_carbon_joint_library(carbon_sampler_dir)
+
     collector_bsey_jmonsel = load_yield_curve_csv(
         model_dir / "BSEYFromPlane_glassyCarbon_t150000nmCuFPA.csv"
     )
@@ -1962,7 +2135,11 @@ def load_default_surface_models(
         model_dir / "SEYFromPlane_glassyCarbon_t150000nmCuFPA.csv"
     )
 
-    if carbon_seemc_yield_dir is not None:
+    if carbon_joint_library is not None:
+        carbon_zero = carbon_joint_library["angle_models"][0]
+        collector_sey = dict(carbon_zero["yield"]["SEY"])
+        collector_bsey = dict(carbon_zero["yield"]["BSEY"])
+    elif carbon_seemc_yield_dir is not None:
         collector_sey, collector_bsey = load_seemc_carbon_yield_pair(
             carbon_seemc_yield_dir
         )
@@ -2012,9 +2189,13 @@ def load_default_surface_models(
     grid_bsey_jmonsel = dict(grid_bsey_jmonsel, geometry="wire")
     grid_sey_jmonsel = dict(grid_sey_jmonsel, geometry="wire")
 
-    if carbon_seemc_yield_dir is not None:
-        # New SEEMC carbon yields provide only the absolute yield magnitude.
-        # Keep all existing carbon energy/theta distributions unchanged.
+    if carbon_joint_library is not None:
+        grid_bsey = dict(collector_bsey, geometry="angle_resolved_joint")
+        grid_sey = dict(collector_sey, geometry="angle_resolved_joint")
+        gridframe_bsey = dict(collector_bsey, geometry="angle_resolved_joint")
+        gridframe_sey = dict(collector_sey, geometry="angle_resolved_joint")
+    elif carbon_seemc_yield_dir is not None:
+        # Yield-only fallback.
         grid_bsey = dict(collector_bsey, geometry="plane")
         grid_sey = dict(collector_sey, geometry="plane")
         gridframe_bsey = dict(collector_bsey, geometry="plane")
@@ -2498,6 +2679,29 @@ def sample_surface_event(
         )
         bsey_val = interp_mo_holder_yield(
             mo_holder_library, Einc, theta_deg, "BSEY"
+        )
+        Nbse = _sample_integer_count_from_mean(bsey_val, rng)
+        Nse = int(rng.poisson(max(0.0, float(sey_val))))
+        return int(Nbse), int(Nse)
+
+    carbon_joint_library = (
+        yield_models.get(model_key, {}).get("carbon_joint_library", None)
+        if (
+            surf in ANALYTIC_MESH_SURFACES
+            or surf in GRID_FRAME_SURFACES
+            or surf in CARBON_COATED_SURFACES
+        )
+        else None
+    )
+    if carbon_joint_library is not None:
+        theta_deg = float(np.degrees(np.arccos(
+            np.clip(float(cos_theta), 0.0, 1.0)
+        )))
+        sey_val = interp_carbon_yield(
+            carbon_joint_library, Einc, theta_deg, "SEY"
+        )
+        bsey_val = interp_carbon_yield(
+            carbon_joint_library, Einc, theta_deg, "BSEY"
         )
         Nbse = _sample_integer_count_from_mean(bsey_val, rng)
         Nse = int(rng.poisson(max(0.0, float(sey_val))))
@@ -3190,6 +3394,13 @@ def generate_surface_emissions(
         "holder_mo_joint_sampler_source": None,
         "holder_mo_sey_mean_used": np.nan,
         "holder_mo_bsey_mean_used": np.nan,
+        "carbon_joint_sampler_used": False,
+        "carbon_incidence_angle_deg": np.nan,
+        "carbon_sampler_angle_deg": np.nan,
+        "carbon_sampler_folder": None,
+        "carbon_joint_sampler_source": None,
+        "carbon_sey_mean_used": np.nan,
+        "carbon_bsey_mean_used": np.nan,
     }
 
     surface_name = canonical_surface_name(surface_name)
@@ -3263,6 +3474,30 @@ def generate_surface_emissions(
             ),
             "holder_mo_bsey_mean_used": interp_mo_holder_yield(
                 holder_mo_library, Einc, holder_incidence_theta_deg, "BSEY"
+            ),
+        })
+
+    carbon_joint_library = (
+        yield_models.get(_surface_model_key(yield_models, surface_name), {}).get(
+            "carbon_joint_library", None
+        )
+        if (
+            surf in ANALYTIC_MESH_SURFACES
+            or surf in GRID_FRAME_SURFACES
+            or surf in CARBON_COATED_SURFACES
+        )
+        else None
+    )
+    carbon_incidence_theta_deg = float(np.degrees(np.arccos(cos_theta)))
+    if carbon_joint_library is not None:
+        event_info.update({
+            "carbon_joint_sampler_used": True,
+            "carbon_incidence_angle_deg": carbon_incidence_theta_deg,
+            "carbon_sey_mean_used": interp_carbon_yield(
+                carbon_joint_library, Einc, carbon_incidence_theta_deg, "SEY"
+            ),
+            "carbon_bsey_mean_used": interp_carbon_yield(
+                carbon_joint_library, Einc, carbon_incidence_theta_deg, "BSEY"
             ),
         })
 
@@ -3515,6 +3750,37 @@ def generate_surface_emissions(
             joint_energy_clipped = not np.isclose(
                 E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
             )
+        elif carbon_joint_library is not None:
+            joint_event = sample_carbon_joint_event(
+                carbon_joint_library,
+                Einc=Einc,
+                theta_deg=carbon_incidence_theta_deg,
+                kind="BSE",
+                rng=rng,
+            )
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            E_bse = float(np.clip(
+                joint_energy_raw, min(50.0, Einc), Einc
+            ))
+            joint_energy_clipped = not np.isclose(
+                E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
+        elif carbon_joint_library is not None:
+            joint_event = sample_carbon_joint_event(
+                carbon_joint_library,
+                Einc=Einc,
+                theta_deg=carbon_incidence_theta_deg,
+                kind="SE",
+                rng=rng,
+            )
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            Ehi = min(50.0, Einc)
+            E_se = float(np.clip(
+                joint_energy_raw, min(0.01, Ehi), Ehi
+            ))
+            joint_energy_clipped = not np.isclose(
+                E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
         elif holder_mo_library is not None:
             joint_event = sample_mo_holder_joint_event(
                 holder_mo_library,
@@ -3649,6 +3915,109 @@ def generate_surface_emissions(
                 joint_event["sampler_incidence_angle_deg"]
             )
             event_info["receiver_ti_joint_sampler_source"] = str(
+                joint_event.get("source", "<joint sampler>")
+            )
+
+        elif joint_event is not None and carbon_joint_library is not None:
+            for _joint_try in range(64):
+                joint_energy_raw = float(joint_event["Eout_eV"])
+                E_bse = float(np.clip(
+                    joint_energy_raw, min(50.0, Einc), Einc
+                ))
+                joint_energy_clipped = not np.isclose(
+                    E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
+                )
+                E_bse_launch = max(E_bse + phi_correction, 1.0e-3)
+                theta_bs = float(joint_event["theta_rad"])
+                phi_bs = float(joint_event["phi_rad"])
+                try:
+                    v_bse, emission_outward_cosine = (
+                        launch_generic_surface_electron_joint(
+                            direction_local=joint_event["direction_local"],
+                            Eout_eV=E_bse_launch,
+                            v_in=v_in,
+                            n_out=n_out,
+                        )
+                    )
+                    break
+                except ValueError:
+                    joint_event = sample_carbon_joint_event(
+                        carbon_joint_library,
+                        Einc=Einc,
+                        theta_deg=carbon_incidence_theta_deg,
+                        kind="BSE",
+                        rng=rng,
+                    )
+            else:
+                raise RuntimeError(
+                    "could not draw an outward carbon BSE joint event "
+                    "after 64 attempts"
+                )
+            emission_polar_axis = "carbon_incident_beam_back_joint"
+            p0_bse = (
+                r_hit + sample_launch_eps * unit(v_bse)
+                if surf in ANALYTIC_MESH_SURFACES
+                else p0_surface
+            )
+            event_info["carbon_sampler_angle_deg"] = float(
+                joint_event["sampler_incidence_angle_deg"]
+            )
+            event_info["carbon_sampler_folder"] = str(
+                joint_event.get("sampler_angle_source_dir", "")
+            )
+            event_info["carbon_joint_sampler_source"] = str(
+                joint_event.get("source", "<joint sampler>")
+            )
+
+        elif joint_event is not None and carbon_joint_library is not None:
+            for _joint_try in range(64):
+                joint_energy_raw = float(joint_event["Eout_eV"])
+                Ehi = min(50.0, Einc)
+                E_se = float(np.clip(
+                    joint_energy_raw, min(0.01, Ehi), Ehi
+                ))
+                joint_energy_clipped = not np.isclose(
+                    E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+                )
+                E_se_launch = max(E_se + phi_correction, 1.0e-3)
+                theta_se = float(joint_event["theta_rad"])
+                phi_se = float(joint_event["phi_rad"])
+                try:
+                    v_se, emission_outward_cosine = (
+                        launch_generic_surface_electron_joint(
+                            direction_local=joint_event["direction_local"],
+                            Eout_eV=E_se_launch,
+                            v_in=v_in,
+                            n_out=n_out,
+                        )
+                    )
+                    break
+                except ValueError:
+                    joint_event = sample_carbon_joint_event(
+                        carbon_joint_library,
+                        Einc=Einc,
+                        theta_deg=carbon_incidence_theta_deg,
+                        kind="SE",
+                        rng=rng,
+                    )
+            else:
+                raise RuntimeError(
+                    "could not draw an outward carbon SE joint event "
+                    "after 64 attempts"
+                )
+            emission_polar_axis = "carbon_incident_beam_back_joint"
+            p0_se = (
+                r_hit + sample_launch_eps * unit(v_se)
+                if surf in ANALYTIC_MESH_SURFACES
+                else p0_surface
+            )
+            event_info["carbon_sampler_angle_deg"] = float(
+                joint_event["sampler_incidence_angle_deg"]
+            )
+            event_info["carbon_sampler_folder"] = str(
+                joint_event.get("sampler_angle_source_dir", "")
+            )
+            event_info["carbon_joint_sampler_source"] = str(
                 joint_event.get("source", "<joint sampler>")
             )
 
@@ -3817,6 +4186,28 @@ def generate_surface_emissions(
             "emission_mu_beam_back": float(dloc[0]),
             "emission_mu_toward_normal": float(dloc[1]),
             "emission_mu_side": float(dloc[2]),
+            "carbon_joint_sampler_used": bool(
+                joint_event is not None and carbon_joint_library is not None
+            ),
+            "carbon_incidence_angle_deg": (
+                float(carbon_incidence_theta_deg)
+                if carbon_joint_library is not None else np.nan
+            ),
+            "carbon_sampler_angle_deg": (
+                np.nan
+                if carbon_joint_library is None or joint_event is None
+                else float(joint_event.get("sampler_incidence_angle_deg", np.nan))
+            ),
+            "carbon_sampler_folder": (
+                None
+                if carbon_joint_library is None or joint_event is None
+                else joint_event.get("sampler_angle_source_dir", None)
+            ),
+            "carbon_joint_sampler_source": (
+                None
+                if carbon_joint_library is None or joint_event is None
+                else joint_event.get("source", None)
+            ),
             "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
             "sample_gun_joint_sampler_used": bool(
                 joint_event is not None
@@ -4225,6 +4616,28 @@ def generate_surface_emissions(
             "emission_mu_beam_back": float(dloc[0]),
             "emission_mu_toward_normal": float(dloc[1]),
             "emission_mu_side": float(dloc[2]),
+            "carbon_joint_sampler_used": bool(
+                joint_event is not None and carbon_joint_library is not None
+            ),
+            "carbon_incidence_angle_deg": (
+                float(carbon_incidence_theta_deg)
+                if carbon_joint_library is not None else np.nan
+            ),
+            "carbon_sampler_angle_deg": (
+                np.nan
+                if carbon_joint_library is None or joint_event is None
+                else float(joint_event.get("sampler_incidence_angle_deg", np.nan))
+            ),
+            "carbon_sampler_folder": (
+                None
+                if carbon_joint_library is None or joint_event is None
+                else joint_event.get("sampler_angle_source_dir", None)
+            ),
+            "carbon_joint_sampler_source": (
+                None
+                if carbon_joint_library is None or joint_event is None
+                else joint_event.get("source", None)
+            ),
             "sample_gun_incidence_sampler_used": bool(use_sample_gun_incidence),
             "sample_gun_joint_sampler_used": bool(
                 joint_event is not None
