@@ -1916,6 +1916,8 @@ def run_cascade_batch_parallel(
     
     x_start: float | None = None,
     beam_sigma: float = 150e-6,
+    beam_y_offset_m: float = 0.0,
+    beam_z_offset_m: float = 0.0,
     energy_spread_eV: float = 0.0,
     angular_sigma_deg: float = 0.0,
     seed: int = 1,
@@ -2231,10 +2233,15 @@ def run_cascade_batch_parallel(
             "analytic sample face moved away from configured sample_face_center"
         )
 
-    # Beam transverse coordinates must be centred on the *front face*, not on
-    # the midpoint of the rotated solid's axis-aligned Y bounds.
-    y0 = float(np.asarray(sample_geometry["center"], dtype=float)[1])
-    z0 = float(np.asarray(sample_geometry["center"], dtype=float)[2])
+    # Beam transverse coordinates are referenced to the *front-face* centre,
+    # not to the midpoint of the rotated solid's axis-aligned bounds.  The
+    # optional offsets move only the beam; they do NOT move the analytical
+    # sample geometry.  This enables controlled off-centre shots and raster
+    # scans (for example, along global z, which is the sample vertical axis
+    # for the present rotation convention).
+    sample_center = np.asarray(sample_geometry["center"], dtype=float)
+    y0 = float(sample_center[1]) + float(beam_y_offset_m)
+    z0 = float(sample_center[2]) + float(beam_z_offset_m)
 
     if verbose:
         print(
@@ -2258,6 +2265,13 @@ def run_cascade_batch_parallel(
                 f"{np.asarray(raw_stl_center, dtype=float)} was used for "
                 "dimensions only; its assembly translation was ignored"
             )
+        print(
+            "[cascade] beam centre offset: "
+            f"dy={1e3 * float(beam_y_offset_m):+.3f} mm, "
+            f"dz={1e3 * float(beam_z_offset_m):+.3f} mm; "
+            f"absolute centre=(y={1e3 * y0:+.3f} mm, "
+            f"z={1e3 * z0:+.3f} mm)"
+        )
 
     p0s, v0s, K0s, Phi0s = make_primary_beam_near_sample(
         N=N_primary,
@@ -2521,6 +2535,14 @@ def run_cascade_batch_parallel(
         "E0_eV": E0_eV,
         "integrator": integrator,
 
+        # Beam-position metadata.  Offsets are relative to the analytical
+        # sample front-face centre and are kept separate from sample geometry.
+        "beam_sigma": float(beam_sigma),
+        "beam_y_offset_m": float(beam_y_offset_m),
+        "beam_z_offset_m": float(beam_z_offset_m),
+        "beam_center_y_m": float(y0),
+        "beam_center_z_m": float(z0),
+
         "grid_transparency": grid_transparency,
         "yield_model_sources": yield_model_sources,
         "emission_sampler_sources": emission_sampler_sources,
@@ -2568,6 +2590,11 @@ def print_cascade_batch_summary(result: dict):
     print("Cascade batch summary")
     print("---------------------")
     print(f"N primary:               {s['N_primary']}")
+    print(
+        "Beam offset (dy,dz):     "
+        f"({1e3 * result.get('beam_y_offset_m', 0.0):+.3f}, "
+        f"{1e3 * result.get('beam_z_offset_m', 0.0):+.3f}) mm"
+    )
     print(f"N cascade electrons:     {s['N_cascade_electrons']}")
     print(f"N SE:                    {s['N_SE']}")
     print(f"N BSE:                   {s['N_BSE']}")
