@@ -2609,6 +2609,67 @@ def _surface_model_key(models: dict, surface_name: str) -> str:
     return fam
 
 
+def _scaled_joint_library_yield(
+    library: dict,
+    active_curve: dict,
+    Einc: float,
+    theta_deg: float,
+    kind: str,
+    interpolator,
+) -> float:
+    """Return a joint-library yield with the active zero-angle curve scaling.
+
+    The full Ti/Mo/C/Cu joint libraries carry their own angle-resolved absolute
+    yields.  Sensitivity studies, however, perturb the normal-incidence curve in
+    ``yield_models`` while leaving the joint library itself unchanged.  Without
+    this bridge, a joint-library early return silently bypasses those
+    perturbations.
+
+    The active zero-angle curve is therefore interpreted as a multiplicative
+    normalization of the library: at each incident energy, the ratio
+
+        active_curve(E) / library_zero_angle_curve(E)
+
+    is applied to the full angle-resolved library yield.  This preserves the
+    library's angular dependence and correlated emitted-energy/direction
+    sampling while changing only the requested yield magnitude.  For an
+    unperturbed production model the ratio is exactly unity.
+
+    A zero baseline yield has no meaningful multiplicative ratio.  Sensitivity
+    perturbations of the current form leave such points at zero, so the neutral
+    scale factor 1 is used there.
+    """
+    kind = str(kind).upper()
+    if kind not in ("SEY", "BSEY"):
+        raise ValueError(f"unknown joint-library yield kind: {kind}")
+
+    base_value = max(0.0, float(
+        interpolator(library, Einc, theta_deg, kind)
+    ))
+
+    angle_models = library.get("angle_models", None)
+    if not angle_models:
+        return base_value
+
+    zero_model = angle_models[0]
+    zero_curve = zero_model.get("yield", {}).get(kind, None)
+    if zero_curve is None:
+        return base_value
+
+    baseline_zero = float(interp_yield_model(zero_curve, Einc))
+    active_zero = float(interp_yield_model(active_curve, Einc))
+
+    if not np.isfinite(baseline_zero) or baseline_zero <= 1.0e-15:
+        return base_value
+    if not np.isfinite(active_zero):
+        raise ValueError(
+            f"non-finite active {kind} sensitivity curve at E={float(Einc):g} eV"
+        )
+
+    scale = max(0.0, active_zero) / baseline_zero
+    return max(0.0, base_value * scale)
+
+
 def sample_surface_event(
     yield_models: dict,
     surface_name: str,
@@ -2621,10 +2682,13 @@ def sample_surface_event(
     """
     Sample the number of BSE and SE electrons emitted by one surface impact.
 
-    Multipliers
-    -----------
-    Yields come straight from the curves in yield_models; there are no
-    tunable multipliers.
+    Yield normalization
+    -------------------
+    Legacy paths read the curves in ``yield_models`` directly.  When a full
+    angle-resolved joint library is active, its angular yield is normalized by
+    the corresponding active zero-angle curve in ``yield_models``.  This is
+    unity in ordinary production runs and lets sensitivity-study perturbations
+    change yield magnitude without replacing the joint energy/direction model.
 
     Returns
     -------
@@ -2658,11 +2722,13 @@ def sample_surface_event(
         theta_deg = float(np.degrees(np.arccos(
             np.clip(float(cos_theta), 0.0, 1.0)
         )))
-        sey_val = interp_ti_receiver_yield(
-            ti_receiver_library, Einc, theta_deg, "SEY"
+        sey_val = _scaled_joint_library_yield(
+            ti_receiver_library, sey_mdl, Einc, theta_deg, "SEY",
+            interp_ti_receiver_yield,
         )
-        bsey_val = interp_ti_receiver_yield(
-            ti_receiver_library, Einc, theta_deg, "BSEY"
+        bsey_val = _scaled_joint_library_yield(
+            ti_receiver_library, bsey_mdl, Einc, theta_deg, "BSEY",
+            interp_ti_receiver_yield,
         )
         Nbse = _sample_integer_count_from_mean(bsey_val, rng)
         Nse = int(rng.poisson(max(0.0, float(sey_val))))
@@ -2677,11 +2743,13 @@ def sample_surface_event(
         theta_deg = float(np.degrees(np.arccos(
             np.clip(float(cos_theta), 0.0, 1.0)
         )))
-        sey_val = interp_mo_holder_yield(
-            mo_holder_library, Einc, theta_deg, "SEY"
+        sey_val = _scaled_joint_library_yield(
+            mo_holder_library, sey_mdl, Einc, theta_deg, "SEY",
+            interp_mo_holder_yield,
         )
-        bsey_val = interp_mo_holder_yield(
-            mo_holder_library, Einc, theta_deg, "BSEY"
+        bsey_val = _scaled_joint_library_yield(
+            mo_holder_library, bsey_mdl, Einc, theta_deg, "BSEY",
+            interp_mo_holder_yield,
         )
         Nbse = _sample_integer_count_from_mean(bsey_val, rng)
         Nse = int(rng.poisson(max(0.0, float(sey_val))))
@@ -2700,11 +2768,13 @@ def sample_surface_event(
         theta_deg = float(np.degrees(np.arccos(
             np.clip(float(cos_theta), 0.0, 1.0)
         )))
-        sey_val = interp_carbon_yield(
-            carbon_joint_library, Einc, theta_deg, "SEY"
+        sey_val = _scaled_joint_library_yield(
+            carbon_joint_library, sey_mdl, Einc, theta_deg, "SEY",
+            interp_carbon_yield,
         )
-        bsey_val = interp_carbon_yield(
-            carbon_joint_library, Einc, theta_deg, "BSEY"
+        bsey_val = _scaled_joint_library_yield(
+            carbon_joint_library, bsey_mdl, Einc, theta_deg, "BSEY",
+            interp_carbon_yield,
         )
         Nbse = _sample_integer_count_from_mean(bsey_val, rng)
         Nse = int(rng.poisson(max(0.0, float(sey_val))))
@@ -2719,11 +2789,13 @@ def sample_surface_event(
         theta_deg = float(np.degrees(np.arccos(
             np.clip(float(cos_theta), 0.0, 1.0)
         )))
-        sey_val = interp_cu_sample_yield(
-            cu_sample_library, Einc, theta_deg, "SEY"
+        sey_val = _scaled_joint_library_yield(
+            cu_sample_library, sey_mdl, Einc, theta_deg, "SEY",
+            interp_cu_sample_yield,
         )
-        bsey_val = interp_cu_sample_yield(
-            cu_sample_library, Einc, theta_deg, "BSEY"
+        bsey_val = _scaled_joint_library_yield(
+            cu_sample_library, bsey_mdl, Einc, theta_deg, "BSEY",
+            interp_cu_sample_yield,
         )
         Nbse = _sample_integer_count_from_mean(bsey_val, rng)
         Nse = int(rng.poisson(max(0.0, float(sey_val))))
@@ -3438,6 +3510,10 @@ def generate_surface_emissions(
     # needs the actual angle to query the JMONSEL angular table.
     cos_theta = float(np.clip(-float(np.dot(vhat, n_out)), 0.0, 1.0))
 
+    diagnostic_model_key = _surface_model_key(yield_models, surface_name)
+    diagnostic_sey_mdl = yield_models[diagnostic_model_key]["SEY"]
+    diagnostic_bsey_mdl = yield_models[diagnostic_model_key]["BSEY"]
+
     receiver_ti_library = (
         yield_models.get("receiver", {}).get("ti_joint_library", None)
         if surf == "receiver"
@@ -3448,17 +3524,13 @@ def generate_surface_emissions(
         event_info.update({
             "receiver_ti_joint_sampler_used": True,
             "receiver_ti_incidence_angle_deg": receiver_incidence_theta_deg,
-            "receiver_ti_sey_mean_used": interp_ti_receiver_yield(
-                receiver_ti_library,
-                Einc,
-                receiver_incidence_theta_deg,
-                "SEY",
+            "receiver_ti_sey_mean_used": _scaled_joint_library_yield(
+                receiver_ti_library, diagnostic_sey_mdl, Einc,
+                receiver_incidence_theta_deg, "SEY", interp_ti_receiver_yield,
             ),
-            "receiver_ti_bsey_mean_used": interp_ti_receiver_yield(
-                receiver_ti_library,
-                Einc,
-                receiver_incidence_theta_deg,
-                "BSEY",
+            "receiver_ti_bsey_mean_used": _scaled_joint_library_yield(
+                receiver_ti_library, diagnostic_bsey_mdl, Einc,
+                receiver_incidence_theta_deg, "BSEY", interp_ti_receiver_yield,
             ),
         })
 
@@ -3472,11 +3544,13 @@ def generate_surface_emissions(
         event_info.update({
             "holder_mo_joint_sampler_used": True,
             "holder_mo_incidence_angle_deg": holder_incidence_theta_deg,
-            "holder_mo_sey_mean_used": interp_mo_holder_yield(
-                holder_mo_library, Einc, holder_incidence_theta_deg, "SEY"
+            "holder_mo_sey_mean_used": _scaled_joint_library_yield(
+                holder_mo_library, diagnostic_sey_mdl, Einc,
+                holder_incidence_theta_deg, "SEY", interp_mo_holder_yield,
             ),
-            "holder_mo_bsey_mean_used": interp_mo_holder_yield(
-                holder_mo_library, Einc, holder_incidence_theta_deg, "BSEY"
+            "holder_mo_bsey_mean_used": _scaled_joint_library_yield(
+                holder_mo_library, diagnostic_bsey_mdl, Einc,
+                holder_incidence_theta_deg, "BSEY", interp_mo_holder_yield,
             ),
         })
 
@@ -3496,11 +3570,13 @@ def generate_surface_emissions(
         event_info.update({
             "carbon_joint_sampler_used": True,
             "carbon_incidence_angle_deg": carbon_incidence_theta_deg,
-            "carbon_sey_mean_used": interp_carbon_yield(
-                carbon_joint_library, Einc, carbon_incidence_theta_deg, "SEY"
+            "carbon_sey_mean_used": _scaled_joint_library_yield(
+                carbon_joint_library, diagnostic_sey_mdl, Einc,
+                carbon_incidence_theta_deg, "SEY", interp_carbon_yield,
             ),
-            "carbon_bsey_mean_used": interp_carbon_yield(
-                carbon_joint_library, Einc, carbon_incidence_theta_deg, "BSEY"
+            "carbon_bsey_mean_used": _scaled_joint_library_yield(
+                carbon_joint_library, diagnostic_bsey_mdl, Einc,
+                carbon_incidence_theta_deg, "BSEY", interp_carbon_yield,
             ),
         })
 
@@ -3514,17 +3590,13 @@ def generate_surface_emissions(
         event_info.update({
             "sample_cu_joint_sampler_used": True,
             "sample_cu_incidence_angle_deg": sample_incidence_theta_deg,
-            "sample_cu_sey_mean_used": interp_cu_sample_yield(
-                cu_sample_library,
-                Einc,
-                sample_incidence_theta_deg,
-                "SEY",
+            "sample_cu_sey_mean_used": _scaled_joint_library_yield(
+                cu_sample_library, diagnostic_sey_mdl, Einc,
+                sample_incidence_theta_deg, "SEY", interp_cu_sample_yield,
             ),
-            "sample_cu_bsey_mean_used": interp_cu_sample_yield(
-                cu_sample_library,
-                Einc,
-                sample_incidence_theta_deg,
-                "BSEY",
+            "sample_cu_bsey_mean_used": _scaled_joint_library_yield(
+                cu_sample_library, diagnostic_bsey_mdl, Einc,
+                sample_incidence_theta_deg, "BSEY", interp_cu_sample_yield,
             ),
         })
 
@@ -3599,17 +3671,13 @@ def generate_surface_emissions(
             sample_theta_deg = sample_incidence_theta_deg
             sample_sey_gain = 1.0
             sample_bsey_gain = 1.0
-            sample_sey_mean = max(
-                0.0,
-                interp_cu_sample_yield(
-                    cu_sample_library, Einc, sample_theta_deg, "SEY"
-                ),
+            sample_sey_mean = _scaled_joint_library_yield(
+                cu_sample_library, yield_models["sample"]["SEY"], Einc,
+                sample_theta_deg, "SEY", interp_cu_sample_yield,
             )
-            sample_bsey_mean = max(
-                0.0,
-                interp_cu_sample_yield(
-                    cu_sample_library, Einc, sample_theta_deg, "BSEY"
-                ),
+            sample_bsey_mean = _scaled_joint_library_yield(
+                cu_sample_library, yield_models["sample"]["BSEY"], Einc,
+                sample_theta_deg, "BSEY", interp_cu_sample_yield,
             )
             sample_model = "SEEMC_Cu_joint_library"
         else:
