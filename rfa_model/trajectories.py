@@ -1047,10 +1047,13 @@ def integrate_one_electron(
                             intersector,
                             face_owner,
                             collision_mesh,
-                            exclude_owners={"sample"},
+                            exclude_owners=None,
                         )
 
-                    hit = stl_hit if stl_hit is not None else sample_hit
+                    if sample_hit is not None:
+                        sample_hit = dict(sample_hit)
+                        sample_hit["distance"] = float(np.linalg.norm(sample_hit["location"] - p))
+                    hit = nearest_hit(sample_hit, stl_hit)
 
                     if hit is not None:
                         hit = dict(hit)
@@ -1225,11 +1228,7 @@ def integrate_one_electron(
                 intersector,
                 face_owner,
                 collision_mesh,
-                exclude_owners=(
-                    {"sample"}
-                    if sample_plane_return and sample_geometry is not None
-                    else None
-                ),
+                exclude_owners=None,
             )
 
         hit_grid = first_analytic_grid_hit(
@@ -1262,9 +1261,11 @@ def integrate_one_electron(
                 }
 
             if hit["kind"] == "stl":
-                append_track(hit["location"], v_new, force=True)
-                hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_new)
-                hit["v_in"] = np.asarray(v_new, dtype=float).copy()
+                t_hit = float(np.clip(hit.get("t", 1.0), 0.0, 1.0))
+                v_hit = v + t_hit * (v_new - v)
+                append_track(hit["location"], v_hit, force=True)
+                hit["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v_hit)
+                hit["v_in"] = np.asarray(v_hit, dtype=float).copy()
                 hit["p_before"] = np.asarray(p, dtype=float).copy()
 
                 traj_out, vel_out = packed_track()

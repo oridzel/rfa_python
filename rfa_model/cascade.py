@@ -130,24 +130,11 @@ def infer_sample_front_face_geometry_from_stl(
     plane_tolerance_m: float = 2.0e-6,
     fallback_center=None,
 ) -> dict:
-    """Build a pivot-anchored analytic sample face using STL dimensions.
+    """Infer the exposed finite face in the actual collision-STL coordinates.
 
-    The sample solid has finite thickness, so the midpoint of its *rotated
-    axis-aligned bounding box* is not the front-face centre at grazing angle.
-    Instead, identify sample-owned triangles whose normals are parallel to the
-    expected rotated front-face normal and select the outermost plane along
-    that normal.  The local U/V *spans* are measured from those triangles, but
-    their absolute STL coordinates are deliberately not copied into the
-    analytic collision geometry.  The analytic face is anchored at the known
-    rotation pivot/front-face position.
-
-    ``fallback_center`` is retained as the argument name for compatibility,
-    but when supplied it is the authoritative face anchor even when STL
-    inference succeeds.  Otherwise the anchor is
-    ``(x_sample, 0, midpoint(sample_z_bounds))``.
-
-    If STL inference is impossible, use the supplied sample bounds on the same
-    pivot-anchored plane.
+    Use STL front-face center and dimensions so analytic and solid collision
+    boundaries agree. The prescribed pivot is only a fallback when no sample
+    STL is available. Reject a mechanical-angle/STL-normal mismatch.
     """
     a = np.deg2rad(float(theta_deg))
     n_expected = unit(np.array([np.cos(a), np.sin(a), 0.0], dtype=float))
@@ -171,6 +158,19 @@ def infer_sample_front_face_geometry_from_stl(
 
     if face_anchor.shape != (3,) or not np.all(np.isfinite(face_anchor)):
         raise ValueError("sample face anchor must be a finite three-vector")
+
+    # Do not silently combine a field/STL at one angle with another face angle.
+    sample_ids_check = [i for i, owner in enumerate(face_owner)
+                        if canonical_surface_name(owner) == "sample"]
+    if sample_ids_check:
+        areas = np.asarray(collision_mesh.area_faces)[sample_ids_check]
+        largest = sample_ids_check[int(np.argmax(areas))]
+        mesh_normal = unit(np.asarray(collision_mesh.face_normals[largest]))
+        mismatch_deg = float(np.degrees(np.arccos(np.clip(
+            abs(float(np.dot(mesh_normal, n_expected))), 0.0, 1.0))))
+        if mismatch_deg > 0.1:
+            raise ValueError(f"Sample STL/front-plane angle mismatch: {mismatch_deg:.6g} deg. "
+                             "Rebuild/load field and collision mesh at sample_theta_deg.")
 
     try:
         owners = np.asarray(face_owner, dtype=object)
@@ -223,10 +223,8 @@ def infer_sample_front_face_geometry_from_stl(
             + v_center_raw * v_axis
         )
 
-        # The aligned collision STL may carry an assembly translation.  That
-        # translation must not redefine the analytical sample coordinate
-        # system or move the primary beam.  Preserve only the measured face
-        # dimensions and place them symmetrically about the known pivot.
+        # Preserve the actual STL face position as well as its dimensions.
+        # Beam offsets are now relative to this physical front-face center.
         u_span = u_max_abs - u_min_abs
         v_span = v_max_abs - v_min_abs
         if not (np.isfinite(u_span) and u_span > 0.0):
@@ -234,7 +232,7 @@ def infer_sample_front_face_geometry_from_stl(
         if not (np.isfinite(v_span) and v_span > 0.0):
             raise ValueError("sample STL front face has invalid V span")
 
-        center = face_anchor.copy()
+        center = stl_center_raw.copy()
         u_bounds = (-0.5 * u_span, 0.5 * u_span)
         v_bounds = (-0.5 * v_span, 0.5 * v_span)
 
@@ -247,7 +245,7 @@ def infer_sample_front_face_geometry_from_stl(
             u_bounds=u_bounds,
             v_bounds=v_bounds,
             theta_deg=float(theta_deg),
-            source="sample_stl_extents_pivot_anchored",
+            source="sample_stl_front_face_aligned",
         )
         g.update({
             "front_face_triangle_count": int(front_face_ids.size),
@@ -590,31 +588,12 @@ def generate_cascade_emissions_from_hit(
     """
     surface_name = cascade_surface_name(surface_name)
 
-    # For first-generation gun -> sample emission, the incidence-specific
-    # joint sampler is defined in the basis of the *analytic mechanical sample
-    # face*.  At very grazing incidence (e.g. 89 deg), a voxel/STL fallback
-    # hit normal can differ dramatically from that face normal and can make a
-    # perfectly valid near-tangent SEEMC event reconstruct as inward.
-    #
-    # Therefore use the authoritative analytic sample normal for gun impacts.
-    # Later cascade re-impacts retain the ordinary hit-local normal logic.
-    if (
-        surface_name == "sample"
-        and str(origin).lower() == "gun"
-        and sample_geometry is not None
-        and sample_geometry.get("normal", None) is not None
-    ):
-        n_out = unit(np.asarray(sample_geometry["normal"], dtype=float))
-    else:
-        n_out = estimate_surface_normal(
-            surface_name,
-            r_hit=r_hit,
-            v_in=v_in,
-            hit_info=hit_info,
-            sample_normal=(
-                None if sample_geometry is None else sample_geometry.get("normal", None)
-            ),
-        )
+    # Both front and side sample impacts carry their actual local normal.
+    n_out = estimate_surface_normal(
+        surface_name, r_hit=r_hit, v_in=v_in, hit_info=hit_info,
+        sample_normal=(None if sample_geometry is None
+                       else sample_geometry.get("normal", None)),
+    )
 
     # Use very small normal offset in generate_surface_emissions; the safe
     # launch point is found by make_emissions_safe_to_launch() using the
@@ -1614,6 +1593,27 @@ def cascade_log_to_dataframe(cascade_log: list[dict]):
 # Cascade batch runners
 # ============================================================
 
+def _cascade_chunk_seeds(seed: int, n_chunks: int, scheme: str = "seedsequence_v1"):
+    """Deterministic chunk seeds without sharing streams between run seeds.
+
+    The legacy additive scheme can share most chunk seeds across repeated
+    runs. Keep it only for reproducing archived calculations. Spawned child
+    seeds use all four 32-bit SeedSequence state words, packed into a Python
+    integer so existing worker and visualization APIs remain compatible.
+    """
+    if scheme == "legacy_additive":
+        return [int(seed) + 5000 + i for i in range(n_chunks)]
+    if scheme != "seedsequence_v1":
+        raise ValueError(
+            "chunk_seed_scheme must be 'seedsequence_v1' or 'legacy_additive'"
+        )
+    children = np.random.SeedSequence(int(seed)).spawn(n_chunks)
+    return [
+        sum(int(word) << (32 * j) for j, word in enumerate(child.generate_state(4)))
+        for child in children
+    ]
+
+
 def _run_cascade_chunk(
     chunk_index: int,
     p0s_chunk,
@@ -1847,7 +1847,8 @@ def primary_results_to_dataframe(
             and reason == "hit_sample"
         ):
             vhat = v_hit / np.linalg.norm(v_hit)
-            incidence_cos = float(np.clip(-np.dot(vhat, sample_normal), -1.0, 1.0))
+            impact_normal = unit(np.asarray(hit_info.get("normal", sample_normal)))
+            incidence_cos = float(np.clip(-np.dot(vhat, impact_normal), -1.0, 1.0))
             incidence_angle_deg = float(np.degrees(np.arccos(incidence_cos)))
 
         rows.append({
@@ -1872,6 +1873,11 @@ def primary_results_to_dataframe(
             "direction_change_deg": direction_change_deg,
             "incidence_cos": incidence_cos,
             "incidence_angle_deg": incidence_angle_deg,
+            "sample_face": (None if reason != "hit_sample" else
+                            hit_info.get("sample_face", "front")),
+            "terminal_owner": None if hit_info is None else hit_info.get("owner_name", hit_info.get("owner")),
+            "front_face_angle_deg": (np.nan if reason != "hit_sample" or sample_normal is None else
+                float(np.degrees(np.arccos(np.clip(-np.dot(v_hit / np.linalg.norm(v_hit), sample_normal), -1, 1))))),
             "sample_voxel_artifact_traversal": (
                 False if hit_info is None
                 else bool(hit_info.get("sample_voxel_artifact_traversal", False))
@@ -1946,6 +1952,7 @@ def run_cascade_batch_parallel(
     track_primary_only: bool = False,
     tracked_primary_indices: set[int] | None = None,
     track_sub_barrier_sample_emissions: bool = False,
+    chunk_seed_scheme: str = "seedsequence_v1",
 ):
     """
     Parallel cascade batch runner.
@@ -1954,6 +1961,12 @@ def run_cascade_batch_parallel(
     -------
     result:
         dict containing primary/cascade dataframes, logs, accounting, and runtime.
+
+    chunk_seed_scheme:
+        'seedsequence_v1' creates distinct reproducible chunk streams for each
+        run seed. 'legacy_additive' reproduces the archived seed assignment;
+        nearby run seeds can reuse streams under that scheme, so it must not
+        be used to claim independent Monte Carlo repeats.
     """
     from joblib import Parallel, delayed
     from pathlib import Path
@@ -1964,6 +1977,11 @@ def run_cascade_batch_parallel(
 
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
+
+    if chunk_seed_scheme not in {"seedsequence_v1", "legacy_additive"}:
+        raise ValueError(
+            "chunk_seed_scheme must be 'seedsequence_v1' or 'legacy_additive'"
+        )
 
     if track_stride <= 0:
         raise ValueError("track_stride must be positive")
@@ -2299,7 +2317,9 @@ def run_cascade_batch_parallel(
         stop = min(start + chunk_size, N_primary)
         chunks.append((start, stop))
 
-    chunk_seeds = seed + 5000 + np.arange(len(chunks))
+    chunk_seeds = _cascade_chunk_seeds(seed, len(chunks), chunk_seed_scheme)
+    if verbose:
+        print(f"[cascade] chunk seed scheme: {chunk_seed_scheme}; run seed={int(seed)}")
 
     tmp_base = (
         os.environ.get("SLURM_TMPDIR")
@@ -2567,6 +2587,8 @@ def run_cascade_batch_parallel(
 
         "n_jobs": n_jobs,
         "chunk_size": chunk_size,
+        "seed": int(seed),
+        "chunk_seed_scheme": chunk_seed_scheme,
 
         "track_points": track_points,
         "track_stride": track_stride,

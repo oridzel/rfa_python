@@ -311,13 +311,13 @@ def _finalize_sample_stl_hit(hit: dict, v_hit, p_before, sample_geometry=None) -
     n = h.get("normal", None)
     if n is not None:
         n = unit(np.asarray(n, dtype=float))
-        # For the exposed face, prefer the known analytic outward orientation.
-        if sample_geometry is not None:
-            n_ref = unit(np.asarray(sample_geometry["normal"], dtype=float))
-            if np.dot(n, n_ref) < 0:
-                n = -n
-        elif np.dot(n, v_hit) > 0:
+        # Entry impacts must retain the local face normal, not the front normal.
+        if np.dot(n, v_hit) > 0:
             n = -n
+        if sample_geometry is not None:
+            alignment = float(np.dot(n, unit(sample_geometry["normal"])))
+            h["sample_face"] = ("front" if alignment > 0.95 else
+                                "back" if alignment < -0.95 else "side")
         h["normal"] = n
 
     return h
@@ -377,11 +377,9 @@ def fly_primary_to_sample(
         traj = None
         vel = None
 
-    # With analytical sample geometry active, the STL sample is dimensional
-    # metadata only and must never compete with the physical analytical face.
-    stl_exclude_owners = (
-        {"sample"} if sample_geometry is not None else None
-    )
+    # The STL sample is a finite solid: retain side/back collisions as well
+    # as the continuous front-plane test, including in voxel bypasses.
+    stl_exclude_owners = None
 
     # Physics/collision logic occasionally needs the immediately preceding
     # vacuum point.  Keep it independently of optional trajectory storage.
@@ -489,10 +487,12 @@ def fly_primary_to_sample(
                             exclude_owners=stl_exclude_owners,
                         )
 
-                    artifact_terminal_hit = (
-                        hit_stl_bypass
-                        if hit_stl_bypass is not None
-                        else hit_sample_bypass
+                    if hit_sample_bypass is not None:
+                        hit_sample_bypass = dict(hit_sample_bypass)
+                        hit_sample_bypass["distance"] = float(np.linalg.norm(
+                            hit_sample_bypass["location"] - artifact_point))
+                    artifact_terminal_hit = nearest_hit(
+                        hit_sample_bypass, hit_stl_bypass
                     )
 
                     if artifact_terminal_hit is not None:
@@ -657,8 +657,7 @@ def fly_primary_to_sample(
                     )
 
                     # Test the ENTIRE bypass segment against continuous CAD.
-                    # With analytic sample geometry enabled, the translated
-                    # sample STL remains excluded exactly as in normal steps.
+                    # Include the finite sample solid, just as in normal steps.
                     hit_stl_bypass = None
                     if (
                         stl_boxes is None
