@@ -1135,6 +1135,21 @@ def integrate_one_electron(
                         extra={"original_grid_status": cls["status"]},
                     )
 
+                # The electron crossed the modeled field/update boundary, but
+                # no physical collision or named opening has been confirmed.
+                # Record the final position and velocity independently of
+                # track_points so the cascade CSV contains x_hit/y_hit/z_hit
+                # even when full trajectory storage is disabled. These are
+                # *domain-exit* coordinates, not verified surface impacts.
+                hit_info["kind"] = "domain_exit"
+                hit_info["location"] = np.asarray(p, dtype=float).copy()
+                hit_info["v_in"] = np.asarray(v, dtype=float).copy()
+                hit_info["KE_hit_eV"] = kinetic_energy_eV_from_velocity(v)
+                if p_previous is not None:
+                    hit_info["p_before"] = np.asarray(
+                        p_previous, dtype=float
+                    ).copy()
+
             append_track(p, v, force=True)
             traj_out, vel_out = packed_track()
             return {
