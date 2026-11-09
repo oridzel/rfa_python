@@ -132,9 +132,11 @@ def infer_sample_front_face_geometry_from_stl(
 ) -> dict:
     """Infer the exposed finite face in the actual collision-STL coordinates.
 
-    Use STL front-face center and dimensions so analytic and solid collision
-    boundaries agree. The prescribed pivot is only a fallback when no sample
-    STL is available. Reject a mechanical-angle/STL-normal mismatch.
+    Preserve the configured anchor (and therefore beam reference). Express
+    the physical STL edges as local, generally asymmetric bounds about that
+    anchor. Require the STL front plane to coincide with the anchored plane;
+    a tangential offset is represented by bounds, not by moving the beam.
+    Reject a mechanical-angle/STL-normal mismatch.
     """
     a = np.deg2rad(float(theta_deg))
     n_expected = unit(np.array([np.cos(a), np.sin(a), 0.0], dtype=float))
@@ -223,8 +225,7 @@ def infer_sample_front_face_geometry_from_stl(
             + v_center_raw * v_axis
         )
 
-        # Preserve the actual STL face position as well as its dimensions.
-        # Beam offsets are now relative to this physical front-face center.
+        # Keep beam reference fixed; preserve the physical STL edges.
         u_span = u_max_abs - u_min_abs
         v_span = v_max_abs - v_min_abs
         if not (np.isfinite(u_span) and u_span > 0.0):
@@ -232,9 +233,18 @@ def infer_sample_front_face_geometry_from_stl(
         if not (np.isfinite(v_span) and v_span > 0.0):
             raise ValueError("sample STL front face has invalid V span")
 
-        center = stl_center_raw.copy()
-        u_bounds = (-0.5 * u_span, 0.5 * u_span)
-        v_bounds = (-0.5 * v_span, 0.5 * v_span)
+        center = face_anchor.copy()
+        normal_offset = d - float(np.dot(center, n_expected))
+        if abs(normal_offset) > float(plane_tolerance_m):
+            raise ValueError(
+                "Sample STL front plane differs from configured sample_face_center "
+                f"by {normal_offset:.9g} m along the normal. "
+                "Check mesh/field alignment; do not translate only the collision mesh."
+            )
+        anchor_u = float(np.dot(center, u_axis))
+        anchor_v = float(np.dot(center, v_axis))
+        u_bounds = (u_min_abs - anchor_u, u_max_abs - anchor_u)
+        v_bounds = (v_min_abs - anchor_v, v_max_abs - anchor_v)
 
         g = _patch_sample_geometry_extents(
             base,
@@ -245,7 +255,7 @@ def infer_sample_front_face_geometry_from_stl(
             u_bounds=u_bounds,
             v_bounds=v_bounds,
             theta_deg=float(theta_deg),
-            source="sample_stl_front_face_aligned",
+            source="sample_stl_edges_configured_anchor",
         )
         g.update({
             "front_face_triangle_count": int(front_face_ids.size),
@@ -254,11 +264,22 @@ def infer_sample_front_face_geometry_from_stl(
             "front_plane_tolerance_m": float(plane_tolerance_m),
             "stl_front_face_center_raw": stl_center_raw,
             "stl_front_plane_offset_raw_m": d,
+            "stl_to_analytic_normal_offset_m": normal_offset,
+            "stl_front_face_center_local_uv_m": (
+                u_center_raw - anchor_u, v_center_raw - anchor_v
+            ),
             "stl_to_analytic_center_shift_m": center - stl_center_raw,
         })
         return g
 
     except Exception as exc:
+        # With a physical sample mesh present, a fallback rectangle could hide
+        # a contradictory solid boundary. Require the mismatch to be resolved.
+        if sample_ids_check:
+            raise RuntimeError(
+                "Could not reconcile sample STL with configured sample anchor: "
+                f"{exc}"
+            ) from exc
         center = face_anchor.copy()
 
         # Preserve generous finite bounds on fallback.  The key correction is
@@ -2238,8 +2259,8 @@ def run_cascade_batch_parallel(
                 f"for {sampler_angle:g} deg"
             )
 
-    # This is a coordinate-system invariant: STL placement can supply face
-    # dimensions, never move the analytical face away from its configured
+    # This is a coordinate-system invariant: STL placement supplies local
+    # edge bounds, never moves the analytical anchor away from its configured
     # pivot.  Fail loudly if a future geometry change violates it.
     if not np.allclose(
         np.asarray(sample_geometry["center"], dtype=float),
