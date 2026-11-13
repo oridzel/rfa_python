@@ -9,6 +9,7 @@ description = "RFA electron trajectory, emission, cascade, and current accountin
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
+    "numba",
     "scipy",
     "pandas",
     "matplotlib",
