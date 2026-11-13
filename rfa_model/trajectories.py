@@ -1315,7 +1315,13 @@ def integrate_one_electron(
                     }
 
                 if event_type == "transmit_grid":
-                    T = transparency_for_owner(grid_transparency, owner, default=1.0)
+                    T = grid_transmission_probability(
+                        grid_transparency,
+                        owner,
+                        v=v_new,
+                        r_hit=hit["location"],
+                        rng=rng,
+                    )
                     u = rng.random()
 
                     if u > T:
@@ -1710,6 +1716,94 @@ def place_emitted_particle_in_vacuum(
         )),
     })
     return p, cls, False
+
+
+GRID_TRANSMISSION_MODELS = ("woven_mesh", "constant")
+DEFAULT_GRID_TRANSMISSION_MODEL = "woven_mesh"
+
+
+def grid_transmission_model(grid_transparency) -> str:
+    """Transmission model selected by ``grid_transparency["model"]``."""
+    model = DEFAULT_GRID_TRANSMISSION_MODEL
+    if isinstance(grid_transparency, dict):
+        model = str(grid_transparency.get("model", model)).strip().lower()
+    if model not in GRID_TRANSMISSION_MODELS:
+        raise ValueError(
+            f"grid_transparency['model'] must be one of {GRID_TRANSMISSION_MODELS}, "
+            f"got {model!r}"
+        )
+    return model
+
+
+def woven_mesh_transmission(T0: float, cos_alpha: float, psi: float) -> float:
+    """Geometric transmission of a square woven mesh for an oblique crossing.
+
+    The mesh is two orthogonal sets of round wires (diameter d, pitch p).  A
+    round wire has the same projected width d from every viewing direction,
+    but the projected spacing of a wire set shrinks when the electron's path
+    is tilted across it.  For a path at angle ``alpha`` to the mesh normal,
+    tilted in the direction that makes angle ``psi`` with the first wire set,
+    the blocked fractions are
+
+        f_1 = f0 * sqrt(1 - sin^2(alpha) cos^2(psi)) / cos(alpha)
+        f_2 = f0 * sqrt(1 - sin^2(alpha) sin^2(psi)) / cos(alpha)
+
+    and T = (1 - f_1)(1 - f_2), each f capped at 1.  ``f0 = d/p`` is fixed by
+    the normal-incidence transparency, ``T0 = (1 - f0)^2``, so ``T0`` keeps
+    its meaning as the tunable normal-incidence (optical) open fraction.
+
+    The result is purely geometric and therefore independent of energy: a
+    ballistic electron cannot exceed it.  Deflection by the fields around the
+    wires only matters for electrons within about a volt of zero kinetic
+    energy at the mesh and is not modelled.
+    """
+    T0 = float(np.clip(T0, 0.0, 1.0))
+    c = abs(float(cos_alpha))
+    if c >= 1.0 - 1.0e-12:
+        return T0
+    f0 = 1.0 - np.sqrt(T0)
+    if c <= 1.0e-9:
+        return 0.0
+    s2 = max(0.0, 1.0 - c * c)
+    f1 = min(1.0, f0 * np.sqrt(max(0.0, 1.0 - s2 * np.cos(psi) ** 2)) / c)
+    f2 = min(1.0, f0 * np.sqrt(max(0.0, 1.0 - s2 * np.sin(psi) ** 2)) / c)
+    return float((1.0 - f1) * (1.0 - f2))
+
+
+def grid_transmission_probability(
+    grid_transparency,
+    owner,
+    v,
+    r_hit,
+    rng,
+    default: float = 1.0,
+    center=None,
+) -> float:
+    """Probability that one crossing of a grid shell misses the wires.
+
+    ``grid_transparency[owner]`` is the normal-incidence transparency T0.
+    With ``grid_transparency["model"] == "woven_mesh"`` (default) the value is
+    reduced for oblique crossings according to ``woven_mesh_transmission``;
+    the local orientation of the formed mesh is not known, so the in-plane
+    angle is drawn uniformly at each crossing.  ``"constant"`` reproduces the
+    earlier angle-independent behaviour.
+    """
+    T0 = transparency_for_owner(grid_transparency, owner, default=default)
+    if grid_transmission_model(grid_transparency) == "constant":
+        return float(T0)
+
+    r = np.asarray(r_hit, dtype=float)
+    if center is not None:
+        r = r - np.asarray(center, dtype=float)
+    rn = float(np.linalg.norm(r))
+    vv = np.asarray(v, dtype=float)
+    vn = float(np.linalg.norm(vv))
+    if rn <= 0.0 or vn <= 0.0:
+        return float(T0)
+
+    cos_alpha = abs(float(np.dot(vv, r))) / (vn * rn)
+    psi = 0.5 * np.pi * rng.random()
+    return woven_mesh_transmission(T0, cos_alpha, psi)
 
 
 def transparency_for_owner(grid_transparency, owner, default=1.0):

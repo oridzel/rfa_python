@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import os
+import re
 import warnings
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -906,6 +909,22 @@ def sample_ti_receiver_joint_event(
     event = dict(sample_joint_emission_event(joint, Einc=Einc, rng=rng))
     event["sampler_incidence_angle_deg"] = float(chosen["angle_deg"])
     event["sampler_angle_source_dir"] = str(chosen["source_dir"])
+    event["ti_specular_reconstructed"] = False
+
+    # Same treatment as Cu, Mo and C: the specular branch keeps its sampled
+    # probability but is launched at the actual incidence angle and energy.
+    if _joint_event_is_exact_specular(
+        event, sampler_alpha_deg=chosen["angle_deg"]
+    ):
+        event = _reconstruct_exact_specular_event(
+            event,
+            actual_Einc_eV=Einc,
+            actual_theta_deg=theta_deg,
+        )
+        event["ti_specular_reconstructed"] = True
+    else:
+        _rescale_joint_event_energy(event, Einc, kind)
+
     return event
 
 
@@ -1051,6 +1070,8 @@ def sample_carbon_joint_event(
         event["carbon_specular_direction_correction_deg"] = float(
             event.get("cu_specular_direction_correction_deg", 0.0)
         )
+    else:
+        _rescale_joint_event_energy(event, Einc, kind)
 
     return event
 
@@ -1291,6 +1312,8 @@ def sample_cu_sample_joint_event(
             actual_Einc_eV=Einc,
             actual_theta_deg=theta_deg,
         )
+    else:
+        _rescale_joint_event_energy(event, Einc, kind)
 
     return event
 
@@ -1352,6 +1375,8 @@ def sample_mo_holder_joint_event(
         event["mo_specular_direction_correction_deg"] = float(
             event.get("cu_specular_direction_correction_deg", 0.0)
         )
+    else:
+        _rescale_joint_event_energy(event, Einc, kind)
 
     return event
 
@@ -1861,6 +1886,10 @@ def load_default_surface_models(
     sample_gun_incidence_tolerance_deg: float = 0.5,
     require_sample_gun_joint_sampler: bool = False,
     sampler_library_dir: str | Path | None = None,
+    use_sampler_library: bool = True,
+    allow_partial_sampler_library: bool = False,
+    use_primary_resolved_sampling: bool = True,
+    verbose: bool = True,
     receiver_ti_sampler_dir: str | Path | None = None,
     holder_mo_sampler_dir: str | Path | None = None,
     carbon_seemc_yield_dir: str | Path | None = None,
@@ -1952,6 +1981,25 @@ def load_default_surface_models(
         (gun and cascade) by bracketing the actual incidence angle and drawing
         correlated emitted events from the corresponding joint NPZ files.
         This replaces the earlier yield-only hybrid.
+    use_sampler_library:
+        If True (default) and ``sampler_library_dir`` is not given, the
+        generated library is looked for automatically (see
+        ``find_sampler_library``) and used when found.  Set False to force the
+        legacy JMONSEL/Bronstein tables.
+    allow_partial_sampler_library:
+        By default a sampler library must provide all four materials (Cu, Mo,
+        Ti, C), each with at least two ``alpha_*deg`` folders; otherwise an
+        error is raised, because a missing material silently falling back to
+        the legacy tables changes the physics without notice.  Set True to
+        accept a partial library (a warning lists what fell back).
+    use_primary_resolved_sampling:
+        If True (default), every impact on a sampler-library surface emits the
+        complete outcome of one simulated primary, read from the library's
+        ``alpha_*deg/raw`` cases (true multiplicities, SE-BSE correlations and
+        energy conservation).  Alpha folders without raw cases, or False, use
+        independent SE and BSE draws from the pooled joint samplers.
+    verbose:
+        Print a one-line-per-surface summary of the models actually in use.
     receiver_ti_sampler_dir:
         Optional explicit override for the Ti root. If omitted and
         ``sampler_library_dir`` is supplied, ``sampler_library_dir / "Ti"`` is
@@ -1992,11 +2040,61 @@ def load_default_surface_models(
     # historical JMONSEL folder and are discovered from one root path.  Explicit
     # per-material paths remain available as overrides, but no environment
     # variables or hard-coded absolute paths are required.
+    explicit_material_dirs = any(
+        d is not None for d in (
+            receiver_ti_sampler_dir, holder_mo_sampler_dir,
+            carbon_sampler_dir, cu_sampler_dir,
+            carbon_seemc_yield_dir, cu_seemc_yield_dir,
+        )
+    )
+    if (
+        sampler_library_dir is None
+        and use_sampler_library
+        and not explicit_material_dirs
+    ):
+        sampler_library_dir = find_sampler_library(model_dir)
+        if sampler_library_dir is None:
+            warnings.warn(
+                "No generated sampler library was found (looked for a "
+                "'sampler_library' folder next to the model directory and in "
+                "the working directory; set RFA_SAMPLER_LIBRARY or pass "
+                "sampler_library_dir). Falling back to the legacy "
+                "JMONSEL/Bronstein tables.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     if sampler_library_dir is not None:
         sampler_library_dir = Path(sampler_library_dir)
         if not sampler_library_dir.is_dir():
             raise FileNotFoundError(
                 f"sampler library directory not found: {sampler_library_dir}"
+            )
+        library_status = sampler_library_status(sampler_library_dir)
+        incomplete = [m for m, n in library_status.items() if n < 2]
+        if incomplete:
+            msg = (
+                f"sampler library {sampler_library_dir} is incomplete: "
+                + ", ".join(
+                    f"{m} has {library_status[m]} alpha_*deg folder(s)"
+                    for m in incomplete
+                )
+                + ". Each of Cu, Mo, Ti and C needs at least two. The "
+                "affected surfaces would fall back to the legacy tables."
+            )
+            if not allow_partial_sampler_library:
+                raise FileNotFoundError(
+                    msg + " Pass allow_partial_sampler_library=True to accept this."
+                )
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        if "C" not in incomplete and use_measured_carbon_for_grids:
+            warnings.warn(
+                "use_measured_carbon_for_grids=True has no effect: the carbon "
+                "sampler library is active and takes precedence on every "
+                "carbon surface. To use the measured C-on-SS curves, pass the "
+                "Ti/Mo/Cu library folders explicitly and no carbon library.",
+                RuntimeWarning,
+                stacklevel=2,
             )
         if receiver_ti_sampler_dir is None:
             receiver_ti_sampler_dir = sampler_library_dir / "Ti"
@@ -2281,7 +2379,10 @@ def load_default_surface_models(
         if not angular_path.exists():
             raise FileNotFoundError(
                 f"Angle-dependent Cu sample yields are enabled, but {angular_path} "
-                "does not exist. Put yieldsCu100TDDFT10ED.csv in model_dir, or "
+                "does not exist. Files present: "
+                f"{sorted(p.name for p in model_dir.glob('yieldsCu*.csv'))}. "
+                "Pass sample_angular_yield_filename=<one of these>, "
+                "put yieldsCu100TDDFT10ED.csv in model_dir, or "
                 "call load_default_surface_models(..., "
                 "use_sample_angle_dependent_yields=False) to reproduce the old "
                 "capped-secant sample model."
@@ -2383,7 +2484,122 @@ def load_default_surface_models(
             "SE": incidence_model["theta"]["SE"],
         }
 
+    _seen = set()
+    for _models in yield_models.values():
+        for _key, _lib in _models.items():
+            if not (_key.endswith("_joint_library") and isinstance(_lib, dict)):
+                continue
+            _lib["primary_resolved"] = bool(use_primary_resolved_sampling)
+            if id(_lib) in _seen or not use_primary_resolved_sampling:
+                continue
+            _seen.add(id(_lib))
+            _have, _total = library_has_raw_cases(_lib)
+            if _have < _total:
+                warnings.warn(
+                    f"{_lib.get('source_root', _key)}: {_total - _have} of "
+                    f"{_total} alpha folders have no raw/ cases; impacts "
+                    "bracketed by those folders use independent SE/BSE draws "
+                    "instead of per-primary sampling.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+    if verbose:
+        print(describe_active_surface_models(yield_models), flush=True)
+
     return yield_models, energy_models, theta_models
+
+
+SAMPLER_LIBRARY_MATERIALS = ("Cu", "Mo", "Ti", "C")
+
+
+def sampler_library_status(sampler_library_dir: str | Path) -> dict:
+    """Number of ``alpha_*deg`` folders per material in a sampler library."""
+    root = Path(sampler_library_dir)
+    status = {}
+    for material in SAMPLER_LIBRARY_MATERIALS:
+        d = root / material
+        status[material] = (
+            sum(
+                1 for x in d.iterdir()
+                if x.is_dir() and _parse_alpha_directory_name(x.name) is not None
+            )
+            if d.is_dir() else 0
+        )
+    return status
+
+
+def find_sampler_library(model_dir: str | Path | None = None) -> Path | None:
+    """Locate the generated sampler library.
+
+    Search order: the ``RFA_SAMPLER_LIBRARY`` environment variable, a
+    ``sampler_library`` folder beside ``model_dir``, inside ``model_dir``, and
+    in the current working directory.  Returns None if none exists.
+    """
+    import os
+
+    candidates = []
+    env = os.environ.get("RFA_SAMPLER_LIBRARY", "").strip()
+    if env:
+        candidates.append(Path(env))
+    if model_dir is not None:
+        model_dir = Path(model_dir)
+        candidates.append(model_dir.parent / "sampler_library")
+        candidates.append(model_dir / "sampler_library")
+    candidates.append(Path.cwd() / "sampler_library")
+
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return None
+
+
+def describe_active_surface_models(yield_models: dict) -> str:
+    """One line per surface family: which yield/emission model is in use."""
+    library_key = {
+        "sample": "cu_joint_library",
+        "holder": "mo_joint_library",
+        "receiver": "ti_joint_library",
+        "grid": "carbon_joint_library",
+        "gridframe": "carbon_joint_library",
+        "collector": "carbon_joint_library",
+    }
+    label = {
+        "sample": "Cu sample",
+        "holder": "Mo holder",
+        "receiver": "Ti receiver",
+        "grid": "grid meshes",
+        "gridframe": "grid frames",
+        "collector": "collector/rod/drift tube",
+    }
+    lines = ["Surface models in use:"]
+    for fam in ("sample", "holder", "receiver", "grid", "gridframe", "collector"):
+        models = yield_models.get(fam, {})
+        lib = models.get(library_key[fam])
+        if lib is not None:
+            angles = np.asarray(lib.get("angles_deg", []), dtype=float)
+            E = np.asarray(lib["angle_models"][0]["yield"]["SEY"]["E"], dtype=float)
+            have, total = library_has_raw_cases(lib)
+            if lib.get("primary_resolved", True) and have > 0:
+                mode = (
+                    "per-primary sampling from raw cases"
+                    + ("" if have == total else f" ({have}/{total} angles)")
+                )
+            else:
+                mode = "independent SE and BSE joint events"
+            text = (
+                f"sampler library {lib.get('source_root', '?')}: "
+                f"{len(angles)} angles ({angles.min():g}-{angles.max():g} deg), "
+                f"yields {E.min():g}-{E.max():g} eV; {mode}"
+            )
+        else:
+            sey = models.get("SEY", {})
+            text = (
+                "LEGACY tables: "
+                f"{sey.get('source', '<untagged>') if isinstance(sey, dict) else sey}"
+            )
+        lines.append(f"  {label[fam]:26s} {text}")
+    return "\n".join(lines)
 
 
 def _make_measured_carbon_hybrid_curve(
@@ -2730,8 +2946,8 @@ def sample_surface_event(
             ti_receiver_library, bsey_mdl, Einc, theta_deg, "BSEY",
             interp_ti_receiver_yield,
         )
-        Nbse = _sample_integer_count_from_mean(bsey_val, rng)
-        Nse = int(rng.poisson(max(0.0, float(sey_val))))
+        Nbse = _joint_bse_count(bsey_val, Einc, rng)
+        Nse = _joint_se_count(sey_val, Einc, rng)
         return int(Nbse), int(Nse)
 
     mo_holder_library = (
@@ -2751,8 +2967,8 @@ def sample_surface_event(
             mo_holder_library, bsey_mdl, Einc, theta_deg, "BSEY",
             interp_mo_holder_yield,
         )
-        Nbse = _sample_integer_count_from_mean(bsey_val, rng)
-        Nse = int(rng.poisson(max(0.0, float(sey_val))))
+        Nbse = _joint_bse_count(bsey_val, Einc, rng)
+        Nse = _joint_se_count(sey_val, Einc, rng)
         return int(Nbse), int(Nse)
 
     carbon_joint_library = (
@@ -2776,8 +2992,8 @@ def sample_surface_event(
             carbon_joint_library, bsey_mdl, Einc, theta_deg, "BSEY",
             interp_carbon_yield,
         )
-        Nbse = _sample_integer_count_from_mean(bsey_val, rng)
-        Nse = int(rng.poisson(max(0.0, float(sey_val))))
+        Nbse = _joint_bse_count(bsey_val, Einc, rng)
+        Nse = _joint_se_count(sey_val, Einc, rng)
         return int(Nbse), int(Nse)
 
     cu_sample_library = (
@@ -2797,8 +3013,8 @@ def sample_surface_event(
             cu_sample_library, bsey_mdl, Einc, theta_deg, "BSEY",
             interp_cu_sample_yield,
         )
-        Nbse = _sample_integer_count_from_mean(bsey_val, rng)
-        Nse = int(rng.poisson(max(0.0, float(sey_val))))
+        Nbse = _joint_bse_count(bsey_val, Einc, rng)
+        Nse = _joint_se_count(sey_val, Einc, rng)
         return int(Nbse), int(Nse)
 
     sey_base = interp_yield_model(sey_mdl, Einc)
@@ -2916,8 +3132,14 @@ def _choose_sampler_table(model: dict, Einc: float, rng):
     if Einc >= Egrid[-1]:
         return tables[-1]
 
-    ilo = np.where(Egrid < Einc)[0][-1]
-    ihi = np.where(Egrid > Einc)[0][0]
+    # Inclusive bracketing: an incident energy that coincides with a grid
+    # point must use that grid point's own table.  The earlier strict
+    # inequalities skipped it and mixed the two neighbouring tables instead.
+    ilo = np.where(Egrid <= Einc)[0][-1]
+    ihi = np.where(Egrid >= Einc)[0][0]
+
+    if ilo == ihi:
+        return tables[ilo]
 
     Elo = Egrid[ilo]
     Ehi = Egrid[ihi]
@@ -2990,6 +3212,419 @@ def sample_theta_from_table(model: dict, Einc: float, rng) -> float:
     f = PchipInterpolator(r, theta, extrapolate=False)
 
     return float(f(u))
+
+
+# Emitted-energy boundary between the SE and BSE sampler families.  The
+# generated libraries hold SE events for emitted energies 0-50 eV and BSE
+# events for emitted energies above 50 eV.
+JOINT_ENERGY_CUTOFF_EV = 50.0
+
+# Per-impact energy bookkeeping (see _EmissionSlots).
+ENERGY_BUDGET_MAX_RETRIES = 16
+ENERGY_BUDGET_MIN_EMIT_EV = 0.01
+ENERGY_BUDGET_TOL_EV = 1.0e-9
+
+
+def _rescale_joint_event_energy(event: dict, Einc: float, kind: str) -> dict:
+    """Map a joint-library emitted energy from its table onto the actual impact.
+
+    A joint event is drawn from the table of a neighbouring incident energy
+    ``E_table``.  Copying its emitted energy unchanged and clipping it to the
+    actual incident energy piles every event with ``Eout > Einc`` into an
+    artificial elastic peak (and leaves a gap below it for the lower table).
+    The energy is instead mapped so that each family keeps its own limits:
+
+    * BSE family (emitted energy from the 50 eV boundary up to the incident
+      energy): linear map of ``[50, E_table]`` onto ``[50, Einc]``.  The
+      elastic peak lands exactly on the actual incident energy and the low
+      edge stays on the boundary, so nothing piles up at either end.
+    * SE family (0-50 eV): unchanged above the boundary, where the SE
+      spectrum does not follow the primary energy.  When the table is at or
+      below 50 eV the family contains the reflected and quasi-elastic
+      electrons, so the energy scales with the incident energy.
+    * Impacts between the last BSE-free energy and 50 eV use the 50 eV BSE
+      table, which is purely elastic; those events are emitted at the
+      incident energy.
+
+    Exact specular events are reconstructed separately and are not rescaled.
+    The original value is kept in ``Eout_table_eV``.
+    """
+    kind = str(kind).upper()
+    Einc = float(Einc)
+    E_table = float(event.get("sampler_Einc_eV", np.nan))
+    Eout = float(event["Eout_eV"])
+    cut = JOINT_ENERGY_CUTOFF_EV
+
+    event["Eout_table_eV"] = Eout
+    Enew = Eout
+    if np.isfinite(E_table) and E_table > 0.0 and Einc > 0.0:
+        if kind == "BSE":
+            if E_table > cut and Einc > cut:
+                Enew = cut + (Eout - cut) * (Einc - cut) / (E_table - cut)
+            else:
+                Enew = Eout * Einc / E_table
+        elif E_table <= cut and Einc <= cut:
+            Enew = Eout * Einc / E_table
+        elif E_table <= cut < Einc:
+            # Table at the boundary, impact just above it: keep SE below 50 eV.
+            Enew = min(Eout, cut)
+    event["joint_energy_scale"] = float(Enew / Eout) if Eout > 0.0 else 1.0
+    event["Eout_eV"] = float(Enew)
+    return event
+
+
+def _joint_se_count(sey_mean: float, Einc: float, rng) -> int:
+    """Number of SE-family electrons for a joint-library impact.
+
+    Above the 50 eV boundary the SE multiplicity is close to Poisson
+    (variance/mean of 1.1-1.3 in the generated carbon data).  At or below the
+    boundary the SE family is dominated by a single reflected or
+    quasi-elastic electron, i.e. zero or one electron per impact; a Poisson
+    draw would produce pairs that cannot both be emitted and so would lose
+    yield once energy is conserved.  There the count is the integer part of
+    the mean plus one more with probability equal to the remainder.
+    """
+    sey_mean = max(0.0, float(sey_mean))
+    if float(Einc) <= JOINT_ENERGY_CUTOFF_EV:
+        return _sample_integer_count_from_mean(sey_mean, rng)
+    return int(rng.poisson(sey_mean))
+
+
+def _joint_bse_count(bsey_mean: float, Einc: float, rng) -> int:
+    """Number of BSE-family electrons for a joint-library impact.
+
+    The generated libraries tabulate BSEY down to 0.1 eV (zero below the
+    50 eV family boundary), so the interpolated yield already vanishes at low
+    energy and ramps up between the last BSE-free grid energy and 50 eV,
+    where it stands for electrons reflected at full energy.
+    """
+    return _sample_integer_count_from_mean(bsey_mean, rng)
+
+
+def _joint_bse_elastic_fraction(joint_model: dict, Einc: float) -> float:
+    """Fraction of a joint BSE sampler's events that are elastic (Eout = Einc).
+
+    Evaluated per incident-energy table (cached on the model) and interpolated
+    linearly in incident energy.
+    """
+    frac = joint_model.get("_elastic_fraction_by_E", None)
+    if frac is None:
+        frac = np.asarray([
+            float(np.mean(
+                np.asarray(t["Eout_eV"], dtype=float)
+                >= float(t["Einc_eV"]) * (1.0 - 1.0e-9)
+            ))
+            for t in joint_model["tables"]
+        ], dtype=float)
+        joint_model["_elastic_fraction_by_E"] = frac
+    E = np.asarray(joint_model["E"], dtype=float)
+    return float(np.interp(float(Einc), E, frac))
+
+
+def _library_elastic_bse_probability(
+    library: dict,
+    bsey_mean: float,
+    Einc: float,
+    theta_deg: float,
+) -> float:
+    """Probability that one impact returns an elastic (zero-loss) BSE."""
+    if bsey_mean <= 0.0:
+        return 0.0
+    lo, hi, w = _receiver_angle_bracket(library, theta_deg)
+    f = _joint_bse_elastic_fraction(
+        _load_joint_sampler_cached(lo["joint_paths"]["BSE"]), Einc
+    )
+    if hi is not lo:
+        f_hi = _joint_bse_elastic_fraction(
+            _load_joint_sampler_cached(hi["joint_paths"]["BSE"]), Einc
+        )
+        f = (1.0 - w) * f + w * f_hi
+    return float(np.clip(float(bsey_mean) * f, 0.0, 0.95))
+
+
+# ============================================================
+# Per-primary sampling from the raw SEEMC cases
+# ============================================================
+#
+# Each ``alpha_*deg/raw/E_<energy>eV.npz`` file of the generated library holds
+# the complete outcome of every simulated primary: which SE and BSE it
+# emitted, with their energies and directions.  Sampling one whole primary at
+# a time reproduces everything the pooled joint samplers cannot: the true
+# SE/BSE multiplicities, the correlation between them (an elastic BSE comes
+# with no secondaries; an inelastic BSE comes with more), and energy
+# conservation, without any compensation rule.
+
+_RAW_CASE_CACHE = {}
+_RAW_CASE_CACHE_ORDER = []
+_RAW_CASE_FILENAME = re.compile(r"^E_(?P<tag>[0-9]+(?:p[0-9]+)?)eV\.npz$")
+
+
+def _raw_case_cache_bytes() -> int:
+    """Per-process memory allowed for cached raw cases (default 400 MB).
+
+    Raw cases differ a lot in size (10^4 to 10^5 primaries each), so the
+    cache is limited by memory, not by the number of cases.  Set
+    ``RFA_RAW_CASE_CACHE_MB`` to change it; each joblib worker has its own.
+    """
+    try:
+        mb = float(os.environ.get("RFA_RAW_CASE_CACHE_MB", "400"))
+    except ValueError:
+        mb = 400.0
+    return int(max(16.0, mb) * 1024 * 1024)
+
+
+def _raw_cases_for_angle_model(angle_model: dict) -> list:
+    """Sorted ``(incident_energy_eV, path)`` list of one alpha folder's raw cases."""
+    cases = angle_model.get("_raw_cases", None)
+    if cases is None:
+        cases = []
+        # "source_dir" holds only the folder name; the joint sampler path
+        # gives the folder's real location.
+        raw_dir = Path(angle_model["joint_paths"]["SE"]).parent / "raw"
+        if raw_dir.is_dir():
+            for f in raw_dir.iterdir():
+                m = _RAW_CASE_FILENAME.match(f.name)
+                if m is not None:
+                    cases.append((float(m.group("tag").replace("p", ".")), f))
+            cases.sort(key=lambda c: c[0])
+        angle_model["_raw_cases"] = cases
+    return cases
+
+
+def library_has_raw_cases(library: dict) -> tuple[int, int]:
+    """(alpha folders with raw cases, alpha folders in total)."""
+    models = library.get("angle_models", [])
+    return sum(1 for m in models if _raw_cases_for_angle_model(m)), len(models)
+
+
+def _load_raw_primary_case(path: str | Path) -> dict:
+    """Load one raw case, grouped by primary, with a process-local LRU cache."""
+    key = str(path)
+    if key in _RAW_CASE_CACHE:
+        _RAW_CASE_CACHE_ORDER.remove(key)
+        _RAW_CASE_CACHE_ORDER.append(key)
+        return _RAW_CASE_CACHE[key]
+
+    with np.load(path, allow_pickle=False) as z:
+        n = int(z["n_primaries"])
+        case = {
+            "Einc_eV": float(z["incident_energy_ev"]),
+            "n_primaries": n,
+            "source": str(path),
+        }
+        for kind, k in (("SE", "se"), ("BSE", "bse")):
+            pid = np.asarray(z[f"{k}_primary_id"], dtype=np.int64).reshape(-1)
+            order = np.argsort(pid, kind="stable")
+            dirs = np.column_stack((
+                np.asarray(z[f"{k}_mu_beam_back"], dtype=float).reshape(-1),
+                np.asarray(z[f"{k}_mu_toward_normal"], dtype=float).reshape(-1),
+                np.asarray(z[f"{k}_mu_side"], dtype=float).reshape(-1),
+            ))[order]
+            norms = np.linalg.norm(dirs, axis=1)
+            norms[norms <= 0.0] = 1.0
+            counts = np.bincount(pid, minlength=n)[:n]
+            case[kind] = {
+                "start": np.concatenate(([0], np.cumsum(counts))).astype(np.int64),
+                "E": np.asarray(z[f"{k}_energy_ev"], dtype=float).reshape(-1)[order],
+                "dir": dirs / norms[:, None],
+            }
+    if n <= 0:
+        raise ValueError(f"raw case {path} contains no primaries")
+
+    case["nbytes"] = int(sum(
+        case[kind][name].nbytes
+        for kind in ("SE", "BSE") for name in ("start", "E", "dir")
+    ))
+    _RAW_CASE_CACHE[key] = case
+    _RAW_CASE_CACHE_ORDER.append(key)
+    limit = _raw_case_cache_bytes()
+    while (
+        len(_RAW_CASE_CACHE_ORDER) > 1
+        and sum(c["nbytes"] for c in _RAW_CASE_CACHE.values()) > limit
+    ):
+        _RAW_CASE_CACHE.pop(_RAW_CASE_CACHE_ORDER.pop(0), None)
+    return case
+
+
+def _choose_raw_case(cases: list, Einc: float, rng):
+    """Stochastic bracketing in incident energy (linear weight, inclusive)."""
+    E = np.asarray([c[0] for c in cases], dtype=float)
+    if Einc <= E[0]:
+        return cases[0]
+    if Einc >= E[-1]:
+        return cases[-1]
+    ilo = int(np.searchsorted(E, Einc, side="right")) - 1
+    if E[ilo] == Einc:
+        return cases[ilo]
+    ihi = ilo + 1
+    w = (Einc - E[ilo]) / (E[ihi] - E[ilo])
+    return cases[ihi] if rng.random() < w else cases[ilo]
+
+
+def sample_primary_bundle(
+    library: dict,
+    Einc: float,
+    theta_deg: float,
+    rng,
+) -> dict | None:
+    """Draw the complete emission of one simulated primary.
+
+    The alpha folder and the incident-energy case are chosen stochastically
+    with linear weights, so mean yields are linearly interpolated in angle and
+    energy exactly as the tabulated yields are.  One primary of that case is
+    then drawn at random and all of its electrons are returned as joint events
+    in the format of ``sample_joint_emission_event``.
+
+    Energies are carried from the case energy to the actual incident energy
+    with ``_rescale_joint_event_energy``; exact specular events are rebuilt at
+    the actual incidence angle and energy.  Because the two families are
+    mapped differently, a primary taken from a neighbouring energy can end up
+    slightly above the actual incident energy; its SE energies are then
+    reduced by a common factor so that the total equals the incident energy.
+
+    Returns None if the chosen alpha folder has no ``raw`` cases; the caller
+    then falls back to independent SE/BSE sampling.
+    """
+    Einc = float(Einc)
+    lo, hi, w = _receiver_angle_bracket(library, theta_deg)
+    chosen = hi if (hi is not lo and rng.random() < w) else lo
+    cases = _raw_cases_for_angle_model(chosen)
+    if not cases:
+        return None
+
+    E_case, path = _choose_raw_case(cases, Einc, rng)
+    case = _load_raw_primary_case(path)
+    i = int(rng.integers(0, case["n_primaries"]))
+    alpha = float(chosen["angle_deg"])
+
+    bundle = {
+        "SE": [], "BSE": [],
+        "case_Einc_eV": float(case["Einc_eV"]),
+        "case_alpha_deg": alpha,
+        "primary_index": i,
+        "source": case["source"],
+        "se_energy_scale": 1.0,
+        "bse_energy_scale": 1.0,
+    }
+    for kind in ("BSE", "SE"):
+        tab = case[kind]
+        for j in range(int(tab["start"][i]), int(tab["start"][i + 1])):
+            d = tab["dir"][j]
+            event = {
+                "Eout_eV": float(tab["E"][j]),
+                "direction_local": d,
+                "theta_rad": float(np.arccos(np.clip(d[0], -1.0, 1.0))),
+                "phi_rad": float(np.arctan2(d[2], d[1])),
+                "sampler_Einc_eV": float(case["Einc_eV"]),
+                "sampler_event_index": j,
+                "source": case["source"],
+                "sampler_incidence_angle_deg": alpha,
+                "sampler_angle_source_dir": str(chosen["source_dir"]),
+                "primary_resolved": True,
+            }
+            specular = _joint_event_is_exact_specular(
+                event, sampler_alpha_deg=alpha
+            )
+            if specular:
+                event = _reconstruct_exact_specular_event(
+                    event, actual_Einc_eV=Einc, actual_theta_deg=theta_deg,
+                )
+            else:
+                _rescale_joint_event_energy(event, Einc, kind)
+            correction = float(
+                event.get("cu_specular_direction_correction_deg", 0.0)
+            )
+            for prefix in ("ti", "mo", "carbon"):
+                event[f"{prefix}_specular_reconstructed"] = bool(specular)
+                event[f"{prefix}_specular_direction_correction_deg"] = correction
+            event.setdefault("cu_specular_reconstructed", False)
+            bundle[kind].append(event)
+
+    # Restore energy conservation after the family-wise mapping.  The excess
+    # is at most (1 - r)(sum of SE energies + 50 eV per additional BSE), with
+    # r the ratio of the above-boundary ranges, i.e. small compared with the
+    # BSE energies.  It is taken from the BSE, in proportion to each one's
+    # energy above the 50 eV boundary, so the SE spectrum is left untouched;
+    # only if the BSE cannot absorb it are the SE energies reduced.
+    cut = JOINT_ENERGY_CUTOFF_EV
+    total_bse = sum(e["Eout_eV"] for e in bundle["BSE"])
+    total_se = sum(e["Eout_eV"] for e in bundle["SE"])
+    excess = total_bse + total_se - Einc
+    if excess > 0.0:
+        above = sum(max(0.0, e["Eout_eV"] - cut) for e in bundle["BSE"])
+        take = min(excess, above)
+        if take > 0.0:
+            g = 1.0 - take / above
+            for e in bundle["BSE"]:
+                if e["Eout_eV"] > cut:
+                    e["Eout_eV"] = float(cut + (e["Eout_eV"] - cut) * g)
+            bundle["bse_energy_scale"] = float(g)
+            excess -= take
+        if excess > 0.0 and total_se > 0.0:
+            f = max(0.0, total_se - excess) / total_se
+            for e in bundle["SE"]:
+                e["Eout_eV"] = float(e["Eout_eV"] * f)
+            bundle["se_energy_scale"] = float(f)
+    return bundle
+
+
+def _scale_bundle_to_yield(
+    bundle: dict, kind: str, scale: float, base_yield: float, rng
+) -> int:
+    """Apply a sensitivity yield multiplier to one family of a bundle.
+
+    scale < 1: each electron is kept with probability ``scale``.
+    scale > 1: returns the number of extra, independently drawn electrons to
+    add.  The number is Poisson with mean (scale - 1) x the library yield and
+    does not depend on what the bundle already holds, so the extras are not
+    piled onto primaries that have already spent their energy.
+    """
+    if not np.isfinite(scale) or np.isclose(scale, 1.0):
+        return 0
+    if scale < 1.0:
+        bundle[kind] = [e for e in bundle[kind] if rng.random() < scale]
+        return 0
+    return int(rng.poisson((scale - 1.0) * max(0.0, float(base_yield))))
+
+
+class _EmissionSlots:
+    """Iterate over the emitted electrons of one impact with retries.
+
+    ``for _ in slots:`` behaves like ``for _ in range(n)``, except that the
+    loop body may call ``slots.retry()`` and ``continue`` to redraw the
+    current electron.  ``retry()`` returns False once the electron has used
+    all its retries; the body then ``continue``s and the electron is dropped.
+    Existing ``continue`` statements in the body keep their meaning (the
+    electron is skipped without a retry).
+    """
+
+    def __init__(self, n: int, max_retries: int = ENERGY_BUDGET_MAX_RETRIES):
+        self.n = max(0, int(n))
+        self.max_retries = max(0, int(max_retries))
+        self.resampled = 0
+        self.dropped = 0
+        self._tries_left = 0
+        self._again = False
+
+    def __iter__(self):
+        for _ in range(self.n):
+            self._tries_left = self.max_retries
+            self._again = True
+            while self._again:
+                self._again = False
+                yield None
+
+    def retry(self) -> bool:
+        if self._tries_left > 0:
+            self._tries_left -= 1
+            self._again = True
+            self.resampled += 1
+            return True
+        self.dropped += 1
+        return False
+
+    def drop(self) -> None:
+        self.dropped += 1
 
 
 def sample_joint_emission_event(
@@ -3358,35 +3993,63 @@ def launch_surface_electron(
 
 
 def sample_effective_wire_normal_for_grid_hit(n_grid, v_in, rng):
-    vhat = unit(v_in)
+    """Sample the local surface normal where an electron strikes a mesh wire.
+
+    The mesh is two orthogonal sets of round wires lying in the local mesh
+    plane (normal ``n_grid``).  For an incoming direction ``u``:
+
+    * the wire axis ``a`` is drawn in the mesh plane with probability
+      proportional to the wire's projected cross-section seen by the electron,
+      ``|u - (u.a) a|`` - an electron travelling almost along a wire is
+      unlikely to hit it (same weighting as the interception probability in
+      ``trajectories.grid_transmission_probability``);
+    * the impact parameter ``b`` across the wire is uniform in [-1, 1];
+    * the normal is that of a cylinder: with ``u_perp`` the unit component of
+      ``u`` perpendicular to ``a`` and ``e = a x u_perp``,
+
+          n = -sqrt(1 - b^2) u_perp + b e.
+
+    The local incidence cosine is then ``sqrt(1 - b^2) |u - (u.a) a|``, which
+    is what the angle-resolved yields and joint samplers need.  At normal
+    incidence on the mesh this reduces to the previous construction; at
+    oblique incidence the previous version built the normal around the mesh
+    normal instead of the incoming direction and so mis-stated the angle.
+    """
+    u = unit(v_in)
     n_grid = unit(n_grid)
 
-    # Make n_grid oppose incoming direction.
-    if np.dot(vhat, n_grid) > 0:
-        n_grid = -n_grid
-
-    # Choose a random tangent direction in the grid plane.
+    # Two orthonormal directions spanning the mesh plane.
     tmp = np.array([0.0, 0.0, 1.0])
     if abs(np.dot(tmp, n_grid)) > 0.9:
         tmp = np.array([0.0, 1.0, 0.0])
-
     t1 = unit(np.cross(n_grid, tmp))
-    t2 = unit(np.cross(n_grid, t1))
+    t2 = np.cross(n_grid, t1)
 
-    # Random wire-edge direction in tangent plane.
-    t_edge = unit(rng.normal() * t1 + rng.normal() * t2)
+    # Wire axis: rejection-sample the in-plane angle with weight |u_perp| <= 1.
+    a = t1
+    perp = u - np.dot(u, a) * a
+    for _ in range(64):
+        psi = np.pi * rng.random()
+        a_try = np.cos(psi) * t1 + np.sin(psi) * t2
+        perp_try = u - np.dot(u, a_try) * a_try
+        weight = float(np.linalg.norm(perp_try))
+        a, perp = a_try, perp_try
+        if rng.random() <= weight:
+            break
 
-    # Impact parameter across wire shadow.
+    perp_norm = float(np.linalg.norm(perp))
+    if perp_norm < 1.0e-12:
+        # Travelling exactly along the wire: fall back to the mesh normal.
+        return n_grid if np.dot(u, n_grid) < 0 else -n_grid
+
+    u_perp = perp / perp_norm
+    e = np.cross(a, u_perp)
+
     b = rng.uniform(-1.0, 1.0)
+    n_wire = unit(-np.sqrt(max(0.0, 1.0 - b * b)) * u_perp + b * e)
 
-    # Local cylinder normal on front half of wire.
-    # b=0 gives normal against incoming/grid-normal direction.
-    # |b| near 1 gives side/edge normal.
-    n_wire = np.sqrt(max(0.0, 1.0 - b*b)) * n_grid + b * t_edge
-    n_wire = unit(n_wire)
-
-    # Ensure it faces the incoming electron.
-    if np.dot(vhat, n_wire) > 0:
+    # Faces the incoming electron by construction; keep the guard.
+    if np.dot(u, n_wire) > 0:
         n_wire = -n_wire
 
     return n_wire
@@ -3801,12 +4464,127 @@ def generate_surface_emissions(
     if surface_name == "sample":
         event_info["sample_bse_multiplicity_sampled"] = int(Nbse)
 
-    for _ in range(Nbse):
+    # ------------------------------------------------------------------
+    # Energy bookkeeping for this impact.
+    #
+    # BSE and SE are drawn from independent sampler families, so without a
+    # constraint their emitted energies can add up to more than the incident
+    # energy (most visibly below ~100 eV, where one impact could return a
+    # full-energy reflected electron *and* secondaries).  Every emitted
+    # electron is therefore charged against a budget that starts at Einc:
+    #
+    #   * an electron whose energy exceeds the remaining budget is redrawn
+    #     (complete correlated event: energy and direction together), up to
+    #     ENERGY_BUDGET_MAX_RETRIES times;
+    #   * if no draw fits, or the remaining budget is below
+    #     ENERGY_BUDGET_MIN_EMIT_EV, that electron is not emitted.  This is
+    #     the physical outcome for an elastically reflected primary, which
+    #     deposits no energy and cannot release secondaries.
+    #
+    # BSE are charged first, then SE.  Counts of redraws and of electrons not
+    # emitted are returned in event_info.
+    #
+    # Keeping the library SE yield.  An elastic BSE leaves no energy, so its
+    # impact emits no secondaries.  The library SEY is an average over all
+    # primaries, including those; if nothing else were done, removing these
+    # secondaries would lower the mean SE yield by the factor (1 - p_el),
+    # with p_el the probability of an elastic BSE.  Impacts without an
+    # elastic BSE therefore receive additional secondaries with Poisson mean
+    # SEY * p_el / (1 - p_el), which restores the library mean exactly.  p_el
+    # is read from the joint BSE tables, so this applies to the sampler-
+    # library paths; the legacy tables are left uncompensated.
+    # ------------------------------------------------------------------
+    energy_budget_eV = float(Einc)
+    bse_slots = _EmissionSlots(Nbse)
+    elastic_bse_emitted = False
+
+    _lib_ctx = None
+    if receiver_ti_library is not None:
+        _lib_ctx = (receiver_ti_library, receiver_incidence_theta_deg,
+                    interp_ti_receiver_yield)
+    elif carbon_joint_library is not None:
+        _lib_ctx = (carbon_joint_library, carbon_incidence_theta_deg,
+                    interp_carbon_yield)
+    elif holder_mo_library is not None:
+        _lib_ctx = (holder_mo_library, holder_incidence_theta_deg,
+                    interp_mo_holder_yield)
+    elif (
+        surf == "sample"
+        and cu_sample_library is not None
+        and not use_sample_gun_incidence
+    ):
+        _lib_ctx = (cu_sample_library, sample_incidence_theta_deg,
+                    interp_cu_sample_yield)
+
+    elastic_bse_probability = 0.0
+    library_sey_mean = 0.0
+    if _lib_ctx is not None:
+        _lib, _theta, _interp = _lib_ctx
+        library_sey_mean = _scaled_joint_library_yield(
+            _lib, diagnostic_sey_mdl, Einc, _theta, "SEY", _interp
+        )
+        elastic_bse_probability = _library_elastic_bse_probability(
+            _lib,
+            _scaled_joint_library_yield(
+                _lib, diagnostic_bsey_mdl, Einc, _theta, "BSEY", _interp
+            ),
+            Einc,
+            _theta,
+        )
+
+    # Per-primary sampling.  When the library has raw cases, the whole
+    # emission of this impact (how many SE and BSE, their energies and
+    # directions) is one simulated primary.  The independently sampled counts
+    # above are then replaced, and the elastic-BSE compensation is switched
+    # off because the bundle already carries the true correlations.
+    _bundle_queue = {"BSE": deque(), "SE": deque()}
+    primary_bundle = None
+    if _lib_ctx is not None and _lib.get("primary_resolved", True):
+        primary_bundle = sample_primary_bundle(_lib, Einc, _theta, rng)
+    if primary_bundle is not None:
+        _extra = {}
+        for _kind, _ykind, _mdl in (
+            ("BSE", "BSEY", diagnostic_bsey_mdl),
+            ("SE", "SEY", diagnostic_sey_mdl),
+        ):
+            _base = max(0.0, float(_interp(_lib, Einc, _theta, _ykind)))
+            _scaled = _scaled_joint_library_yield(
+                _lib, _mdl, Einc, _theta, _ykind, _interp
+            )
+            _scale = (_scaled / _base) if _base > 0.0 else 1.0
+            _extra[_kind] = _scale_bundle_to_yield(
+                primary_bundle, _kind, _scale, _base, rng
+            )
+            _bundle_queue[_kind].extend(primary_bundle[_kind])
+        Nbse = len(primary_bundle["BSE"]) + _extra["BSE"]
+        Nse = len(primary_bundle["SE"]) + _extra["SE"]
+        bse_slots = _EmissionSlots(Nbse)
+        elastic_bse_probability = 0.0
+        event_info.update({
+            "primary_resolved_sampling": True,
+            "primary_bundle_case_Einc_eV": primary_bundle["case_Einc_eV"],
+            "primary_bundle_case_alpha_deg": primary_bundle["case_alpha_deg"],
+            "primary_bundle_se_energy_scale": primary_bundle["se_energy_scale"],
+            "primary_bundle_bse_energy_scale": primary_bundle["bse_energy_scale"],
+        })
+    else:
+        event_info["primary_resolved_sampling"] = False
+
+    for _ in bse_slots:
         joint_event = None
         joint_energy_raw = np.nan
         joint_energy_clipped = False
 
-        if receiver_ti_library is not None:
+        if _bundle_queue["BSE"]:
+            joint_event = _bundle_queue["BSE"].popleft()
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            E_bse = float(np.clip(
+                joint_energy_raw, min(50.0, Einc), Einc
+            ))
+            joint_energy_clipped = not np.isclose(
+                E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
+        elif receiver_ti_library is not None:
             joint_event = sample_ti_receiver_joint_event(
                 receiver_ti_library,
                 Einc=Einc,
@@ -3836,22 +4614,6 @@ def generate_surface_emissions(
             joint_energy_clipped = not np.isclose(
                 E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
             )
-        elif carbon_joint_library is not None:
-            joint_event = sample_carbon_joint_event(
-                carbon_joint_library,
-                Einc=Einc,
-                theta_deg=carbon_incidence_theta_deg,
-                kind="SE",
-                rng=rng,
-            )
-            joint_energy_raw = float(joint_event["Eout_eV"])
-            Ehi = min(50.0, Einc)
-            E_se = float(np.clip(
-                joint_energy_raw, min(0.01, Ehi), Ehi
-            ))
-            joint_energy_clipped = not np.isclose(
-                E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
-            )
         elif holder_mo_library is not None:
             joint_event = sample_mo_holder_joint_event(
                 holder_mo_library,
@@ -3868,8 +4630,11 @@ def generate_surface_emissions(
                 E_bse, joint_energy_raw, rtol=0.0, atol=1.0e-12
             )
         elif use_sample_gun_incidence and sample_joint_override is not None:
-            joint_event = sample_joint_emission_event(
-                sample_joint_override["BSE"], Einc=Einc, rng=rng
+            joint_event = _rescale_joint_event_energy(
+                dict(sample_joint_emission_event(
+                    sample_joint_override["BSE"], Einc=Einc, rng=rng
+                )),
+                Einc, "BSE",
             )
             joint_energy_raw = float(joint_event["Eout_eV"])
             E_bse = float(np.clip(joint_energy_raw, 50.0, Einc))
@@ -4040,58 +4805,6 @@ def generate_surface_emissions(
                 joint_event.get("source", "<joint sampler>")
             )
 
-        elif joint_event is not None and carbon_joint_library is not None:
-            for _joint_try in range(64):
-                joint_energy_raw = float(joint_event["Eout_eV"])
-                Ehi = min(50.0, Einc)
-                E_se = float(np.clip(
-                    joint_energy_raw, min(0.01, Ehi), Ehi
-                ))
-                joint_energy_clipped = not np.isclose(
-                    E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
-                )
-                E_se_launch = max(E_se + phi_correction, 1.0e-3)
-                theta_se = float(joint_event["theta_rad"])
-                phi_se = float(joint_event["phi_rad"])
-                try:
-                    v_se, emission_outward_cosine = (
-                        launch_generic_surface_electron_joint(
-                            direction_local=joint_event["direction_local"],
-                            Eout_eV=E_se_launch,
-                            v_in=v_in,
-                            n_out=n_out,
-                        )
-                    )
-                    break
-                except ValueError:
-                    joint_event = sample_carbon_joint_event(
-                        carbon_joint_library,
-                        Einc=Einc,
-                        theta_deg=carbon_incidence_theta_deg,
-                        kind="SE",
-                        rng=rng,
-                    )
-            else:
-                raise RuntimeError(
-                    "could not draw an outward carbon SE joint event "
-                    "after 64 attempts"
-                )
-            emission_polar_axis = "carbon_incident_beam_back_joint"
-            p0_se = (
-                r_hit + sample_launch_eps * unit(v_se)
-                if surf in ANALYTIC_MESH_SURFACES
-                else p0_surface
-            )
-            event_info["carbon_sampler_angle_deg"] = float(
-                joint_event["sampler_incidence_angle_deg"]
-            )
-            event_info["carbon_sampler_folder"] = str(
-                joint_event.get("sampler_angle_source_dir", "")
-            )
-            event_info["carbon_joint_sampler_source"] = str(
-                joint_event.get("source", "<joint sampler>")
-            )
-
         elif joint_event is not None and holder_mo_library is not None:
             for _joint_try in range(64):
                 joint_energy_raw = float(joint_event["Eout_eV"])
@@ -4242,6 +4955,13 @@ def generate_surface_emissions(
             if joint_event is not None
             else np.full(3, np.nan)
         )
+        if E_bse > energy_budget_eV + ENERGY_BUDGET_TOL_EV:
+            bse_slots.retry()
+            continue
+        energy_budget_eV -= float(E_bse)
+        if E_bse >= Einc * (1.0 - 1.0e-9):
+            elastic_bse_emitted = True
+
         emitted.append({
             "p0": p0_bse,
             "v0": v_bse,
@@ -4371,16 +5091,62 @@ def generate_surface_emissions(
             "visualization_only": sub_barrier_bse,
         })
 
-    for _ in range(Nse):
+    Nse_compensation = 0
+    if (
+        not elastic_bse_emitted
+        and elastic_bse_probability > 0.0
+        and library_sey_mean > 0.0
+    ):
+        Nse_compensation = int(rng.poisson(
+            library_sey_mean
+            * elastic_bse_probability / (1.0 - elastic_bse_probability)
+        ))
+    se_slots = _EmissionSlots(Nse + Nse_compensation)
+
+    for _ in se_slots:
+        if energy_budget_eV < ENERGY_BUDGET_MIN_EMIT_EV:
+            # Nothing left to give (e.g. an elastic BSE took the full
+            # incident energy): this secondary is not emitted.
+            if _bundle_queue["SE"]:
+                _bundle_queue["SE"].popleft()
+            se_slots.drop()
+            continue
+
         joint_event = None
         joint_energy_raw = np.nan
         joint_energy_clipped = False
 
-        if receiver_ti_library is not None:
+        if _bundle_queue["SE"]:
+            joint_event = _bundle_queue["SE"].popleft()
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            Ehi = min(50.0, Einc)
+            E_se = float(np.clip(
+                joint_energy_raw, min(0.01, Ehi), Ehi
+            ))
+            joint_energy_clipped = not np.isclose(
+                E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
+        elif receiver_ti_library is not None:
             joint_event = sample_ti_receiver_joint_event(
                 receiver_ti_library,
                 Einc=Einc,
                 theta_deg=receiver_incidence_theta_deg,
+                kind="SE",
+                rng=rng,
+            )
+            joint_energy_raw = float(joint_event["Eout_eV"])
+            Ehi = min(50.0, Einc)
+            E_se = float(np.clip(
+                joint_energy_raw, min(0.01, Ehi), Ehi
+            ))
+            joint_energy_clipped = not np.isclose(
+                E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+            )
+        elif carbon_joint_library is not None:
+            joint_event = sample_carbon_joint_event(
+                carbon_joint_library,
+                Einc=Einc,
+                theta_deg=carbon_incidence_theta_deg,
                 kind="SE",
                 rng=rng,
             )
@@ -4409,8 +5175,11 @@ def generate_surface_emissions(
                 E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
             )
         elif use_sample_gun_incidence and sample_joint_override is not None:
-            joint_event = sample_joint_emission_event(
-                sample_joint_override["SE"], Einc=Einc, rng=rng
+            joint_event = _rescale_joint_event_energy(
+                dict(sample_joint_emission_event(
+                    sample_joint_override["SE"], Einc=Einc, rng=rng
+                )),
+                Einc, "SE",
             )
             joint_energy_raw = float(joint_event["Eout_eV"])
             Ehi = min(50.0, Einc)
@@ -4613,6 +5382,58 @@ def generate_surface_emissions(
                 joint_event.get("source", "<joint sampler>")
             )
 
+        elif joint_event is not None and carbon_joint_library is not None:
+            for _joint_try in range(64):
+                joint_energy_raw = float(joint_event["Eout_eV"])
+                Ehi = min(50.0, Einc)
+                E_se = float(np.clip(
+                    joint_energy_raw, min(0.01, Ehi), Ehi
+                ))
+                joint_energy_clipped = not np.isclose(
+                    E_se, joint_energy_raw, rtol=0.0, atol=1.0e-12
+                )
+                E_se_launch = max(E_se + phi_correction, 1.0e-3)
+                theta_se = float(joint_event["theta_rad"])
+                phi_se = float(joint_event["phi_rad"])
+                try:
+                    v_se, emission_outward_cosine = (
+                        launch_generic_surface_electron_joint(
+                            direction_local=joint_event["direction_local"],
+                            Eout_eV=E_se_launch,
+                            v_in=v_in,
+                            n_out=n_out,
+                        )
+                    )
+                    break
+                except ValueError:
+                    joint_event = sample_carbon_joint_event(
+                        carbon_joint_library,
+                        Einc=Einc,
+                        theta_deg=carbon_incidence_theta_deg,
+                        kind="SE",
+                        rng=rng,
+                    )
+            else:
+                raise RuntimeError(
+                    "could not draw an outward carbon SE joint event "
+                    "after 64 attempts"
+                )
+            emission_polar_axis = "carbon_incident_beam_back_joint"
+            p0_se = (
+                r_hit + sample_launch_eps * unit(v_se)
+                if surf in ANALYTIC_MESH_SURFACES
+                else p0_surface
+            )
+            event_info["carbon_sampler_angle_deg"] = float(
+                joint_event["sampler_incidence_angle_deg"]
+            )
+            event_info["carbon_sampler_folder"] = str(
+                joint_event.get("sampler_angle_source_dir", "")
+            )
+            event_info["carbon_joint_sampler_source"] = str(
+                joint_event.get("source", "<joint sampler>")
+            )
+
         elif joint_event is not None:
             v_se, emission_outward_cosine = launch_sample_electron_joint(
                 direction_local=joint_event["direction_local"],
@@ -4672,6 +5493,14 @@ def generate_surface_emissions(
             if joint_event is not None
             else np.full(3, np.nan)
         )
+        # Sub-barrier sample secondaries are visualization-only electrons that
+        # never leave the sample; they are not charged against the budget.
+        if not sub_barrier_se:
+            if E_se > energy_budget_eV + ENERGY_BUDGET_TOL_EV:
+                se_slots.retry()
+                continue
+            energy_budget_eV -= float(E_se)
+
         emitted.append({
             "p0": p0_se,
             "v0": v_se,
@@ -4800,6 +5629,16 @@ def generate_surface_emissions(
             "escape_eligible": not sub_barrier_se,
             "visualization_only": sub_barrier_se,
         })
+
+    event_info.update({
+        "energy_budget_incident_eV": float(Einc),
+        "energy_budget_emitted_eV": float(Einc) - float(energy_budget_eV),
+        "energy_budget_resampled": int(bse_slots.resampled + se_slots.resampled),
+        "energy_budget_bse_not_emitted": int(bse_slots.dropped),
+        "energy_budget_se_not_emitted": int(se_slots.dropped),
+        "energy_budget_se_compensation": int(Nse_compensation),
+        "elastic_bse_probability": float(elastic_bse_probability),
+    })
 
     return emitted, event_info
 
