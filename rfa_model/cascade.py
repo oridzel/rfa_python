@@ -2061,7 +2061,15 @@ def run_cascade_batch_parallel(
                     f"{yield_model_sources[family][yield_kind]}"
                 )
 
-        print("[cascade] emitted-energy / angle samplers in use:")
+        # These are the legacy per-family tables.  Surfaces covered by the
+        # sampler library do not use them: their energies and directions come
+        # from the library's joint/raw cases (see the "Surface models in use"
+        # summary printed by load_default_surface_models, and the
+        # emission_polar_axis column of the cascade table).
+        print(
+            "[cascade] legacy energy / angle tables (fallback only; NOT used "
+            "for surfaces covered by the sampler library):"
+        )
         for family in sorted(set(energy_models) | set(theta_models)):
             for kind in ("SE", "BSE"):
                 e_src = emission_sampler_sources["energy"].get(

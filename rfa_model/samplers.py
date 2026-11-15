@@ -899,6 +899,10 @@ def sample_ti_receiver_joint_event(
     correlation; individual direction/energy components are never
     interpolated independently.
     """
+    if library.get("primary_resolved", True):
+        _raw_event = sample_raw_single_event(library, Einc, theta_deg, kind, rng)
+        if _raw_event is not None:
+            return _raw_event
     kind = str(kind).upper()
     if kind not in ("SE", "BSE"):
         raise ValueError(f"unknown Ti receiver emission kind: {kind}")
@@ -1044,6 +1048,10 @@ def sample_carbon_joint_event(
     RFA incidence angle and incident energy after stochastic angle-folder
     selection, exactly as for Cu and Mo.
     """
+    if library.get("primary_resolved", True):
+        _raw_event = sample_raw_single_event(library, Einc, theta_deg, kind, rng)
+        if _raw_event is not None:
+            return _raw_event
     kind = str(kind).upper()
     if kind not in ("SE", "BSE"):
         raise ValueError(f"unknown carbon emission kind: {kind}")
@@ -1289,6 +1297,10 @@ def sample_cu_sample_joint_event(
     for example, from being launched at the exact 45- or 60-degree specular
     direction merely because that neighboring folder happened to be selected.
     """
+    if library.get("primary_resolved", True):
+        _raw_event = sample_raw_single_event(library, Einc, theta_deg, kind, rng)
+        if _raw_event is not None:
+            return _raw_event
     kind = str(kind).upper()
     if kind not in ("SE", "BSE"):
         raise ValueError(f"unknown Cu sample emission kind: {kind}")
@@ -1350,6 +1362,10 @@ def sample_mo_holder_joint_event(
     holder incidence angle/energy after the stochastic folder choice, matching
     the corrected Cu treatment.
     """
+    if library.get("primary_resolved", True):
+        _raw_event = sample_raw_single_event(library, Einc, theta_deg, kind, rng)
+        if _raw_event is not None:
+            return _raw_event
     kind = str(kind).upper()
     if kind not in ("SE", "BSE"):
         raise ValueError(f"unknown Mo holder emission kind: {kind}")
@@ -1894,6 +1910,7 @@ def load_default_surface_models(
     holder_mo_sampler_dir: str | Path | None = None,
     carbon_seemc_yield_dir: str | Path | None = None,
     carbon_sampler_dir: str | Path | None = None,
+    grid_mesh_sampler_dir: str | Path | None = None,
     cu_seemc_yield_dir: str | Path | None = None,
     cu_sampler_dir: str | Path | None = None,
 ) -> tuple[dict, dict, dict]:
@@ -2421,6 +2438,21 @@ def load_default_surface_models(
     if carbon_joint_library is not None:
         for carbon_key in ("grid", "gridframe", "collector"):
             yield_models[carbon_key]["carbon_joint_library"] = carbon_joint_library
+
+    # Optional separate library for the grid MESH WIRES only (for example a
+    # thin carbon film on tungsten, "C70nm_on_W").  Frames, collector, rod and
+    # drift tube keep the carbon library.  The folder has the same layout as
+    # every other material (alpha_*deg with yield CSVs, joint NPZs and raw/).
+    if grid_mesh_sampler_dir is not None:
+        mesh_library = load_carbon_joint_library(grid_mesh_sampler_dir)
+        mesh_library = dict(mesh_library, material=Path(grid_mesh_sampler_dir).name)
+        mesh_zero = mesh_library["angle_models"][0]
+        yield_models["grid"] = dict(
+            yield_models["grid"],
+            SEY=dict(mesh_zero["yield"]["SEY"], geometry="angle_resolved_joint"),
+            BSEY=dict(mesh_zero["yield"]["BSEY"], geometry="angle_resolved_joint"),
+            carbon_joint_library=mesh_library,
+        )
 
     if holder_mo_sampler_dir is not None:
         mo_library = load_mo_holder_joint_library(holder_mo_sampler_dir)
@@ -3461,6 +3493,74 @@ def _choose_raw_case(cases: list, Einc: float, rng):
     return cases[ihi] if rng.random() < w else cases[ilo]
 
 
+def _raw_case_event(
+    case: dict, angle_model: dict, kind: str, j: int,
+    Einc: float, theta_deg: float,
+) -> dict:
+    """Electron ``j`` of one raw case as a joint event at the actual impact."""
+    alpha = float(angle_model["angle_deg"])
+    tab = case[kind]
+    d = tab["dir"][j]
+    event = {
+        "Eout_eV": float(tab["E"][j]),
+        "direction_local": d,
+        "theta_rad": float(np.arccos(np.clip(d[0], -1.0, 1.0))),
+        "phi_rad": float(np.arctan2(d[2], d[1])),
+        "sampler_Einc_eV": float(case["Einc_eV"]),
+        "sampler_event_index": int(j),
+        "source": case["source"],
+        "sampler_incidence_angle_deg": alpha,
+        "sampler_angle_source_dir": str(angle_model["source_dir"]),
+        "primary_resolved": True,
+    }
+    specular = _joint_event_is_exact_specular(event, sampler_alpha_deg=alpha)
+    if specular:
+        event = _reconstruct_exact_specular_event(
+            event, actual_Einc_eV=Einc, actual_theta_deg=theta_deg,
+        )
+    else:
+        _rescale_joint_event_energy(event, Einc, kind)
+    correction = float(event.get("cu_specular_direction_correction_deg", 0.0))
+    for prefix in ("ti", "mo", "carbon"):
+        event[f"{prefix}_specular_reconstructed"] = bool(specular)
+        event[f"{prefix}_specular_direction_correction_deg"] = correction
+    event.setdefault("cu_specular_reconstructed", False)
+    return event
+
+
+def sample_raw_single_event(
+    library: dict, Einc: float, theta_deg: float, kind: str, rng,
+) -> dict | None:
+    """Draw ONE emitted electron of ``kind`` from the raw cases.
+
+    Used wherever a single replacement or additional electron is needed in
+    per-primary mode (an emission direction that cannot be launched from the
+    local surface, an electron that does not fit the energy budget, extra
+    electrons from a yield multiplier).  The electron is drawn uniformly from
+    all electrons of that kind in the chosen case, which is the same pooled
+    distribution as the joint sampler file, but comes from the raw case that
+    is already in memory, so no large joint file has to be loaded.
+
+    Returns None if the library has no raw cases at the chosen angle or the
+    case holds no electron of this kind; callers then use the joint file.
+    """
+    kind = str(kind).upper()
+    Einc = float(Einc)
+    lo, hi, w = _receiver_angle_bracket(library, theta_deg)
+    chosen = hi if (hi is not lo and rng.random() < w) else lo
+    cases = _raw_cases_for_angle_model(chosen)
+    if not cases:
+        return None
+    _, path = _choose_raw_case(cases, Einc, rng)
+    case = _load_raw_primary_case(path)
+    n = int(case[kind]["E"].size)
+    if n == 0:
+        return None
+    return _raw_case_event(
+        case, chosen, kind, int(rng.integers(0, n)), Einc, theta_deg
+    )
+
+
 def sample_primary_bundle(
     library: dict,
     Einc: float,
@@ -3509,36 +3609,9 @@ def sample_primary_bundle(
     for kind in ("BSE", "SE"):
         tab = case[kind]
         for j in range(int(tab["start"][i]), int(tab["start"][i + 1])):
-            d = tab["dir"][j]
-            event = {
-                "Eout_eV": float(tab["E"][j]),
-                "direction_local": d,
-                "theta_rad": float(np.arccos(np.clip(d[0], -1.0, 1.0))),
-                "phi_rad": float(np.arctan2(d[2], d[1])),
-                "sampler_Einc_eV": float(case["Einc_eV"]),
-                "sampler_event_index": j,
-                "source": case["source"],
-                "sampler_incidence_angle_deg": alpha,
-                "sampler_angle_source_dir": str(chosen["source_dir"]),
-                "primary_resolved": True,
-            }
-            specular = _joint_event_is_exact_specular(
-                event, sampler_alpha_deg=alpha
+            bundle[kind].append(
+                _raw_case_event(case, chosen, kind, j, Einc, theta_deg)
             )
-            if specular:
-                event = _reconstruct_exact_specular_event(
-                    event, actual_Einc_eV=Einc, actual_theta_deg=theta_deg,
-                )
-            else:
-                _rescale_joint_event_energy(event, Einc, kind)
-            correction = float(
-                event.get("cu_specular_direction_correction_deg", 0.0)
-            )
-            for prefix in ("ti", "mo", "carbon"):
-                event[f"{prefix}_specular_reconstructed"] = bool(specular)
-                event[f"{prefix}_specular_direction_correction_deg"] = correction
-            event.setdefault("cu_specular_reconstructed", False)
-            bundle[kind].append(event)
 
     # Restore energy conservation after the family-wise mapping.  The excess
     # is at most (1 - r)(sum of SE energies + 50 eV per additional BSE), with
@@ -4523,14 +4596,6 @@ def generate_surface_emissions(
         library_sey_mean = _scaled_joint_library_yield(
             _lib, diagnostic_sey_mdl, Einc, _theta, "SEY", _interp
         )
-        elastic_bse_probability = _library_elastic_bse_probability(
-            _lib,
-            _scaled_joint_library_yield(
-                _lib, diagnostic_bsey_mdl, Einc, _theta, "BSEY", _interp
-            ),
-            Einc,
-            _theta,
-        )
 
     # Per-primary sampling.  When the library has raw cases, the whole
     # emission of this impact (how many SE and BSE, their energies and
@@ -4541,6 +4606,19 @@ def generate_surface_emissions(
     primary_bundle = None
     if _lib_ctx is not None and _lib.get("primary_resolved", True):
         primary_bundle = sample_primary_bundle(_lib, Einc, _theta, rng)
+    if primary_bundle is None and _lib_ctx is not None:
+        # Independent SE/BSE sampling only: the elastic-BSE compensation needs
+        # the elastic fraction, read from the pooled BSE joint file.  It is
+        # not evaluated in per-primary mode, where it would force a large
+        # joint file to be loaded on every impact.
+        elastic_bse_probability = _library_elastic_bse_probability(
+            _lib,
+            _scaled_joint_library_yield(
+                _lib, diagnostic_bsey_mdl, Einc, _theta, "BSEY", _interp
+            ),
+            Einc,
+            _theta,
+        )
     if primary_bundle is not None:
         _extra = {}
         for _kind, _ykind, _mdl in (
