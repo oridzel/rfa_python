@@ -782,6 +782,9 @@ def integrate_one_electron(
 
     p = np.asarray(p0, dtype=float).copy()
     v = np.asarray(v0, dtype=float).copy()
+    # Kinetic energy at launch (emission energy for a cascade electron); used
+    # only by the optional energy-dependent grid transparency.
+    E_launch_eV = float(kinetic_energy_eV_from_velocity(v))
 
     if track_points:
         traj = [p.copy()]
@@ -1321,6 +1324,7 @@ def integrate_one_electron(
                         v=v_new,
                         r_hit=hit["location"],
                         rng=rng,
+                        E_launch_eV=E_launch_eV,
                     )
                     u = rng.random()
 
@@ -1778,6 +1782,7 @@ def grid_transmission_probability(
     rng,
     default: float = 1.0,
     center=None,
+    E_launch_eV: float | None = None,
 ) -> float:
     """Probability that one crossing of a grid shell misses the wires.
 
@@ -1789,7 +1794,7 @@ def grid_transmission_probability(
     earlier angle-independent behaviour.
     """
     T0 = transparency_for_owner(grid_transparency, owner, default=default)
-    T0 = _energy_dependent_transparency(grid_transparency, T0, v)
+    T0 = _energy_dependent_transparency(grid_transparency, T0, v, E_launch_eV)
     if grid_transmission_model(grid_transparency) == "constant":
         return float(T0)
 
@@ -1807,7 +1812,7 @@ def grid_transmission_probability(
     return woven_mesh_transmission(T0, cos_alpha, psi)
 
 
-def _energy_dependent_transparency(grid_transparency, T0: float, v) -> float:
+def _energy_dependent_transparency(grid_transparency, T0: float, v, E_launch_eV=None) -> float:
     """Optional effective transparency that depends on the electron energy.
 
     Enabled by ``grid_transparency["energy_dependence"]``, a dict with
@@ -1815,6 +1820,12 @@ def _energy_dependent_transparency(grid_transparency, T0: float, v) -> float:
         T_low      normal-incidence transparency for slow electrons
         E_mid_eV   energy of the transition (default 50 eV)
         width_eV   width of the transition (default 10 eV; 0 = sharp step)
+        reference  which energy decides (default "crossing"):
+                   "crossing" - kinetic energy where the electron meets the grid;
+                   "launch"   - kinetic energy with which it left its surface,
+                                i.e. its emission energy.  With a biased sample
+                                these differ: under +50 V sample bias a 70 eV
+                                BSE reaches the grids with 20 eV.
 
     The per-grid value ``grid_transparency[owner]`` is then the transparency
     for fast electrons, and the value used at a crossing is
@@ -1836,7 +1847,13 @@ def _energy_dependent_transparency(grid_transparency, T0: float, v) -> float:
     width = float(spec.get("width_eV", 10.0))
     if not (0.0 <= T_low <= 1.0):
         raise ValueError("energy_dependence['T_low'] must lie in [0, 1]")
-    E = float(kinetic_energy_eV_from_velocity(v))
+    reference = str(spec.get("reference", "crossing"))
+    if reference == "launch" and E_launch_eV is not None:
+        E = float(E_launch_eV)
+    elif reference in ("crossing", "launch"):
+        E = float(kinetic_energy_eV_from_velocity(v))
+    else:
+        raise ValueError("energy_dependence['reference'] must be 'crossing' or 'launch'")
     if width <= 0.0:
         w = 1.0 if E >= E_mid else 0.0
     else:

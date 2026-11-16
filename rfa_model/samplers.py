@@ -597,6 +597,34 @@ def load_joint_emission_sampler_npz(path: str | Path) -> dict:
 
 
 
+_PLANE_TABLE_PREFIXES = (
+    "SEYFromPlane", "BSEYFromPlane", "SEeEFromPlaneSampler", "BSEeEFromPlaneSampler",
+    "SEThetaFromPlaneSampler", "BSEThetaFromPlaneSampler",
+    "SEJointFromPlaneSampler", "BSEJointFromPlaneSampler",
+)
+
+
+def _find_plane_table(directory: str | Path, legacy_name: str) -> Path:
+    """Path of one plane table, accepting legacy and material-named files.
+
+    Libraries written before the adapter named its tables after the material
+    use ``...SEVaccum_t0nmCuFPA.csv`` / ``...uncoatedCuFPA...`` in every
+    folder; newer ones use ``..._uncoated<material>FPA...``.  The legacy name
+    is returned if present; otherwise the single file with the same prefix
+    and suffix.  If neither exists the legacy path is returned, so the caller
+    reports it as missing.
+    """
+    directory = Path(directory)
+    path = directory / legacy_name
+    if path.is_file():
+        return path
+    prefix = next((p for p in _PLANE_TABLE_PREFIXES if legacy_name.startswith(p + "_")), None)
+    if prefix is None:
+        return path
+    matches = sorted(directory.glob(f"{prefix}_*{Path(legacy_name).suffix}"))
+    return matches[0] if len(matches) == 1 else path
+
+
 def _resolve_generated_plane_file(directory: str | Path, kind: str) -> Path:
     """Resolve one generated SEEMC plane-sampler file robustly.
 
@@ -1459,7 +1487,7 @@ def load_sample_gun_incidence_model(
         raise ValueError("sample gun-incidence angle tolerance must be >= 0 deg")
 
     paths = {
-        key: sampler_dir / filename
+        key: _find_plane_table(sampler_dir, filename)
         for key, filename in SAMPLE_GUN_INCIDENCE_FILENAMES.items()
     }
     missing = [str(path) for path in paths.values() if not path.is_file()]
@@ -1470,7 +1498,7 @@ def load_sample_gun_incidence_model(
         )
 
     joint_paths = {
-        kind: sampler_dir / filename
+        kind: _find_plane_table(sampler_dir, filename)
         for kind, filename in SAMPLE_GUN_JOINT_FILENAMES.items()
     }
     joint_present = {kind: path.is_file() for kind, path in joint_paths.items()}
