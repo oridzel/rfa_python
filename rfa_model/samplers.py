@@ -3249,6 +3249,9 @@ def sample_theta_from_table(model: dict, Einc: float, rng) -> float:
 # Emitted-energy boundary between the SE and BSE sampler families.  The
 # generated libraries hold SE events for emitted energies 0-50 eV and BSE
 # events for emitted energies above 50 eV.
+# SE/BSE boundary, JMONSEL convention: SE if E_out <= 50 eV, BSE if E_out > 50 eV.
+# Sampler libraries must be generated with the same convention (an elastic
+# electron at exactly 50 eV incidence is an SE; BSEY(50 eV) = 0).
 JOINT_ENERGY_CUTOFF_EV = 50.0
 
 # Per-impact energy bookkeeping (see _EmissionSlots).
@@ -3638,7 +3641,24 @@ def sample_primary_bundle(
             for e in bundle["SE"]:
                 e["Eout_eV"] = float(e["Eout_eV"] * f)
             bundle["se_energy_scale"] = float(f)
+
+    # Label every electron by its FINAL energy with the JMONSEL convention:
+    # SE if E <= 50 eV, BSE if E > 50 eV.  Mapping to the actual impact
+    # energy can move an electron across the boundary (an elastic electron
+    # recorded at exactly 50 eV in the 50 eV case and rebuilt at a 60 eV
+    # impact, or a BSE trimmed down to 50 eV by the energy budget).
+    _relabel_bundle_by_energy(bundle)
     return bundle
+
+
+def _relabel_bundle_by_energy(bundle: dict) -> None:
+    cut = JOINT_ENERGY_CUTOFF_EV
+    se_up = [e for e in bundle["SE"] if e["Eout_eV"] > cut]
+    bse_down = [e for e in bundle["BSE"] if e["Eout_eV"] <= cut]
+    if se_up or bse_down:
+        bundle["SE"] = [e for e in bundle["SE"] if e["Eout_eV"] <= cut] + bse_down
+        bundle["BSE"] = [e for e in bundle["BSE"] if e["Eout_eV"] > cut] + se_up
+    bundle["relabelled_by_energy"] = len(se_up) + len(bse_down)
 
 
 def _scale_bundle_to_yield(

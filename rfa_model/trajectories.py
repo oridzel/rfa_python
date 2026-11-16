@@ -1789,6 +1789,7 @@ def grid_transmission_probability(
     earlier angle-independent behaviour.
     """
     T0 = transparency_for_owner(grid_transparency, owner, default=default)
+    T0 = _energy_dependent_transparency(grid_transparency, T0, v)
     if grid_transmission_model(grid_transparency) == "constant":
         return float(T0)
 
@@ -1804,6 +1805,43 @@ def grid_transmission_probability(
     cos_alpha = abs(float(np.dot(vv, r))) / (vn * rn)
     psi = 0.5 * np.pi * rng.random()
     return woven_mesh_transmission(T0, cos_alpha, psi)
+
+
+def _energy_dependent_transparency(grid_transparency, T0: float, v) -> float:
+    """Optional effective transparency that depends on the electron energy.
+
+    Enabled by ``grid_transparency["energy_dependence"]``, a dict with
+
+        T_low      normal-incidence transparency for slow electrons
+        E_mid_eV   energy of the transition (default 50 eV)
+        width_eV   width of the transition (default 10 eV; 0 = sharp step)
+
+    The per-grid value ``grid_transparency[owner]`` is then the transparency
+    for fast electrons, and the value used at a crossing is
+
+        T(E) = T_low + (T_fast - T_low) / (1 + exp(-(E - E_mid)/width)),
+
+    with E the kinetic energy at the crossing.  This is an EFFECTIVE
+    description (the geometric open area does not depend on energy); it
+    stands for whatever makes slow electrons end on the wires more often than
+    fast ones.  Without the key the transparency is energy independent.
+    """
+    if not isinstance(grid_transparency, dict):
+        return float(T0)
+    spec = grid_transparency.get("energy_dependence")
+    if not spec:
+        return float(T0)
+    T_low = float(spec["T_low"])
+    E_mid = float(spec.get("E_mid_eV", 50.0))
+    width = float(spec.get("width_eV", 10.0))
+    if not (0.0 <= T_low <= 1.0):
+        raise ValueError("energy_dependence['T_low'] must lie in [0, 1]")
+    E = float(kinetic_energy_eV_from_velocity(v))
+    if width <= 0.0:
+        w = 1.0 if E >= E_mid else 0.0
+    else:
+        w = 1.0 / (1.0 + np.exp(-np.clip((E - E_mid) / width, -60.0, 60.0)))
+    return float(T_low + (float(T0) - T_low) * w)
 
 
 def transparency_for_owner(grid_transparency, owner, default=1.0):
