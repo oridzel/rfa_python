@@ -730,6 +730,52 @@ def rk4_step(p, v, dt, Ex_interp, Ey_interp, Ez_interp):
 # Main emitted-electron integrator
 # ============================================================
 
+_SHELL_RADIUS_KEY = {"g1_shell": "R_g1", "g2_shell": "R_g2", "g3_shell": "R_g3", "collector_shell": "R_col"}
+
+
+def _diffuse_return_spec(grid_transparency, field):
+    """Parse grid_transparency["diffuse_return"] (None = feature off).
+
+    Keys:
+      probability  f, chance that a rejected electron re-entering the inner
+                   cavity is redirected (0 = off, 1 = fully diffuse).  Default 0.75.
+      inner_shell  shell through which the cavity is re-entered (default "g1_shell").
+      outer_shell  outer limit of the region where a turn-around counts
+                   (default "collector_shell").
+    A turn-around is an outward-to-inward reversal of the radial velocity at a
+    radius between the two shells.
+    """
+    if not isinstance(grid_transparency, dict):
+        return None
+    spec = grid_transparency.get("diffuse_return")
+    if not spec:
+        return None
+    f = float(spec.get("probability", 0.75))
+    if f <= 0.0:
+        return None
+    inner = str(spec.get("inner_shell", "g1_shell"))
+    outer = str(spec.get("outer_shell", "collector_shell"))
+    return {
+        "probability": min(f, 1.0),
+        "inner_shell": inner,
+        "r_min": float(field[_SHELL_RADIUS_KEY[inner]]),
+        "r_max": float(field[_SHELL_RADIUS_KEY[outer]]),
+    }
+
+
+def _cosine_direction(normal, rng):
+    """Unit vector drawn from a cosine (Lambert) distribution about ``normal``."""
+    n = unit(np.asarray(normal, dtype=float))
+    a = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    t1 = unit(np.cross(n, a))
+    t2 = np.cross(n, t1)
+    u1, u2 = rng.random(), rng.random()
+    sin_t = np.sqrt(u1)
+    cos_t = np.sqrt(1.0 - u1)
+    phi = 2.0 * np.pi * u2
+    return cos_t * n + sin_t * (np.cos(phi) * t1 + np.sin(phi) * t2)
+
+
 def integrate_one_electron(
     p0,
     v0,
@@ -885,6 +931,11 @@ def integrate_one_electron(
 
     grid_events = []
     ignore_sphere_owners = set()
+
+    # Optional diffuse return of electrons rejected between the grids
+    # (grid_transparency["diffuse_return"]); see _diffuse_return_spec.
+    _dr = _diffuse_return_spec(grid_transparency, field)
+    turned_in_gap = False
 
     if not np.all(np.isfinite(p)) or not np.all(np.isfinite(v)):
         return _trajectory_failure(
@@ -1353,6 +1404,26 @@ def integrate_one_electron(
                         "T": T,
                     })
 
+                    # DIFFUSE_RETURN_V1: an electron that turned around between
+                    # the grids and now re-enters the inner cavity through the
+                    # inner shell gets, with probability f, a new direction drawn
+                    # from a cosine distribution about the inward normal (speed
+                    # kept).  Stands in for the cumulative scattering by the
+                    # granular mesh field that the smooth field solution lacks.
+                    if _dr is not None and owner == _dr["inner_shell"]:
+                        r_hat = unit(np.asarray(hit["location"], dtype=float))
+                        if turned_in_gap and float(np.dot(v_new, r_hat)) < 0.0:
+                            if rng.random() < _dr["probability"]:
+                                speed = float(np.linalg.norm(v_new))
+                                v_new = speed * _cosine_direction(-r_hat, rng)
+                                grid_events.append({
+                                    "type": "diffuse_return",
+                                    "owner": owner,
+                                    "location": hit["location"],
+                                    "step": step,
+                                })
+                        turned_in_gap = False
+
                     # Preserve the exact crossing in presentation trajectories,
                     # regardless of track_stride, then move a tiny distance to
                     # the transmitted side to avoid redetecting the same shell.
@@ -1370,6 +1441,14 @@ def integrate_one_electron(
                     continue
 
         ignore_sphere_owners = set()
+
+        if _dr is not None and not turned_in_gap:
+            r_new = float(np.linalg.norm(p_new))
+            if _dr["r_min"] < r_new < _dr["r_max"]:
+                vr_old = float(np.dot(v, p)) / max(float(np.linalg.norm(p)), 1e-30)
+                vr_new = float(np.dot(v_new, p_new)) / max(r_new, 1e-30)
+                if vr_old > 0.0 >= vr_new:
+                    turned_in_gap = True
 
         p_previous = p.copy()
         p = p_new
