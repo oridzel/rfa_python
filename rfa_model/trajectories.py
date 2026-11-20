@@ -17,6 +17,7 @@ from .constants import (
     kinetic_energy_eV_from_velocity,
 )
 from .fields import E_at_point
+from . import mesh_transfer as _mt
 from .collisions import (
     first_segment_hit,
     first_analytic_grid_hit,
@@ -730,59 +731,6 @@ def rk4_step(p, v, dt, Ex_interp, Ey_interp, Ez_interp):
 # Main emitted-electron integrator
 # ============================================================
 
-_SHELL_RADIUS_KEY = {"g1_shell": "R_g1", "g2_shell": "R_g2", "g3_shell": "R_g3", "collector_shell": "R_col"}
-
-
-def _diffuse_return_spec(grid_transparency, field):
-    """Parse grid_transparency["diffuse_return"] (None = feature off).
-
-    Keys:
-      probability  f, chance that a rejected electron re-entering the inner
-                   cavity is redirected (0 = off, 1 = fully diffuse).  Default 0.75.
-      inner_shell  shell through which the cavity is re-entered (default "g1_shell").
-      outer_shell  outer limit of the region where a turn-around counts
-                   (default "collector_shell").
-      return_transparency
-                   optional normal-incidence transparency used for every grid
-                   crossing after the electron's first turn-around between the
-                   shells (None = the usual transparency, including the
-                   slow-electron value).
-    A turn-around is an outward-to-inward reversal of the radial velocity at a
-    radius between the two shells.
-    """
-    if not isinstance(grid_transparency, dict):
-        return None
-    spec = grid_transparency.get("diffuse_return")
-    if not spec:
-        return None
-    f = float(spec.get("probability", 0.75))
-    if f <= 0.0:
-        return None
-    inner = str(spec.get("inner_shell", "g1_shell"))
-    outer = str(spec.get("outer_shell", "collector_shell"))
-    T_ret = spec.get("return_transparency", None)
-    return {
-        "probability": min(f, 1.0),
-        "return_transparency": None if T_ret is None else float(T_ret),
-        "inner_shell": inner,
-        "r_min": float(field[_SHELL_RADIUS_KEY[inner]]),
-        "r_max": float(field[_SHELL_RADIUS_KEY[outer]]),
-    }
-
-
-def _cosine_direction(normal, rng):
-    """Unit vector drawn from a cosine (Lambert) distribution about ``normal``."""
-    n = unit(np.asarray(normal, dtype=float))
-    a = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    t1 = unit(np.cross(n, a))
-    t2 = np.cross(n, t1)
-    u1, u2 = rng.random(), rng.random()
-    sin_t = np.sqrt(u1)
-    cos_t = np.sqrt(1.0 - u1)
-    phi = 2.0 * np.pi * u2
-    return cos_t * n + sin_t * (np.cos(phi) * t1 + np.sin(phi) * t2)
-
-
 def integrate_one_electron(
     p0,
     v0,
@@ -939,11 +887,9 @@ def integrate_one_electron(
     grid_events = []
     ignore_sphere_owners = set()
 
-    # Optional diffuse return of electrons rejected between the grids
-    # (grid_transparency["diffuse_return"]); see _diffuse_return_spec.
-    _dr = _diffuse_return_spec(grid_transparency, field)
-    turned_in_gap = False
-    rejected_once = False
+    # Cell-scale mesh field (grid_transparency["mesh_transfer"]); see mesh_transfer.py.
+    _mts = _mt.spec_from(grid_transparency)
+    mesh_round_trip = {}          # owner -> crossing info of a pending round trip
 
     if not np.all(np.isfinite(p)) or not np.all(np.isfinite(v)):
         return _trajectory_failure(
@@ -1377,23 +1323,33 @@ def integrate_one_electron(
                     }
 
                 if event_type == "transmit_grid":
-                    if rejected_once and _dr["return_transparency"] is not None:
-                        _gt_ret = {k: v_ for k, v_ in grid_transparency.items()
-                                   if k != "energy_dependence"}
-                        for _o in ("g1_shell", "g2_shell", "g3_shell"):
-                            _gt_ret[_o] = _dr["return_transparency"]
-                        T = grid_transmission_probability(
-                            _gt_ret, owner, v=v_new, r_hit=hit["location"], rng=rng,
-                        )
-                    else:
-                        T = grid_transmission_probability(
-                            grid_transparency,
-                            owner,
-                            v=v_new,
-                            r_hit=hit["location"],
-                            rng=rng,
-                            E_launch_eV=E_launch_eV,
-                        )
+                    T = grid_transmission_probability(
+                        grid_transparency,
+                        owner,
+                        v=v_new,
+                        r_hit=hit["location"],
+                        rng=rng,
+                        E_launch_eV=E_launch_eV,
+                    )
+                    # MESH_TRANSFER_V1: cell-scale mesh field at this crossing.
+                    _mkick = None
+                    if _mts is not None:
+                        if owner in mesh_round_trip:
+                            # second crossing of a round trip: survival was applied
+                            # at the first crossing; give the round-trip kick now
+                            _mkick = (mesh_round_trip.pop(owner), True)
+                            T = 1.0
+                        else:
+                            _mi = _mt.crossing_info(_mts, owner, hit["location"], v_new, field,
+                                                    Ex_interp, Ey_interp, Ez_interp)
+                            if _mi is not None:
+                                if (_mi["type"] == "L" and _mi["enters_field_side"]
+                                        and _mi["kappa"] <= _mts["tables"]["kappa_rt"]):
+                                    T = min(1.0, T * T * _mt.round_trip_survival_factor(_mts, _mi))
+                                    mesh_round_trip[owner] = _mi
+                                else:
+                                    T = 1.0 - (1.0 - T) * _mt.opacity_ratio(_mts, _mi)
+                                    _mkick = (_mi, False)
                     u = rng.random()
 
                     if u > T:
@@ -1420,26 +1376,9 @@ def integrate_one_electron(
                         "u": u,
                         "T": T,
                     })
-
-                    # DIFFUSE_RETURN_V1: an electron that turned around between
-                    # the grids and now re-enters the inner cavity through the
-                    # inner shell gets, with probability f, a new direction drawn
-                    # from a cosine distribution about the inward normal (speed
-                    # kept).  Stands in for the cumulative scattering by the
-                    # granular mesh field that the smooth field solution lacks.
-                    if _dr is not None and owner == _dr["inner_shell"]:
-                        r_hat = unit(np.asarray(hit["location"], dtype=float))
-                        if turned_in_gap and float(np.dot(v_new, r_hat)) < 0.0:
-                            if rng.random() < _dr["probability"]:
-                                speed = float(np.linalg.norm(v_new))
-                                v_new = speed * _cosine_direction(-r_hat, rng)
-                                grid_events.append({
-                                    "type": "diffuse_return",
-                                    "owner": owner,
-                                    "location": hit["location"],
-                                    "step": step,
-                                })
-                        turned_in_gap = False
+                    if _mkick is not None:
+                        v_new = _mt.apply_kick(_mts, _mkick[0], v_new, rng, round_trip=_mkick[1])
+                        grid_events[-1]["mesh_kappa"] = float(_mkick[0]["kappa"])
 
                     # Preserve the exact crossing in presentation trajectories,
                     # regardless of track_stride, then move a tiny distance to
@@ -1458,15 +1397,6 @@ def integrate_one_electron(
                     continue
 
         ignore_sphere_owners = set()
-
-        if _dr is not None and not turned_in_gap:
-            r_new = float(np.linalg.norm(p_new))
-            if _dr["r_min"] < r_new < _dr["r_max"]:
-                vr_old = float(np.dot(v, p)) / max(float(np.linalg.norm(p)), 1e-30)
-                vr_new = float(np.dot(v_new, p_new)) / max(r_new, 1e-30)
-                if vr_old > 0.0 >= vr_new:
-                    turned_in_gap = True
-                    rejected_once = True
 
         p_previous = p.copy()
         p = p_new
