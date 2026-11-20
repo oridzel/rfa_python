@@ -27,7 +27,10 @@ K: kinetic energy at the crossing (eV); dE: field difference across the mesh
 
 Enabled with grid_transparency["mesh_transfer"] = True (default tables) or a
 dict with keys "tables" (path), "kappa_max" (default 40), "delta_m" (radial
-offset used to read the field on each side, default 0.6 mm).
+offset used to read the field on each side, default 0.6 mm), and
+"shape_slope_deg": rms local slope of the meshes (shape errors).  When given,
+an electron that turned around between G1 and the collector is deflected by a
+Gaussian angle of 2 x slope (tilted mirror) when it re-enters the G1 cavity.
 """
 from __future__ import annotations
 
@@ -73,8 +76,27 @@ def spec_from(grid_transparency):
         return None
     s = {} if s is True else dict(s)
     tables = _load(str(s.get("tables", _DEFAULT_TABLES)))
+    slope = s.get("shape_slope_deg", None)
     return dict(tables=tables, kappa_max=float(s.get("kappa_max", 40.0)),
-                delta_m=float(s.get("delta_m", 6.0e-4)))
+                delta_m=float(s.get("delta_m", 6.0e-4)),
+                shape_slope_rad=None if not slope else np.deg2rad(float(slope)))
+
+
+def tilt(v, slope_rad, rng):
+    """Mesh shape error as a tilted mirror: rotate the returning direction by a
+    Gaussian angle with sigma = 2 x rms local slope in each transverse component
+    (speed kept).  Energy independent, as for reflection."""
+    vv = np.asarray(v, float)
+    speed = float(np.linalg.norm(vv))
+    if speed <= 0.0:
+        return vv
+    d = vv / speed
+    a = np.array([1.0, 0.0, 0.0]) if abs(d[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    t1 = np.cross(d, a); t1 /= np.linalg.norm(t1)
+    t2 = np.cross(d, t1)
+    ax, ay = rng.normal(0.0, 2.0 * slope_rad, 2)
+    w = d + np.tan(ax) * t1 + np.tan(ay) * t2
+    return speed * w / np.linalg.norm(w)
 
 
 def _interp_row(tab, kappa):

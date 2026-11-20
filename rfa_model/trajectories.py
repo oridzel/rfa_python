@@ -890,6 +890,10 @@ def integrate_one_electron(
     # Cell-scale mesh field (grid_transparency["mesh_transfer"]); see mesh_transfer.py.
     _mts = _mt.spec_from(grid_transparency)
     mesh_round_trip = {}          # owner -> crossing info of a pending round trip
+    _shape = None
+    if _mts is not None and _mts["shape_slope_rad"] is not None:
+        _shape = (float(field["R_g1"]), float(field["R_col"]))
+    turned_in_gap = False
 
     if not np.all(np.isfinite(p)) or not np.all(np.isfinite(v)):
         return _trajectory_failure(
@@ -1379,6 +1383,10 @@ def integrate_one_electron(
                     if _mkick is not None:
                         v_new = _mt.apply_kick(_mts, _mkick[0], v_new, rng, round_trip=_mkick[1])
                         grid_events[-1]["mesh_kappa"] = float(_mkick[0]["kappa"])
+                    if _shape is not None and owner == "g1_shell":
+                        if turned_in_gap and float(np.dot(v_new, np.asarray(hit["location"], float))) < 0.0:
+                            v_new = _mt.tilt(v_new, _mts["shape_slope_rad"], rng)
+                        turned_in_gap = False
 
                     # Preserve the exact crossing in presentation trajectories,
                     # regardless of track_stride, then move a tiny distance to
@@ -1397,6 +1405,12 @@ def integrate_one_electron(
                     continue
 
         ignore_sphere_owners = set()
+
+        if _shape is not None and not turned_in_gap:
+            _rn = float(np.linalg.norm(p_new))
+            if _shape[0] < _rn < _shape[1]:
+                if float(np.dot(v, p)) > 0.0 >= float(np.dot(v_new, p_new)):
+                    turned_in_gap = True
 
         p_previous = p.copy()
         p = p_new

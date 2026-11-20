@@ -23,3 +23,6 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["rfa_model*"]
+
+[tool.setuptools.package-data]
+rfa_model = ["data/*.json"]
