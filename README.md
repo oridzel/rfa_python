@@ -1,7 +1,7 @@
 ## ⚙️ Installation
 
 **Install directly from GitHub**
-The easiest way to install the library and all its dependencies (like `numpy`, `scipy`, `nlopt`, etc.):
+The easiest way to install the library and all its dependencies:
 ```bash
 pip install git+https://github.com/oridzel/rfa_python.git
 ```
