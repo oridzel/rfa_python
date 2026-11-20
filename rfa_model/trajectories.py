@@ -742,6 +742,11 @@ def _diffuse_return_spec(grid_transparency, field):
       inner_shell  shell through which the cavity is re-entered (default "g1_shell").
       outer_shell  outer limit of the region where a turn-around counts
                    (default "collector_shell").
+      return_transparency
+                   optional normal-incidence transparency used for every grid
+                   crossing after the electron's first turn-around between the
+                   shells (None = the usual transparency, including the
+                   slow-electron value).
     A turn-around is an outward-to-inward reversal of the radial velocity at a
     radius between the two shells.
     """
@@ -755,8 +760,10 @@ def _diffuse_return_spec(grid_transparency, field):
         return None
     inner = str(spec.get("inner_shell", "g1_shell"))
     outer = str(spec.get("outer_shell", "collector_shell"))
+    T_ret = spec.get("return_transparency", None)
     return {
         "probability": min(f, 1.0),
+        "return_transparency": None if T_ret is None else float(T_ret),
         "inner_shell": inner,
         "r_min": float(field[_SHELL_RADIUS_KEY[inner]]),
         "r_max": float(field[_SHELL_RADIUS_KEY[outer]]),
@@ -936,6 +943,7 @@ def integrate_one_electron(
     # (grid_transparency["diffuse_return"]); see _diffuse_return_spec.
     _dr = _diffuse_return_spec(grid_transparency, field)
     turned_in_gap = False
+    rejected_once = False
 
     if not np.all(np.isfinite(p)) or not np.all(np.isfinite(v)):
         return _trajectory_failure(
@@ -1369,14 +1377,23 @@ def integrate_one_electron(
                     }
 
                 if event_type == "transmit_grid":
-                    T = grid_transmission_probability(
-                        grid_transparency,
-                        owner,
-                        v=v_new,
-                        r_hit=hit["location"],
-                        rng=rng,
-                        E_launch_eV=E_launch_eV,
-                    )
+                    if rejected_once and _dr["return_transparency"] is not None:
+                        _gt_ret = {k: v_ for k, v_ in grid_transparency.items()
+                                   if k != "energy_dependence"}
+                        for _o in ("g1_shell", "g2_shell", "g3_shell"):
+                            _gt_ret[_o] = _dr["return_transparency"]
+                        T = grid_transmission_probability(
+                            _gt_ret, owner, v=v_new, r_hit=hit["location"], rng=rng,
+                        )
+                    else:
+                        T = grid_transmission_probability(
+                            grid_transparency,
+                            owner,
+                            v=v_new,
+                            r_hit=hit["location"],
+                            rng=rng,
+                            E_launch_eV=E_launch_eV,
+                        )
                     u = rng.random()
 
                     if u > T:
@@ -1449,6 +1466,7 @@ def integrate_one_electron(
                 vr_new = float(np.dot(v_new, p_new)) / max(r_new, 1e-30)
                 if vr_old > 0.0 >= vr_new:
                     turned_in_gap = True
+                    rejected_once = True
 
         p_previous = p.copy()
         p = p_new
