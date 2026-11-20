@@ -1,3 +1,11 @@
+## ⚙️ Installation
+
+**Install directly from GitHub**
+The easiest way to install the library and all its dependencies (like `numpy`, `scipy`, `nlopt`, etc.):
+```bash
+pip install git+https://github.com/oridzel/rfa_python.git
+```
+
 # Finite sample collision fix
 
 Back up your current rfa_model directory, then copy the four files in this
